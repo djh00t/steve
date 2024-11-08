@@ -1,0 +1,77 @@
+# docker-compose.yaml
+services:
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - LOG_LEVEL=INFO
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
+    networks:
+      - ai_network
+    command: ["python", "-m", "ai_agent.main"]
+
+  bash_agent:
+    build:
+      context: .
+      dockerfile: ai_agent/agents/execution/Dockerfile
+    environment:
+      - AGENT_TYPE=bash
+      - MESSAGE_BUS_URL=redis://redis:6379
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - orchestrator
+    networks:
+      - ai_network
+    command: ["python", "-m", "ai_agent.main"]
+
+  research_agent:
+    build:
+      context: .
+      dockerfile: ai_agent/agents/research/Dockerfile
+    environment:
+      - AGENT_TYPE=research
+      - MESSAGE_BUS_URL=redis://redis:6379
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    volumes:
+      - .:/app
+    working_dir: /app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - orchestrator
+      - redis
+    networks:
+      - ai_network
+    command: ["python", "-m", "ai_agent.main"]
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ai_network
+
+volumes:
+  redis_data:
+
+networks:
+  ai_network:
+    driver: bridge
