@@ -17,7 +17,7 @@ on:
 
 env:
   POETRY_VERSION: "1.5.1"
-  PYTHON_LATEST: "3.11"
+  PYTHON_LATEST: "3.12"
 
 jobs:
   code-quality:
@@ -63,13 +63,13 @@ jobs:
         run: poetry run flake8 .
 
       - name: Run mypy
-        run: poetry run mypy klingon_log tests
+        run: poetry run mypy ai_agent tests
 
       - name: Run bandit
         run: poetry run bandit -r klingon_log -c pyproject.toml
 
       - name: Run pylint
-        run: poetry run pylint klingon_log tests
+        run: poetry run pylint ai_agent tests
 
   test:
     name: Test Python ${{ matrix.python-version }} on ${{ matrix.os }}
@@ -78,7 +78,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11"]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
         os: [ubuntu-latest, windows-latest, macos-latest]
 
     steps:
@@ -200,14 +200,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./dist/klingon_log-${{ github.run_number }}.tar.gz
-          asset_name: klingon_log-${{ github.run_number }}.tar.gz
+          asset_path: ./dist/ai_agent-${{ github.run_number }}.tar.gz
+          asset_name: ai_agent-${{ github.run_number }}.tar.gz
           asset_content_type: application/gzip
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v1.4.4
         with:
-          subject_path: ./dist/klingon_log-${{ github.run_number }}.tar.gz
+          subject_path: ./dist/ai_agent-${{ github.run_number }}.tar.gz
           
       - name: Publish to PyPI
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
