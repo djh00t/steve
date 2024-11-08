@@ -7,15 +7,20 @@ from pydantic import BaseModel
 
 app = FastAPI(title="AI Agent API")
 
+
 class CommandRequest(BaseModel):
     """Request model for executing commands."""
+
     command: str
     timeout: int = 300
 
+
 class ResearchRequest(BaseModel):
     """Request model for research tasks."""
+
     query: str
     max_results: int = 5
+
 
 @app.post("/execute")
 async def execute_command(request: CommandRequest) -> Dict[str, Any]:
@@ -26,6 +31,7 @@ async def execute_command(request: CommandRequest) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/research")
 async def research(request: ResearchRequest) -> Dict[str, Any]:
     """Perform web research."""
@@ -34,6 +40,7 @@ async def research(request: ResearchRequest) -> Dict[str, Any]:
         return {"status": "success", "message": "Research completed"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/health")
 async def health_check() -> Dict[str, str]:

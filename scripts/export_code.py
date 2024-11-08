@@ -66,9 +66,7 @@ def expand_globs(patterns: List[str]) -> List[Path]:
             matched = glob.glob(pattern, recursive=True)
         else:
             matched = glob.glob(pattern)
-        expanded.extend(
-            [Path(p).resolve() for p in matched if Path(p).exists()]
-        )
+        expanded.extend([Path(p).resolve() for p in matched if Path(p).exists()])
     return expanded
 
 
@@ -83,9 +81,9 @@ def collect_files(
     patterns and skipping binary files.
     """
     collected = set()
-    
+
     # Add data/ directory to ignored paths
-    data_dir = Path('data')
+    data_dir = Path("data")
 
     # Process directories
     for dir_path in dirs:
@@ -109,7 +107,7 @@ def collect_files(
                 if data_dir in file_path.parents:
                     logger.debug(f"Skipping file in data directory: {relative_path}")
                     continue
-                
+
                 if not spec.match_file(str(relative_path)):
                     if not is_binary_file(file_path):
                         collected.add(file_path)
@@ -132,7 +130,7 @@ def collect_files(
         if data_dir in file_path.parents:
             logger.debug(f"Skipping file in data directory: {relative_path}")
             continue
-            
+
         if not spec.match_file(str(relative_path)):
             if not is_binary_file(file_path):
                 collected.add(file_path.resolve())
@@ -176,11 +174,12 @@ def is_binary_file(file_path: Path) -> bool:
     """Check if a file is binary by reading its first chunk."""
     try:
         chunk_size = 8192
-        with open(file_path, 'rb') as f:
+        with open(file_path, "rb") as f:
             chunk = f.read(chunk_size)
-            return b'\0' in chunk  # Binary files typically contain null bytes
+            return b"\0" in chunk  # Binary files typically contain null bytes
     except Exception:
         return True  # Assume binary if we can't read the file
+
 
 def format_file_size(size: int) -> str:
     """Format file size in bytes to a human-readable form."""
@@ -189,16 +188,10 @@ def format_file_size(size: int) -> str:
     while size >= 1024 and index < len(units) - 1:
         size /= 1024.0
         index += 1
-    return (
-        f"{size:.2f} {units[index]}"
-        if index > 0
-        else f"{int(size)} {units[index]}"
-    )
+    return f"{size:.2f} {units[index]}" if index > 0 else f"{int(size)} {units[index]}"
 
 
-def generate_output_filename(
-    git_root: Path, provided_output: str = None
-) -> Path:
+def generate_output_filename(git_root: Path, provided_output: str = None) -> Path:
     """
     Generate the output file name based on the provided argument or default
     pattern.
@@ -247,9 +240,7 @@ def main():
     parser.add_argument(
         "--path", help="Path to run commands from (default: current directory)"
     )
-    parser.add_argument(
-        "--debug", action="store_true", help="Enable debug logging"
-    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
 
     # Set up logging
@@ -277,9 +268,7 @@ def main():
         git_root = Path(git_root_str).resolve()
     except subprocess.CalledProcessError:
         git_root = Path.cwd()
-        logger.warning(
-            "Not inside a Git repository. Using current directory as root."
-        )
+        logger.warning("Not inside a Git repository. Using current directory as root.")
 
     # Load .gitignore patterns
     gitignore_path = git_root / ".gitignore"
@@ -288,9 +277,7 @@ def main():
 
     # Combine with additional ignore patterns from --ignore
     cli_ignore_patterns = args.ignore
-    logger.debug(
-        f"Additional ignore patterns from --ignore: {cli_ignore_patterns}"
-    )
+    logger.debug(f"Additional ignore patterns from --ignore: {cli_ignore_patterns}")
 
     # Compile ignore specifications
     spec = compile_ignore_spec(gitignore_patterns, cli_ignore_patterns)
@@ -305,8 +292,7 @@ def main():
     # Collect files applying ignore patterns
     collected_files = collect_files(dirs, files, spec, logger)
     logger.debug(
-        f"Collected {len(collected_files)} files after applying ignore "
-        "patterns."
+        f"Collected {len(collected_files)} files after applying ignore " "patterns."
     )
 
     # If no files to process, exit
@@ -348,7 +334,7 @@ def main():
                 if is_binary_file(file_path):
                     logger.warning(f"Skipping binary file: {relative_file_path}")
                     continue
-                    
+
                 f_out.write(f"# {relative_file_path}\n")
                 try:
                     with file_path.open(

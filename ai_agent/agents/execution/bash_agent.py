@@ -20,8 +20,10 @@ from ..base import BaseAgent
 
 logger = logging.getLogger(__name__)
 
+
 class CommandResult(BaseModel):
     """Result of a command execution."""
+
     exit_code: int
     stdout: str
     stderr: str
@@ -32,8 +34,10 @@ class CommandResult(BaseModel):
     environment: Dict[str, str]
     terminated: bool = False  # New field to track if command was terminated
 
+
 class CommandExecution(BaseModel):
     """Active command execution tracking."""
+
     model_config = ConfigDict(arbitrary_types_allowed=True)  # Moved before fields
     process: Optional[asyncio.subprocess.Process] = None
     start_time: datetime = Field(default_factory=datetime.utcnow)
@@ -42,6 +46,7 @@ class CommandExecution(BaseModel):
     environment: Dict[str, str] = Field(default_factory=dict)
     terminated: bool = False  # Flag to indicate termination
 
+
 class BashExecutionAgent(BaseAgent):
     """Agent for executing bash commands."""
 
@@ -49,132 +54,136 @@ class BashExecutionAgent(BaseAgent):
         super().__init__(*args, **kwargs)
         self.active_executions: Dict[UUID, CommandExecution] = {}
         self._setup_environment()
-        
+
     def _setup_environment(self):
         """Set up the execution environment."""
         self.base_environment = {
-            'PATH': os.environ.get('PATH', ''),
-            'HOME': '/home/agent',
-            'SHELL': '/bin/bash',
-            'LANG': 'en_US.UTF-8',
-            'TERM': 'xterm-256color',
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": "/home/agent",
+            "SHELL": "/bin/bash",
+            "LANG": "en_US.UTF-8",
+            "TERM": "xterm-256color",
         }
-        
+
     async def execute_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        command = task.get('command')
-        timeout = task.get('timeout', 300)  # Default 5 minute timeout
-        env = task.get('env', {})
+        command = task.get("command")
+        timeout = task.get("timeout", 300)  # Default 5 minute timeout
+        env = task.get("env", {})
 
         if not command:
             return {
-                'success': False,
-                'result': {
-                    'exit_code': -1,
-                    'stdout': "",
-                    'stderr': "No command specified",
-                    'duration': 0.0,
-                    'start_time': datetime.utcnow(),
-                    'end_time': datetime.utcnow(),
-                    'command': "",
-                    'environment': env,
-                    'terminated': False
-                }
+                "success": False,
+                "result": {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "No command specified",
+                    "duration": 0.0,
+                    "start_time": datetime.utcnow(),
+                    "end_time": datetime.utcnow(),
+                    "command": "",
+                    "environment": env,
+                    "terminated": False,
+                },
             }
-            
+
         operation = SecurityOperation(
-            operation_type='execute_command',
-            resource='bash',
-            required_permissions={'bash.execute'}
+            operation_type="execute_command",
+            resource="bash",
+            required_permissions={"bash.execute"},
         )
         if not await self.security_context.validate_operation(
-            self.security_context.context_id,
-            operation
+            self.security_context.context_id, operation
         ):
             return {
-                'success': False,
-                'result': {
-                    'exit_code': -1,
-                    'stdout': "",
-                    'stderr': "Command execution not permitted",
-                    'duration': 0.0,
-                    'start_time': datetime.utcnow(),
-                    'end_time': datetime.utcnow(),
-                    'command': command,
-                    'environment': env,
-                    'terminated': False
-                }
+                "success": False,
+                "result": {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": "Command execution not permitted",
+                    "duration": 0.0,
+                    "start_time": datetime.utcnow(),
+                    "end_time": datetime.utcnow(),
+                    "command": command,
+                    "environment": env,
+                    "terminated": False,
+                },
             }
-            
+
         execution_id = uuid4()
         try:
             result = await self._execute_command(command, timeout, env, execution_id)
             success = result.exit_code == 0 and not result.terminated
-            return {
-                'success': success,
-                'result': result.model_dump()
-            }
-                
+            return {"success": success, "result": result.model_dump()}
+
         except asyncio.TimeoutError:
             return {
-                'success': False,
-                'result': {
-                    'exit_code': -1,
-                    'stdout': "",
-                    'stderr': f"Command timed out after {timeout} seconds",
-                    'duration': 0.0,
-                    'start_time': datetime.utcnow(),
-                    'end_time': datetime.utcnow(),
-                    'command': command,
-                    'environment': env,
-                    'terminated': True
-                }
+                "success": False,
+                "result": {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Command timed out after {timeout} seconds",
+                    "duration": 0.0,
+                    "start_time": datetime.utcnow(),
+                    "end_time": datetime.utcnow(),
+                    "command": command,
+                    "environment": env,
+                    "terminated": True,
+                },
             }
         except Exception as e:
             return {
-                'success': False,
-                'result': {
-                    'exit_code': -1,
-                    'stdout': "",
-                    'stderr': f"Command execution failed: {str(e)}",
-                    'duration': 0.0,
-                    'start_time': datetime.utcnow(),
-                    'end_time': datetime.utcnow(),
-                    'command': command,
-                    'environment': env,
-                    'terminated': True
-                }
+                "success": False,
+                "result": {
+                    "exit_code": -1,
+                    "stdout": "",
+                    "stderr": f"Command execution failed: {str(e)}",
+                    "duration": 0.0,
+                    "start_time": datetime.utcnow(),
+                    "end_time": datetime.utcnow(),
+                    "command": command,
+                    "environment": env,
+                    "terminated": True,
+                },
             }
-            
-    async def _execute_command(self, command: str, timeout: Optional[float] = None, env: Optional[Dict[str, str]] = None, execution_id: Optional[UUID] = None) -> CommandResult:
+
+    async def _execute_command(
+        self,
+        command: str,
+        timeout: Optional[float] = None,
+        env: Optional[Dict[str, str]] = None,
+        execution_id: Optional[UUID] = None,
+    ) -> CommandResult:
         execution_env = self.base_environment.copy()
         if env:
             execution_env.update(env)
-            
+
         start_time = datetime.utcnow()
         if not execution_id:
             execution_id = uuid4()
         terminated = False  # Track termination status
-        
+
         try:
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=execution_env,
-                start_new_session=True
+                start_new_session=True,
             )
-            
+
             execution = CommandExecution(
                 process=process,
                 start_time=start_time,
                 command=command,
                 timeout=timeout,
-                environment=execution_env
+                environment=execution_env,
             )
             self.active_executions[execution_id] = execution
-            
+
             try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=timeout
+                )
             except asyncio.CancelledError:
                 # Handle cancellation due to stop()
                 terminated = True
@@ -184,24 +193,28 @@ class BashExecutionAgent(BaseAgent):
                 terminated = True
                 raise
             else:
-                terminated = execution.terminated  # Check if terminated during execution
+                terminated = (
+                    execution.terminated
+                )  # Check if terminated during execution
             end_time = datetime.utcnow()
             duration = (end_time - start_time).total_seconds()
 
-            logger.debug(f"Command '{command}' terminated: {terminated}, returncode: {process.returncode}")
+            logger.debug(
+                f"Command '{command}' terminated: {terminated}, returncode: {process.returncode}"
+            )
 
             return CommandResult(
                 exit_code=process.returncode,
-                stdout=stdout.decode('utf-8', errors='replace').strip(),
-                stderr=stderr.decode('utf-8', errors='replace').strip(),
+                stdout=stdout.decode("utf-8", errors="replace").strip(),
+                stderr=stderr.decode("utf-8", errors="replace").strip(),
                 duration=duration,
                 start_time=start_time,
                 end_time=end_time,
                 command=command,
                 environment=execution_env,
-                terminated=terminated
+                terminated=terminated,
             )
-                
+
         except asyncio.TimeoutError:
             if process and process.pid:
                 pgid = os.getpgid(process.pid)
@@ -218,7 +231,7 @@ class BashExecutionAgent(BaseAgent):
                 end_time=datetime.utcnow(),
                 command=command,
                 environment=execution_env,
-                terminated=terminated
+                terminated=terminated,
             )
         except asyncio.CancelledError:
             if process and process.pid:
@@ -241,12 +254,12 @@ class BashExecutionAgent(BaseAgent):
                 end_time=end_time,
                 command=command,
                 environment=execution_env,
-                terminated=terminated
+                terminated=terminated,
             )
         finally:
             if execution_id in self.active_executions:
                 del self.active_executions[execution_id]
-                
+
     async def stop(self):
         """Stop all currently active executions."""
         for execution_id, execution in list(self.active_executions.items()):
