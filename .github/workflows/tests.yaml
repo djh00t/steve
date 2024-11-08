@@ -204,10 +204,10 @@ jobs:
           asset_name: ai_agent-${{ github.run_number }}.tar.gz
           asset_content_type: application/gzip
 
-      - name: Attest Build Provenance
-        uses: actions/attest-build-provenance@v1.4.4
+      - name: Attest
+        uses: actions/attest-build-provenance@v1
         with:
-          artifact_path: ./dist/ai_agent-${{ github.run_number }}.tar.gz
+          subject-path: '${{ github.workspace }}/dist/*'
           
       - name: Publish to PyPI
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
