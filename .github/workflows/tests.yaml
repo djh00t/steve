@@ -66,7 +66,7 @@ jobs:
         run: poetry run mypy ai_agent tests
 
       - name: Run bandit
-        run: poetry run bandit -r klingon_log -c pyproject.toml
+        run: poetry run bandit -r ai_agent -c pyproject.toml
 
       - name: Run pylint
         run: poetry run pylint ai_agent tests
@@ -211,6 +211,7 @@ jobs:
           
       - name: Publish to PyPI
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: poetry/poetry-publish@v1.0.0
-        env:
-          POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
+        uses: pypa/gh-action-pypi-publish@v1.8.11
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+          packages_dir: dist/
