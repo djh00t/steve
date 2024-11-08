@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+
 from ai_agent.core.message_bus import MessageBus
 
 logger = logging.getLogger(__name__)

@@ -3,16 +3,16 @@
 Task management and distribution implementation.
 Handles task creation, assignment, and lifecycle management.
 """
-from typing import Dict, Optional, List
-from uuid import UUID, uuid4
-from datetime import datetime
-import logging
 import asyncio
+import logging
+from datetime import datetime
+from typing import Dict, List, Optional
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from .message_bus import MessageBus, Message
 from .agent_manager import AgentManager
+from .message_bus import Message, MessageBus
 
 logger = logging.getLogger(__name__)
 

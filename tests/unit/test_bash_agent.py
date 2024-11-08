@@ -3,10 +3,11 @@
 """
 Tests for the bash execution agent.
 """
-import pytest
-import pytest_asyncio
 import asyncio
 from uuid import uuid4
+
+import pytest
+import pytest_asyncio
 
 from ai_agent.agents.execution.bash_agent import BashExecutionAgent
 from ai_agent.core.message_bus import MessageBus

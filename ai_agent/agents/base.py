@@ -3,16 +3,16 @@ Base agent implementation with common functionality.
 Provides base classes for specialized agents.
 """
 
-from typing import Dict, Any, Optional, List
-from uuid import UUID, uuid4
-from abc import ABC, abstractmethod
-import logging
 import asyncio
+import logging
+from abc import ABC, abstractmethod
 from datetime import datetime
+from typing import Any, Dict, List, Optional
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from ..core.message_bus import MessageBus, Message
+from ..core.message_bus import Message, MessageBus
 from ..core.security_manager import SecurityContext, SecurityOperation
 
 logger = logging.getLogger(__name__)

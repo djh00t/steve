@@ -3,15 +3,16 @@
 """
 Research agent implementation for web browsing and content gathering.
 """
-from typing import Dict, Any, List, Optional
-from uuid import UUID, uuid4
-from datetime import datetime
 import logging
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+from uuid import UUID, uuid4
+
 from pydantic import BaseModel, Field
 
-from ..base import BaseAgent
 from ...core.message_bus import Message
 from ...sandbox.browser.secure_browser import SecureBrowser
+from ..base import BaseAgent
 
 logger = logging.getLogger(__name__)
 

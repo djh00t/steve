@@ -3,7 +3,9 @@
 """Main entry point for the AI Agent system."""
 import asyncio
 import logging
+
 import uvicorn
+
 from ai_agent.api.routes import app
 from ai_agent.core.agent_manager import AgentManager
 from ai_agent.core.message_bus import MessageBus

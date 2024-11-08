@@ -4,15 +4,15 @@
 Bash execution agent implementation.
 Provides secure bash command execution in a sandboxed environment.
 """
-from typing import Dict, Any, Optional
-from uuid import UUID, uuid4
-import logging
 import asyncio
+import logging
 import os
 import signal
 from datetime import datetime
+from typing import Any, Dict, Optional
+from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from ...core.message_bus import Message
 from ...core.security_manager import SecurityOperation

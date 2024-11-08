@@ -3,18 +3,18 @@
 """
 Analysis agent implementation for data processing and insights.
 """
-from typing import Dict, Any, List, Optional
-from uuid import UUID, uuid4
-from datetime import datetime, timedelta
-import logging
 import asyncio
+import logging
 import statistics
 from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from ..base import BaseAgent
 from ...core.message_bus import Message
+from ..base import BaseAgent
 
 logger = logging.getLogger(__name__)
 

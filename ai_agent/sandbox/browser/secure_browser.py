@@ -3,20 +3,20 @@ Secure browser implementation with anti-detection measures.
 """
 
 import asyncio
-import random
-import logging
-from typing import Dict, Any, Optional, List
-from pathlib import Path
 import json
+import logging
+import random
 import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+from fake_useragent import UserAgent
 from selenium import webdriver
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver import Chrome, ChromeOptions
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
-from fake_useragent import UserAgent
+from selenium.webdriver.support.ui import WebDriverWait
 
 logger = logging.getLogger(__name__)
 

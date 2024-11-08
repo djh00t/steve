@@ -2,22 +2,23 @@
 Tests for the research agent implementation.
 """
 
-import pytest
 import asyncio
-from uuid import UUID, uuid4
 from datetime import datetime
 from unittest.mock import Mock, patch
+from uuid import UUID, uuid4
+
+import pytest
+import redis.asyncio as redis
 
 from ai_agent.agents.research.research_agent import (
     ResearchAgent,
+    ResearchSession,
     SearchParams,
     SearchResult,
-    ResearchSession,
 )
-from ai_agent.sandbox.browser.secure_browser import SecureBrowser
 from ai_agent.core.message_bus import MessageBus
-import redis.asyncio as redis
 from ai_agent.core.security_manager import SecurityContext
+from ai_agent.sandbox.browser.secure_browser import SecureBrowser
 
 
 @pytest.fixture
@@ -252,9 +253,9 @@ async def test_export_session(research_agent):
 
 from ai_agent.agents.research.research_agent import (
     ResearchAgent,
+    ResearchSession,
     SearchParams,
     SearchResult,
-    ResearchSession,
 )
 from ai_agent.core.message_bus import MessageBus
 from ai_agent.core.security_manager import SecurityContext
@@ -356,7 +357,8 @@ async def test_invalid_action(research_agent):
         pytest.fail(f"Test failed: {str(e)}")
 
 
-import pytest
+from datetime import datetime
 from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
-from datetime import datetime
+
+import pytest

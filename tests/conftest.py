@@ -1,9 +1,10 @@
 # tests/conftest.py
 
 """Test configuration and fixtures."""
-import pytest
-from uuid import uuid4
 import asyncio
+from uuid import uuid4
+
+import pytest
 
 from ai_agent.core.message_bus import MessageBus
 from ai_agent.core.security_manager import SecurityContext

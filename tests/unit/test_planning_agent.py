@@ -2,17 +2,18 @@
 Tests for the planning agent implementation.
 """
 
-import pytest
-from uuid import UUID, uuid4
 from datetime import datetime, timedelta
+from uuid import UUID, uuid4
+
+import pytest
 
 from ai_agent.agents.planning.planning_agent import (
-    PlanningAgent,
-    ProjectPlan,
     PlannedTask,
-    TaskDependency,
-    ResourceRequirement,
+    PlanningAgent,
     PlanningSession,
+    ProjectPlan,
+    ResourceRequirement,
+    TaskDependency,
 )
 from ai_agent.core.message_bus import MessageBus
 from ai_agent.core.security_manager import SecurityContext

@@ -3,14 +3,14 @@
 Agent lifecycle and management implementation.
 Manages agent creation, termination, and coordination.
 """
-from typing import Dict, Optional, List, Set
-from uuid import UUID, uuid4
-import logging
 import asyncio
+import logging
+from typing import Dict, List, Optional, Set
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
-from .message_bus import MessageBus, Message
+from .message_bus import Message, MessageBus
 
 logger = logging.getLogger(__name__)
 

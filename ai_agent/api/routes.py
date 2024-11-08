@@ -1,7 +1,8 @@
 # ai_agent/api/routes.py
 
 """API routes for the AI Agent system."""
-from typing import Dict, Any
+from typing import Any, Dict
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 

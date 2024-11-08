@@ -3,16 +3,15 @@
 Message bus implementation for agent communication.
 Implements a Redis-based message bus for reliable agent communication.
 """
-from typing import Dict, Any, Callable, Optional
-from uuid import UUID, uuid4
-from datetime import datetime
 import asyncio
 import json
 import logging
+from datetime import datetime
+from typing import Any, Callable, Dict, Optional
+from uuid import UUID, uuid4
 
 import redis.asyncio as redis
-from pydantic import BaseModel, Field, ConfigDict
-from typing import Any
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
