@@ -56,7 +56,7 @@ impl DeferredQueues {
         tokio::spawn(async move {
             while let Some(event) = accounting_rx.recv().await {
                 let result = sqlx::query(
-                    "INSERT INTO steve_background_events(id, kind, payload, created_at) VALUES (?, ?, ?, ?)"
+                    "INSERT INTO steve_background_events(id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
                 )
                 .bind(Uuid::now_v7().to_string())
                 .bind(event.kind)
@@ -84,26 +84,37 @@ impl DeferredQueues {
             }
         });
 
-        Self { accounting: accounting_tx, history: history_tx, telemetry: telemetry_tx, stats }
+        Self {
+            accounting: accounting_tx,
+            history: history_tx,
+            telemetry: telemetry_tx,
+            stats,
+        }
     }
 
     pub fn accounting(&self, kind: &'static str, payload: Value) {
         if self.accounting.try_send(Event { kind, payload }).is_err() {
-            self.stats.accounting_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .accounting_dropped
+                .fetch_add(1, Ordering::Relaxed);
             error!("accounting queue saturated; event was not persisted");
         }
     }
 
     pub fn history(&self, key: String, data: Bytes) {
         if self.history.try_send(HistoryEvent { key, data }).is_err() {
-            self.stats.history_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .history_dropped
+                .fetch_add(1, Ordering::Relaxed);
             warn!("history queue saturated; payload dropped");
         }
     }
 
     pub fn telemetry(&self, kind: &'static str, payload: Value) {
         if self.telemetry.try_send(Event { kind, payload }).is_err() {
-            self.stats.telemetry_dropped.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .telemetry_dropped
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 

@@ -73,7 +73,11 @@ pub async fn run(
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr: SocketAddr = cfg.server.bind.parse().context("parsing server bind address")?;
+    let addr: SocketAddr = cfg
+        .server
+        .bind
+        .parse()
+        .context("parsing server bind address")?;
     let listener = bind_listener(addr).await?;
     let local_addr = listener.local_addr()?;
 
@@ -91,8 +95,7 @@ pub async fn run(
         .with_graceful_shutdown(async move {
             let reason = shutdown_signal().await;
             shutdown_lifecycle.drain(reason);
-            let result =
-                tokio::time::timeout(timeout, shutdown_lifecycle.wait_for_zero()).await;
+            let result = tokio::time::timeout(timeout, shutdown_lifecycle.wait_for_zero()).await;
             if result.is_err() {
                 tracing::warn!(
                     event = "drain_timeout",

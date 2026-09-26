@@ -17,12 +17,23 @@ impl ObjectStorage {
                 Operator::new(builder)?
             }
             "s3" => {
-                let bucket = cfg.bucket.as_deref().ok_or_else(|| anyhow!("S3 bucket is required"))?;
+                let bucket = cfg
+                    .bucket
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("S3 bucket is required"))?;
                 let mut builder = services::S3::default().bucket(bucket).root(&cfg.root);
-                if let Some(v) = &cfg.endpoint { builder = builder.endpoint(v); }
-                if let Some(v) = &cfg.region { builder = builder.region(v); }
-                if let Some(v) = &cfg.access_key_id { builder = builder.access_key_id(v); }
-                if let Some(v) = &cfg.secret_access_key { builder = builder.secret_access_key(v); }
+                if let Some(v) = &cfg.endpoint {
+                    builder = builder.endpoint(v);
+                }
+                if let Some(v) = &cfg.region {
+                    builder = builder.region(v);
+                }
+                if let Some(v) = &cfg.access_key_id {
+                    builder = builder.access_key_id(v);
+                }
+                if let Some(v) = &cfg.secret_access_key {
+                    builder = builder.secret_access_key(v);
+                }
                 Operator::new(builder)?
             }
             other => return Err(anyhow!("unsupported object storage kind: {other}")),
@@ -34,7 +45,9 @@ impl ObjectStorage {
         let key = format!("health/{}.txt", uuid::Uuid::now_v7());
         self.put(&key, Bytes::from_static(b"ok")).await?;
         let got = self.get(&key).await?;
-        if got.as_ref() != b"ok" { return Err(anyhow!("object storage read-back mismatch")); }
+        if got.as_ref() != b"ok" {
+            return Err(anyhow!("object storage read-back mismatch"));
+        }
         self.delete(&key).await?;
         Ok(())
     }
@@ -54,7 +67,6 @@ impl ObjectStorage {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,7 +85,9 @@ mod tests {
             secret_access_key: None,
         };
 
-        let store = ObjectStorage::from_config(&cfg).await.expect("create store");
+        let store = ObjectStorage::from_config(&cfg)
+            .await
+            .expect("create store");
         store
             .put("sessions/test.json", Bytes::from_static(br#"{"ok":true}"#))
             .await
