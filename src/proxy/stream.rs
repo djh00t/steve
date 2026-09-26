@@ -64,13 +64,25 @@ impl CancelToken {
 
     /// Resolves when [`CancelToken::cancel`] has been called.
     pub async fn cancelled(&self) {
+        self.cancelled_future().await;
+    }
+
+    /// `'static` cancel wait for streams that outlive this borrow.
+    ///
+    /// The upstream SSE client polls this while reading the response body so
+    /// cancellation aborts the read without buffering the rest of the stream.
+    /// Dropping the future does not cancel the token.
+    #[must_use = "the cancel wait does nothing unless polled"]
+    pub fn cancelled_future(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
         let mut rx = self.rx.clone();
-        loop {
-            if *rx.borrow_and_update() {
-                return;
-            }
-            if rx.changed().await.is_err() {
-                return;
+        async move {
+            loop {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    return;
+                }
             }
         }
     }
@@ -328,5 +340,27 @@ mod tests {
 
         let forbidden = pump_upstream(&gate, CancelToken::new(), UnpolledUpstream);
         assert_eq!(forbidden.err(), Some(ReplayForbidden));
+    }
+
+    #[tokio::test]
+    async fn cancelled_future_waits_until_cancel() {
+        let token = CancelToken::new();
+        let wait = token.cancelled_future();
+        let clone = token.clone();
+        let handle = tokio::spawn(async move {
+            wait.await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !handle.is_finished(),
+            "cancel wait must not complete before cancel"
+        );
+        clone.cancel();
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("cancel wait was not woken")
+            .expect("cancel wait task");
+        assert!(token.is_cancelled());
     }
 }
