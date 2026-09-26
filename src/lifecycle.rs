@@ -85,3 +85,34 @@ impl Drop for InflightGuard {
         }
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_rejects_new_work_and_waits_for_inflight() {
+        let lifecycle = Lifecycle::new();
+        lifecycle.ready();
+
+        let guard = lifecycle.enter().expect("ready lifecycle should accept work");
+        assert_eq!(lifecycle.inflight(), 1);
+
+        lifecycle.drain();
+        assert_eq!(lifecycle.phase(), Phase::Draining);
+        assert!(lifecycle.enter().is_none());
+
+        let waiter = {
+            let lifecycle = lifecycle.clone();
+            tokio::spawn(async move {
+                lifecycle.wait_for_zero().await;
+            })
+        };
+
+        assert!(!waiter.is_finished());
+        drop(guard);
+        waiter.await.expect("waiter should complete");
+        assert_eq!(lifecycle.inflight(), 0);
+    }
+}
