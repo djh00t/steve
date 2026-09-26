@@ -515,11 +515,13 @@ mod tests {
             let content_length = String::from_utf8_lossy(&request[..header_end])
                 .lines()
                 .find_map(|line| {
-                    line.strip_prefix("content-length:")
-                        .or_else(|| line.strip_prefix("Content-Length:"))
+                    let (name, value) = line.split_once(':')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("content-length")
+                        .then_some(value)
                 })
                 .and_then(|value| value.trim().parse::<usize>().ok())
-                .unwrap_or(0);
+                .expect("request must include a valid Content-Length");
             let mut remaining = content_length.saturating_sub(request.len() - header_end);
             while remaining > 0 {
                 let count = socket.read(&mut buf).await.unwrap();
