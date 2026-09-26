@@ -14,7 +14,7 @@ impl ObjectStorage {
             "fs" | "filesystem" => {
                 std::fs::create_dir_all(&cfg.root)?;
                 let builder = services::Fs::default().root(&cfg.root);
-                Operator::new(builder)?.finish()
+                Operator::new(builder)?
             }
             "s3" => {
                 let bucket = cfg.bucket.as_deref().ok_or_else(|| anyhow!("S3 bucket is required"))?;
@@ -23,7 +23,7 @@ impl ObjectStorage {
                 if let Some(v) = &cfg.region { builder = builder.region(v); }
                 if let Some(v) = &cfg.access_key_id { builder = builder.access_key_id(v); }
                 if let Some(v) = &cfg.secret_access_key { builder = builder.secret_access_key(v); }
-                Operator::new(builder)?.finish()
+                Operator::new(builder)?
             }
             other => return Err(anyhow!("unsupported object storage kind: {other}")),
         };
