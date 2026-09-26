@@ -166,12 +166,18 @@ pub(crate) async fn handle_responses_with_upstream(
     if handoff.stream {
         let cancel = CancelToken::new();
         let gate = ReplayGate::new();
+        let mut pending = PendingStreamAttempt {
+            attempt: attempt.clone(),
+            cancel: cancel.clone(),
+            armed: true,
+        };
         match upstream
             .create_response_stream(&request, cancel.clone())
             .await
         {
             Ok(stream) => {
                 let body = pump_upstream(&gate, cancel, stream).expect("fresh replay gate");
+                pending.armed = false;
                 return ResponsesReply {
                     status: StatusCode::OK,
                     body: ResponsesReplyBody::Stream(Body::from_stream(AttemptBody {
@@ -181,7 +187,11 @@ pub(crate) async fn handle_responses_with_upstream(
                     attempt: Some(attempt),
                 };
             }
-            Err(error) => return upstream_failure(attempt, error),
+            Err(error) => {
+                let reply = upstream_failure(attempt, error);
+                pending.armed = false;
+                return reply;
+            }
         }
     }
 
@@ -233,6 +243,21 @@ fn finish_attempt(attempt: &Arc<Mutex<RequestAttempt>>, status: AttemptStatus) {
         finished_at = ?attempt.finished_at,
         "responses upstream attempt finished"
     );
+}
+
+struct PendingStreamAttempt {
+    attempt: Arc<Mutex<RequestAttempt>>,
+    cancel: CancelToken,
+    armed: bool,
+}
+
+impl Drop for PendingStreamAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel.cancel();
+            finish_attempt(&self.attempt, AttemptStatus::Cancelled);
+        }
+    }
 }
 
 struct AttemptBody {
@@ -458,6 +483,35 @@ mod tests {
 
     fn attempt(reply: &ResponsesReply) -> Arc<Mutex<RequestAttempt>> {
         reply.attempt.as_ref().expect("attempt").clone()
+    }
+
+    #[tokio::test]
+    async fn aborted_header_wait_cancels_pending_attempt() {
+        let handoff = parse_responses(br#"{"model":"m","input":"hi","stream":true}"#).unwrap();
+        let attempt = Arc::new(Mutex::new(handoff.attempt));
+        let cancel = CancelToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let waiting = tokio::spawn({
+            let attempt = attempt.clone();
+            let cancel = cancel.clone();
+            async move {
+                let _pending = PendingStreamAttempt {
+                    attempt,
+                    cancel,
+                    armed: true,
+                };
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+        ready_rx.await.unwrap();
+        assert_eq!(attempt.lock().unwrap().status, AttemptStatus::Pending);
+        waiting.abort();
+        let _ = waiting.await;
+        assert!(cancel.is_cancelled());
+        let attempt = attempt.lock().unwrap();
+        assert_eq!(attempt.status, AttemptStatus::Cancelled);
+        assert!(attempt.finished_at.is_some());
     }
 
     #[tokio::test]
