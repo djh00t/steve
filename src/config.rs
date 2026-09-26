@@ -54,18 +54,6 @@ pub struct LoggingConfig {
     pub json: bool,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            database: DatabaseConfig::default(),
-            object_storage: ObjectStorageConfig::default(),
-            queues: QueueConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
-}
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self { bind: "127.0.0.1:11435".into(), drain_timeout_seconds: 60 }
