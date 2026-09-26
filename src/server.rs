@@ -27,7 +27,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{signal, sync::watch};
+use tokio::{
+    signal,
+    sync::{watch, Semaphore},
+};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -52,6 +55,7 @@ struct AppState {
     models: Arc<[ModelConfig]>,
     openai_upstream: Option<OpenAiUpstream>,
     anthropic_upstream: Option<AnthropicUpstream>,
+    provider_probe: ProviderProbeState,
 }
 
 #[derive(Clone)]
@@ -60,6 +64,36 @@ struct Catalogue(Arc<[ModelConfig]>);
 impl FromRef<Arc<AppState>> for Catalogue {
     fn from_ref(state: &Arc<AppState>) -> Self {
         Self(Arc::clone(&state.models))
+    }
+}
+
+#[derive(Clone)]
+struct ProviderProbeState {
+    client: reqwest::Client,
+    probe_gate: Arc<Semaphore>,
+    openai_url: Option<String>,
+    anthropic_url: Option<String>,
+}
+
+impl ProviderProbeState {
+    fn new(
+        openai_url: Option<String>,
+        anthropic_url: Option<String>,
+    ) -> std::result::Result<Self, reqwest::Error> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            probe_gate: Arc::new(Semaphore::new(1)),
+            openai_url,
+            anthropic_url,
+        })
+    }
+}
+
+impl FromRef<Arc<AppState>> for ProviderProbeState {
+    fn from_ref(state: &Arc<AppState>) -> Self {
+        state.provider_probe.clone()
     }
 }
 
@@ -140,6 +174,11 @@ pub async fn run(
         .as_ref()
         .map(|url| AnthropicUpstream::new(url, Duration::from_secs(30)))
         .transpose()?;
+    let provider_probe = ProviderProbeState::new(
+        cfg.server.openai_upstream_url.clone(),
+        cfg.server.anthropic_upstream_url.clone(),
+    )
+    .context("building provider health client")?;
     let state = Arc::new(AppState {
         lifecycle: lifecycle.clone(),
         deferred,
@@ -154,6 +193,7 @@ pub async fn run(
         models: catalogue,
         openai_upstream,
         anthropic_upstream,
+        provider_probe,
     });
 
     let inference_app = inference_router(state.clone());
@@ -232,12 +272,70 @@ fn management_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/system/version", get(version))
         .route("/api/v1/system/status", get(status))
         .route("/api/v1/system/drain", post(drain))
+        .route("/api/v1/providers/health", get(provider_health))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             RequestClass::Management(state.counters.clone()),
             track_requests,
         ))
         .with_state(state)
+}
+
+async fn probe_provider(
+    client: reqwest::Client,
+    url: Option<String>,
+    path: &'static str,
+) -> &'static str {
+    let Some(url) = url else {
+        return "unconfigured";
+    };
+
+    let base = url.trim().trim_end_matches('/');
+    let url = if base.ends_with("/v1") {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/v1{path}")
+    };
+    match tokio::time::timeout(Duration::from_millis(500), client.get(url).send()).await {
+        Ok(Ok(response))
+            if response.status().as_u16() < 500 && response.status().as_u16() != 404 =>
+        {
+            "healthy"
+        }
+        _ => "unhealthy",
+    }
+}
+
+async fn provider_health(State(probe): State<ProviderProbeState>) -> Response {
+    let Ok(_permit) = probe.probe_gate.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"status": "busy"})),
+        )
+            .into_response();
+    };
+    let (openai, anthropic) = tokio::join!(
+        probe_provider(probe.client.clone(), probe.openai_url, "/chat/completions"),
+        probe_provider(probe.client, probe.anthropic_url, "/messages"),
+    );
+    let healthy = openai != "unhealthy" && anthropic != "unhealthy";
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(json!({
+            "status": if healthy { "healthy" } else { "unhealthy" },
+            "providers": {
+                "openai": {"status": openai},
+                "anthropic": {"status": anthropic},
+            }
+        })),
+    )
+        .into_response()
 }
 
 async fn list_models(State(Catalogue(catalogue)): State<Catalogue>) -> Json<ModelList> {
@@ -448,8 +546,10 @@ pub(crate) async fn shutdown_signal() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_upstream;
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
+    use std::future::IntoFuture;
     use tower::ServiceExt;
 
     fn models_router(catalogue: Arc<[ModelConfig]>) -> Router {
@@ -519,5 +619,233 @@ mod tests {
         assert_eq!(data[0]["id"], "steve-test-model");
         assert_eq!(data[0]["object"], "model");
         assert_eq!(data[0]["owned_by"], "steve");
+    }
+
+    fn provider_router(state: ProviderProbeState) -> Router {
+        Router::new()
+            .route("/api/v1/providers/health", get(provider_health))
+            .route("/health/live", get(|| async { "live" }))
+            .with_state(state)
+    }
+
+    async fn get_provider_health(state: ProviderProbeState) -> (StatusCode, Value) {
+        let response = provider_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/providers/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    async fn hanging_probe() -> &'static str {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        "late"
+    }
+
+    #[tokio::test]
+    async fn provider_health_reports_reachable_closed_and_unconfigured() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/chat/completions",
+                    get(|| async { (StatusCode::METHOD_NOT_ALLOWED, "") }),
+                ),
+            )
+            .into_future(),
+        );
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        let closed_task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = closed_listener.accept().await else {
+                    break;
+                };
+                drop(socket);
+            }
+        });
+        let (status, body) = get_provider_health(
+            ProviderProbeState::new(
+                Some(format!("http://{addr}")),
+                Some(format!("http://{closed_addr}")),
+            )
+            .unwrap(),
+        )
+        .await;
+        server.abort();
+        closed_task.abort();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["providers"]["openai"]["status"], "healthy");
+        assert_eq!(body["providers"]["anthropic"]["status"], "unhealthy");
+        assert!(!body["providers"]["openai"]
+            .as_object()
+            .unwrap()
+            .contains_key("url"));
+    }
+
+    #[tokio::test]
+    async fn provider_health_reports_fixture_and_unconfigured_as_healthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, test_upstream::router()).into_future());
+        let (status, body) = get_provider_health(
+            ProviderProbeState::new(Some(format!("  http://{addr}///  ")), None).unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["providers"]["openai"]["status"], "healthy");
+        assert_eq!(body["providers"]["anthropic"]["status"], "unconfigured");
+
+        let (status, body) = get_provider_health(
+            ProviderProbeState::new(Some(format!(" http://{addr}/v1/ ")), None).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["providers"]["openai"]["status"], "healthy");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_health_rejects_missing_and_server_error_provider_routes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/v1/chat/completions",
+                        get(|| async { StatusCode::NOT_FOUND }),
+                    )
+                    .route(
+                        "/v1/messages",
+                        get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    ),
+            )
+            .into_future(),
+        );
+        let (status, body) = get_provider_health(
+            ProviderProbeState::new(
+                Some(format!("http://{addr}")),
+                Some(format!("http://{addr}")),
+            )
+            .unwrap(),
+        )
+        .await;
+        server.abort();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["providers"]["openai"]["status"], "unhealthy");
+        assert_eq!(body["providers"]["anthropic"]["status"], "unhealthy");
+    }
+
+    #[tokio::test]
+    async fn provider_health_times_out_without_blocking_other_management_routes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = provider_router(
+            ProviderProbeState::new(
+                Some(format!("http://{addr}")),
+                Some(format!("http://{addr}")),
+            )
+            .unwrap(),
+        );
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                router
+                    .clone()
+                    .route("/v1/chat/completions", get(hanging_probe))
+                    .route("/v1/messages", get(hanging_probe)),
+            )
+            .into_future(),
+        );
+        let client = reqwest::Client::new();
+        let probe = tokio::spawn(
+            client
+                .get(format!("http://{addr}/api/v1/providers/health"))
+                .send(),
+        );
+        let live = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.get(format!("http://{addr}/health/live")).send(),
+        )
+        .await
+        .expect("management route must remain responsive")
+        .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+        let response = tokio::time::timeout(Duration::from_secs(1), probe)
+            .await
+            .expect("probe must finish within one second")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_health_returns_busy_while_another_probe_is_running() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", get(hanging_probe))
+                    .route("/v1/messages", get(hanging_probe)),
+            )
+            .into_future(),
+        );
+        let state = ProviderProbeState::new(
+            Some(format!("http://{addr}")),
+            Some(format!("http://{addr}")),
+        )
+        .unwrap();
+        let gate = state.probe_gate.clone();
+        let router = provider_router(state);
+        let first = tokio::spawn(
+            router.clone().oneshot(
+                Request::builder()
+                    .uri("/api/v1/providers/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while gate.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first probe must acquire the gate");
+        let second = tokio::time::timeout(
+            Duration::from_millis(100),
+            router.oneshot(
+                Request::builder()
+                    .uri("/api/v1/providers/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("busy response must not queue")
+        .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        first.abort();
+        server.abort();
     }
 }

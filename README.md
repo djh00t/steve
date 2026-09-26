@@ -88,6 +88,10 @@ A minimal body is `model`, `max_tokens`, and `messages`. `stream` is optional an
 
 Invalid JSON or a missing or empty required field returns HTTP 400 with the Steve error model (`error.message`, `error.type`, `error.code`, `error.param`). Set `server.anthropic_upstream_url` to the unauthenticated local `make test-upstream` fixture origin to forward validated non-stream JSON and return the upstream JSON. Authenticated provider accounts are later work; Steve does not forward the inbound `x-api-key` to the upstream. Successful upstream attempts are logged as `Success`; failed attempts are logged as `UpstreamError` and return HTTP 502 (HTTP 504 for timeouts). Streaming still returns HTTP 501. Without an upstream URL, a valid body returns HTTP 501 with a typed stub (`request_id`, `attempt_id`, `model`, `max_tokens`, `stream`, `status`).
 
+## Provider health
+
+`GET /api/v1/providers/health` is available on the management listener. It probes each configured OpenAI and Anthropic provider route (`/v1/chat/completions` and `/v1/messages`) on demand with a 500 ms timeout. HTTP 2xx, 3xx, and other 4xx responses (including 401 and 405) are reachable; HTTP 404, HTTP 500 or higher, transport failures, and timeouts are `unhealthy`. An omitted upstream is reported as `unconfigured`. The endpoint returns HTTP 200 when all configured providers are healthy and HTTP 503 otherwise; a probe already in progress returns HTTP 429 with `status: "busy"`. The response contains only the overall and per-provider statuses and never includes URLs or credentials.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Before pushing, run `make check` and `make quality-gates`.
