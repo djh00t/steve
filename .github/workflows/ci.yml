@@ -70,7 +70,9 @@ jobs:
       - name: Start S3-compatible test server
         run: |
           python -m pip install "moto[server]==5.2.3"
-          S3_IGNORE_SUBDOMAIN_BUCKETNAME=true moto_server -H 127.0.0.1 -p 5000 >/tmp/moto.log 2>&1 &
+          # pip --user places moto_server in ~/.local/bin, which is not on PATH
+          # in this job. Invoke the module with the same interpreter instead.
+          S3_IGNORE_SUBDOMAIN_BUCKETNAME=true python -m moto.server -H 127.0.0.1 -p 5000 >/tmp/moto.log 2>&1 &
           python - <<'PY'
           import socket
           import time
@@ -82,6 +84,10 @@ jobs:
                       break
               except OSError:
                   if time.time() >= deadline:
+                      try:
+                          print(open("/tmp/moto.log", encoding="utf-8").read())
+                      except OSError as log_error:
+                          print(f"moto log unavailable: {log_error}")
                       raise
                   time.sleep(1)
           PY
