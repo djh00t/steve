@@ -1,3 +1,4 @@
+pub(crate) mod anthropic_messages;
 pub(crate) mod openai_chat;
 #[cfg_attr(not(test), allow(dead_code))]
 mod openai_upstream;

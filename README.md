@@ -62,9 +62,27 @@ steve migrate
 
 **M0 — clean foundation: done.** It landed on `main` in [PR #1](https://github.com/djh00t/steve/pull/1) (`cbc2c44`). `steve serve` boots with SQLite or PostgreSQL, health and management endpoints respond, and local and S3-compatible object storage share one contract.
 
-**M1 — real proxy hot path: next.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. That proxy behavior is not in this tree yet.
+**M1 — real proxy hot path: next.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. Anthropic Messages parsing is documented in [Anthropic Messages ingress](#anthropic-messages-ingress). Streaming, cancellation, and upstream forwarding remain later M1 work.
 
 The MVP stays a complete vertical slice. Delivery order is in the [MVP plan](docs/plans/2026-09-26-steve-mvp.md). Protocol and product boundaries are in the [architecture spec](docs/specs/2026-09-26-steve-gateway.md).
+
+## Anthropic Messages ingress
+
+`POST /v1/messages` on the inference listener (default `[::]:11435`).
+
+```text
+content-type: application/json
+x-api-key: <api-key>
+anthropic-version: 2023-06-01
+```
+
+A minimal body is `model`, `max_tokens`, and `messages`. `stream` is optional and defaults to `false`.
+
+```json
+{"model":"claude-test","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}
+```
+
+Invalid JSON or a missing or empty required field returns HTTP 400 with the Steve error model (`error.message`, `error.type`, `error.code`, `error.param`). A valid body returns HTTP 501 with a typed stub (`request_id`, `attempt_id`, `model`, `max_tokens`, `stream`, `status`) until an upstream is connected.
 
 ## Contributing
 
