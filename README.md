@@ -62,7 +62,7 @@ steve migrate
 
 **M0 — clean foundation: done.** It landed on `main` in [PR #1](https://github.com/djh00t/steve/pull/1) (`cbc2c44`). `steve serve` boots with SQLite or PostgreSQL, health and management endpoints respond, and local and S3-compatible object storage share one contract.
 
-**M1 — real proxy hot path: in progress.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. Non-stream Chat Completions can forward to a configured OpenAI-compatible upstream. Other forwarding and streaming remain later M1 work.
+**M1 — real proxy hot path: in progress.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. Non-stream Chat Completions and Anthropic Messages can forward to configured upstreams. Other forwarding and streaming remain later M1 work.
 
 The MVP stays a complete vertical slice. Delivery order is in the [MVP plan](docs/plans/2026-09-26-steve-mvp.md). Protocol and product boundaries are in the [architecture spec](docs/specs/2026-09-26-steve-gateway.md).
 
@@ -86,7 +86,7 @@ A minimal body is `model`, `max_tokens`, and `messages`. `stream` is optional an
 {"model":"claude-test","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}
 ```
 
-Invalid JSON or a missing or empty required field returns HTTP 400 with the Steve error model (`error.message`, `error.type`, `error.code`, `error.param`). A valid body returns HTTP 501 with a typed stub (`request_id`, `attempt_id`, `model`, `max_tokens`, `stream`, `status`) until an upstream is connected.
+Invalid JSON or a missing or empty required field returns HTTP 400 with the Steve error model (`error.message`, `error.type`, `error.code`, `error.param`). Set `server.anthropic_upstream_url` to an Anthropic-compatible upstream origin to forward validated non-stream JSON and return the upstream JSON. Successful upstream attempts are logged as `Success`; failed attempts are logged as `UpstreamError` and return HTTP 502 (HTTP 504 for timeouts). Streaming still returns HTTP 501. Without an upstream URL, a valid body returns HTTP 501 with a typed stub (`request_id`, `attempt_id`, `model`, `max_tokens`, `stream`, `status`).
 
 ## Contributing
 

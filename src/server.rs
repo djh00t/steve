@@ -4,7 +4,7 @@ use crate::{
     lifecycle::{Lifecycle, Phase},
     models::{self, ModelList},
     net::{bind_listener, is_dual_stack_address},
-    proxy::{anthropic_messages, openai_chat, openai_responses, OpenAiUpstream},
+    proxy::{anthropic_messages, openai_chat, openai_responses, AnthropicUpstream, OpenAiUpstream},
     storage::{Database, ObjectStorage},
 };
 use anyhow::{Context, Result};
@@ -51,6 +51,7 @@ struct AppState {
     management_bind: String,
     models: Arc<[ModelConfig]>,
     openai_upstream: Option<OpenAiUpstream>,
+    anthropic_upstream: Option<AnthropicUpstream>,
 }
 
 #[derive(Clone)]
@@ -133,6 +134,12 @@ pub async fn run(
         .as_ref()
         .map(|url| OpenAiUpstream::new(url, Duration::from_secs(30)))
         .transpose()?;
+    let anthropic_upstream = cfg
+        .server
+        .anthropic_upstream_url
+        .as_ref()
+        .map(|url| AnthropicUpstream::new(url, Duration::from_secs(30)))
+        .transpose()?;
     let state = Arc::new(AppState {
         lifecycle: lifecycle.clone(),
         deferred,
@@ -146,6 +153,7 @@ pub async fn run(
         management_bind: cfg.server.management_bind.clone(),
         models: catalogue,
         openai_upstream,
+        anthropic_upstream,
     });
 
     let inference_app = inference_router(state.clone());
@@ -301,7 +309,22 @@ async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Res
             .into_response();
     };
 
-    let reply = anthropic_messages::handle_messages(&body);
+    let reply = if let Some(upstream) = &state.anthropic_upstream {
+        anthropic_messages::handle_messages_with_upstream(&body, upstream).await
+    } else {
+        anthropic_messages::handle_messages(&body)
+    };
+    if let Some(attempt) = &reply.attempt {
+        if attempt.finished_at.is_some() {
+            tracing::info!(
+                request_id = %attempt.request_id.0,
+                attempt_id = %attempt.id.0,
+                status = ?attempt.status,
+                finished_at = ?attempt.finished_at,
+                "messages upstream attempt finished"
+            );
+        }
+    }
     (reply.status, Json(reply.body)).into_response()
 }
 

@@ -5,6 +5,8 @@ management_bind = "[::]:8790"
 drain_timeout_seconds = 60
 # Set to the OpenAI-compatible upstream origin to enable non-stream chat forwarding.
 # openai_upstream_url = "http://127.0.0.1:18080"
+# Set to an Anthropic-compatible upstream origin to enable non-stream Messages forwarding.
+# anthropic_upstream_url = "http://127.0.0.1:18080"
 
 [database]
 url = "sqlite://data/steve.db?mode=rwc"
