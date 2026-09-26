@@ -2,12 +2,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Logical request identifier. Generated as a time-ordered UUID.
+/// Logical request identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RequestId(pub Uuid);
 
-/// Upstream attempt identifier. Generated as a time-ordered UUID.
+/// Upstream attempt identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AttemptId(pub Uuid);
@@ -47,8 +47,9 @@ pub struct RequestAttempt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use chrono::DateTime;
+    use crate::proxy::{AttemptId, AttemptStatus, Request, RequestAttempt, RequestId};
+    use chrono::{DateTime, Utc};
+    use uuid::Uuid;
 
     fn timestamp() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-09-26T08:34:00Z")
