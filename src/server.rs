@@ -21,6 +21,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    future::Future,
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -181,35 +182,65 @@ pub async fn run(
     let timeout = Duration::from_secs(cfg.server.drain_timeout_seconds);
     let signal_tx = shutdown_tx.clone();
 
-    let signal_task = tokio::spawn(async move {
-        let reason = shutdown_signal().await;
-        shutdown_lifecycle.drain(reason);
-
-        let result = tokio::time::timeout(timeout, shutdown_lifecycle.wait_for_zero()).await;
-        if result.is_err() {
-            tracing::warn!(
-                event = "drain_timeout",
-                timeout_seconds = timeout.as_secs(),
-                inflight = shutdown_lifecycle.inflight(),
-                "drain deadline reached"
-            );
-        }
-
-        let _ = signal_tx.send(true);
-    });
-
     let inference = axum::serve(inference_listener, inference_app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
     let management = axum::serve(management_listener, management_app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx));
 
-    let result = tokio::try_join!(inference, management);
+    let result = serve_until_drained(
+        async { tokio::try_join!(inference, management).map(|_| ()) },
+        shutdown_signal(),
+        shutdown_lifecycle,
+        timeout,
+        signal_tx,
+    )
+    .await;
     let _ = shutdown_tx.send(true);
-    signal_task.abort();
 
     lifecycle.stopped("listeners_exited");
     result?;
     Ok(())
+}
+
+async fn serve_until_drained<S, F>(
+    serving: S,
+    signal: F,
+    lifecycle: Lifecycle,
+    timeout: Duration,
+    shutdown_tx: watch::Sender<bool>,
+) -> std::io::Result<()>
+where
+    S: Future<Output = std::io::Result<()>>,
+    F: Future<Output = &'static str>,
+{
+    let drain = async {
+        lifecycle.drain(signal.await);
+        let timed_out = tokio::time::timeout(timeout, lifecycle.wait_for_zero())
+            .await
+            .is_err();
+        if timed_out {
+            tracing::warn!(
+                event = "drain_timeout",
+                timeout_seconds = timeout.as_secs(),
+                inflight = lifecycle.inflight(),
+                "drain deadline reached"
+            );
+        }
+        let _ = shutdown_tx.send(true);
+        timed_out
+    };
+
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => result,
+        timed_out = drain => {
+            if timed_out {
+                Ok(())
+            } else {
+                serving.await
+            }
+        }
+    }
 }
 
 fn inference_router(state: Arc<AppState>) -> Router {
@@ -356,22 +387,26 @@ async fn responses(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Re
 }
 
 fn hold_inflight_until_body_end(response: Response, guard: InflightGuard) -> Response {
+    hold_guard_until_body_end(response, guard)
+}
+
+fn hold_guard_until_body_end<G: Send + Unpin + 'static>(response: Response, guard: G) -> Response {
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        Body::from_stream(InflightBody {
+        Body::from_stream(GuardedBody {
             inner: body.into_data_stream(),
             guard: Some(guard),
         }),
     )
 }
 
-struct InflightBody {
+struct GuardedBody<G> {
     inner: BodyDataStream,
-    guard: Option<InflightGuard>,
+    guard: Option<G>,
 }
 
-impl Stream for InflightBody {
+impl<G: Unpin> Stream for GuardedBody<G> {
     type Item = Result<bytes::Bytes, axum::Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
@@ -439,17 +474,40 @@ async fn track_requests(
     request: Request,
     next: Next,
 ) -> Response {
-    let (counter, class_name) = match &class {
-        RequestClass::Inference(counters) => (&counters.inference, "inference"),
-        RequestClass::Management(counters) => (&counters.management, "management"),
-    };
-
-    counter.fetch_add(1, Ordering::Relaxed);
+    let guard = RequestCounterGuard::new(class);
     let response = next.run(request).await;
-    counter.fetch_sub(1, Ordering::Relaxed);
+    hold_guard_until_body_end(response, guard)
+}
 
-    tracing::trace!(request_class = class_name, "request completed");
-    response
+struct RequestCounterGuard(RequestClass);
+
+impl RequestCounterGuard {
+    fn new(class: RequestClass) -> Self {
+        class.counter().fetch_add(1, Ordering::Relaxed);
+        Self(class)
+    }
+}
+
+impl RequestClass {
+    fn counter(&self) -> &AtomicU64 {
+        match self {
+            Self::Inference(counters) => &counters.inference,
+            Self::Management(counters) => &counters.management,
+        }
+    }
+}
+
+impl Drop for RequestCounterGuard {
+    fn drop(&mut self) {
+        self.0.counter().fetch_sub(1, Ordering::Relaxed);
+        tracing::trace!(
+            request_class = match self.0 {
+                RequestClass::Inference(_) => "inference",
+                RequestClass::Management(_) => "management",
+            },
+            "request completed"
+        );
+    }
 }
 
 async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
@@ -495,6 +553,114 @@ mod tests {
     use http_body_util::BodyExt;
     use tokio_stream::StreamExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn drain_deadline_cancels_stuck_serving_future() {
+        let lifecycle = Lifecycle::new();
+        lifecycle.ready("test");
+        let _guard = lifecycle.enter().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (serve_tx, serve_rx) = tokio::sync::oneshot::channel::<()>();
+        let serving = async move {
+            let _ = serve_rx.await;
+            Ok(())
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            serve_until_drained(
+                serving,
+                async { "test" },
+                lifecycle.clone(),
+                Duration::from_millis(10),
+                shutdown_tx,
+            ),
+        )
+        .await
+        .expect("drain deadline must end the serving wait")
+        .unwrap();
+
+        assert_eq!(lifecycle.phase(), Phase::Draining);
+        assert!(*shutdown_rx.borrow());
+        assert!(serve_tx.is_closed());
+    }
+
+    fn tracked_stream_router(
+        counters: Arc<RequestCounters>,
+        rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+    ) -> Router {
+        let rx = Arc::new(std::sync::Mutex::new(Some(rx)));
+        Router::new()
+            .route(
+                "/",
+                get(move || {
+                    let rx = rx.clone();
+                    async move {
+                        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(
+                            rx.lock().unwrap().take().unwrap(),
+                        ))
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                RequestClass::Inference(counters),
+                track_requests,
+            ))
+    }
+
+    #[tokio::test]
+    async fn request_counter_stays_active_until_stream_eof() {
+        let counters = Arc::new(RequestCounters::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let response = tracked_stream_router(counters.clone(), rx)
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+
+        tx.send(Ok(bytes::Bytes::from_static(b"data: done\n\n")))
+            .await
+            .unwrap();
+        drop(tx);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            bytes::Bytes::from_static(b"data: done\n\n")
+        );
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn request_counter_decrements_when_stream_body_is_dropped() {
+        let counters = Arc::new(RequestCounters::default());
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let response = tracked_stream_router(counters.clone(), rx)
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+        drop(response);
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn request_counter_decrements_when_handler_is_cancelled() {
+        let counters = Arc::new(RequestCounters::default());
+        let app = Router::new()
+            .route("/", get(|| async { std::future::pending::<()>().await }))
+            .layer(middleware::from_fn_with_state(
+                RequestClass::Inference(counters.clone()),
+                track_requests,
+            ));
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
 
     #[tokio::test]
     async fn streaming_response_keeps_drain_waiting_until_body_ends() {
