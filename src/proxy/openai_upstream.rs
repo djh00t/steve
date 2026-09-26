@@ -503,14 +503,38 @@ mod tests {
             while !request.windows(4).any(|window| window == b"\r\n\r\n") {
                 let count = socket.read(&mut buf).await.unwrap();
                 if count == 0 {
-                    return;
+                    return Ok::<(), String>(());
                 }
                 request.extend_from_slice(&buf[..count]);
+            }
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length:")
+                        .or_else(|| line.strip_prefix("Content-Length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut remaining = content_length.saturating_sub(request.len() - header_end);
+            while remaining > 0 {
+                let count = socket.read(&mut buf).await.unwrap();
+                if count == 0 {
+                    return Ok(());
+                }
+                remaining = remaining.saturating_sub(count);
             }
             socket.write_all(
                 b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 1024\r\nconnection: close\r\n\r\ndata: first\n\n",
             ).await.unwrap();
-            let _ = socket.read(&mut buf).await;
+            match socket.read(&mut buf).await {
+                Ok(0) | Err(_) => Ok(()),
+                Ok(count) => Err(format!("received {count} bytes after cancellation")),
+            }
         });
         let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
         let cancel = CancelToken::new();
@@ -527,7 +551,8 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .expect("upstream socket was not dropped")
-            .unwrap();
+            .unwrap()
+            .expect("upstream socket received bytes instead of closing");
     }
 
     #[tokio::test]
