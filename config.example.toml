@@ -1,6 +1,7 @@
 [server]
-# [::] with dual-stack enabled accepts both IPv6 and IPv4 connections.
-bind = "[::]:11435"
+# Unspecified IPv6 with IPV6_V6ONLY disabled accepts IPv6 and IPv4.
+inference_bind = "[::]:11435"
+management_bind = "[::]:8790"
 drain_timeout_seconds = 60
 
 [database]
