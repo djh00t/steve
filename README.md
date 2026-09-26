@@ -69,3 +69,7 @@ The MVP stays a complete vertical slice. Delivery order is in the [MVP plan](doc
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Before pushing, run `make check` and `make quality-gates`.
+
+## License
+
+Apache-2.0 — Copyright (c) 2026 David Hooton. See [LICENSE](LICENSE).
