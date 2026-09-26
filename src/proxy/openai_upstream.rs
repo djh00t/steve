@@ -296,7 +296,14 @@ mod tests {
     use crate::proxy::stream::CancelToken;
     use crate::proxy::{OpenAiUpstream, SteveError};
     use crate::test_upstream;
-    use axum::{http::StatusCode, routing::post, Router};
+    use axum::{
+        body::Body,
+        http::{header, HeaderValue, StatusCode},
+        response::IntoResponse,
+        routing::post,
+        Router,
+    };
+    use bytes::Bytes;
     use serde_json::{json, Value};
     use std::time::Duration;
     use tokio_stream::StreamExt;
@@ -424,6 +431,60 @@ mod tests {
             assert!(body.contains("responses-fixture"));
         }
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_stream_body_continues_after_header_timeout() {
+        let (addr, server) = spawn(Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move {
+                    tx.send(Ok::<_, std::io::Error>(Bytes::from_static(b"first")))
+                        .await
+                        .expect("send first chunk");
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    tx.send(Ok(Bytes::from_static(b"last")))
+                        .await
+                        .expect("send final chunk");
+                });
+
+                let mut response =
+                    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+                        .into_response();
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }),
+        ))
+        .await;
+        let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_millis(100))
+            .expect("client");
+        let mut stream = client
+            .create_response_stream(&json!({"model": "m"}), CancelToken::new())
+            .await
+            .expect("headers arrive before timeout");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("first chunk arrives")
+                .expect("first chunk exists")
+                .expect("first chunk succeeds"),
+            Bytes::from_static(b"first")
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("delayed final chunk arrives")
+                .expect("final chunk exists")
+                .expect("final chunk succeeds"),
+            Bytes::from_static(b"last")
+        );
+        assert!(stream.next().await.is_none());
         server.abort();
     }
 
