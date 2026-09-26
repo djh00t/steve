@@ -71,7 +71,20 @@ jobs:
         run: |
           python -m pip install "moto[server]==5.2.3"
           S3_IGNORE_SUBDOMAIN_BUCKETNAME=true moto_server -H 127.0.0.1 -p 5000 >/tmp/moto.log 2>&1 &
-          until curl -fsS http://127.0.0.1:5000/ >/dev/null; do sleep 1; done
+          python - <<'PY'
+          import socket
+          import time
+
+          deadline = time.time() + 60
+          while True:
+              try:
+                  with socket.create_connection(("127.0.0.1", 5000), timeout=1):
+                      break
+              except OSError:
+                  if time.time() >= deadline:
+                      raise
+                  time.sleep(1)
+          PY
           python - <<'PY'
           import boto3
           s3 = boto3.client(
