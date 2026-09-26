@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use axum::{
-    body::{Body, BodyDataStream},
+    body::{Body, HttpBody},
     extract::{FromRef, Request, State},
     http::StatusCode,
     middleware::{self, Next},
@@ -18,6 +18,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use http_body::{Frame, SizeHint};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -32,7 +33,6 @@ use std::{
     time::Duration,
 };
 use tokio::{signal, sync::watch};
-use tokio_stream::Stream;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -394,28 +394,40 @@ fn hold_guard_until_body_end<G: Send + Unpin + 'static>(response: Response, guar
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        Body::from_stream(GuardedBody {
-            inner: body.into_data_stream(),
+        Body::new(GuardedBody {
+            inner: body,
             guard: Some(guard),
         }),
     )
 }
 
 struct GuardedBody<G> {
-    inner: BodyDataStream,
+    inner: Body,
     guard: Option<G>,
 }
 
-impl<G: Unpin> Stream for GuardedBody<G> {
-    type Item = Result<bytes::Bytes, axum::Error>;
+impl<G: Unpin> HttpBody for GuardedBody<G> {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        let result = Pin::new(&mut this.inner).poll_next(cx);
+        let result = Pin::new(&mut this.inner).poll_frame(cx);
         if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
             this.guard.take();
         }
         result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -549,7 +561,7 @@ pub(crate) async fn shutdown_signal() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{body::HttpBody, http::Request};
     use http_body_util::BodyExt;
     use tokio_stream::StreamExt;
     use tower::ServiceExt;
@@ -639,6 +651,49 @@ mod tests {
             .unwrap();
         assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
         drop(response);
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn tracked_response_preserves_size_hint_and_trailers() {
+        let counters = Arc::new(RequestCounters::default());
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Body::new(Body::from("ok").with_trailers(async {
+                        let mut trailers = axum::http::HeaderMap::new();
+                        trailers.insert("x-final-status", "complete".parse().unwrap());
+                        Some(Ok(trailers))
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                RequestClass::Inference(counters.clone()),
+                track_requests,
+            ));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+
+        assert_eq!(body.size_hint().exact(), Some(2));
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            bytes::Bytes::from_static(b"ok")
+        );
+        assert_eq!(
+            body.frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_trailers()
+                .unwrap()["x-final-status"],
+            "complete"
+        );
+        assert!(body.frame().await.is_none());
         assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
     }
 
