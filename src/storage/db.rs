@@ -1,11 +1,7 @@
 use crate::config::DatabaseConfig;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use sqlx::{
-    postgres::PgPoolOptions,
-    sqlite::SqlitePoolOptions,
-    PgPool, SqlitePool,
-};
+use sqlx::{postgres::PgPoolOptions, sqlite::SqlitePoolOptions, PgPool, SqlitePool};
 use std::path::Path;
 
 #[derive(Clone)]
@@ -39,10 +35,7 @@ impl Database {
             configure_sqlite(&hot).await?;
             configure_sqlite(&background).await?;
 
-            (
-                DatabasePool::Sqlite(hot),
-                DatabasePool::Sqlite(background),
-            )
+            (DatabasePool::Sqlite(hot), DatabasePool::Sqlite(background))
         } else if cfg.url.starts_with("postgres://") || cfg.url.starts_with("postgresql://") {
             let hot = PgPoolOptions::new()
                 .max_connections(cfg.hot_max_connections)
@@ -119,7 +112,9 @@ impl DatabasePool {
 }
 
 async fn configure_sqlite(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("PRAGMA journal_mode = WAL").execute(pool).await?;
+    sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(pool)
+        .await?;
     sqlx::query("PRAGMA synchronous = NORMAL")
         .execute(pool)
         .await?;
