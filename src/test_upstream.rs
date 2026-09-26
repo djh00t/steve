@@ -54,6 +54,7 @@ const CHAT_CONTENT_CHUNKS: [&str; 2] = ["steve-test-", "response"];
 const MESSAGE_ID: &str = "msg_steve_test";
 const MESSAGE_TEXT: &str = "steve-test-response";
 const RESPONSE_ID: &str = "resp_steve_test";
+const RESPONSE_TEXT: &str = "steve-test-response";
 const RESPONSE_TEXT_CHUNKS: [&str; 2] = ["steve-test-", "response"];
 
 pub async fn run(listen: SocketAddr) -> Result<()> {
@@ -179,7 +180,7 @@ fn response_json(model: &str) -> Value {
             "role": "assistant",
             "content": [{
                 "type": "output_text",
-                "text": "steve-test-response"
+                "text": RESPONSE_TEXT
             }]
         }],
         "usage": {
@@ -517,8 +518,32 @@ mod tests {
                 "response.completed"
             ]
         );
-        assert!(sse_body.contains(RESPONSE_TEXT_CHUNKS[0]));
-        assert!(sse_body.contains(RESPONSE_TEXT_CHUNKS[1]));
+        let deltas: Vec<String> = sse_body
+            .split("\n\n")
+            .filter_map(|block| {
+                let event = block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("event: "))?;
+                if event != "response.output_text.delta" {
+                    return None;
+                }
+                let data = block.lines().find_map(|line| line.strip_prefix("data: "))?;
+                Some(
+                    serde_json::from_str::<Value>(data).expect("delta json")["delta"]
+                        .as_str()
+                        .expect("delta text")
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            RESPONSE_TEXT_CHUNKS
+                .iter()
+                .map(|chunk| (*chunk).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(deltas.concat(), RESPONSE_TEXT);
         assert!(sse_body.contains(&response_json("responses-fixture").to_string()));
 
         server.abort();
