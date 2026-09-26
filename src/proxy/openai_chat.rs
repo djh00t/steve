@@ -123,6 +123,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
             }
         }
     };
+    record_handoff(&handoff);
     if handoff.stream {
         return ChatCompletionReply {
             status: StatusCode::NOT_IMPLEMENTED,
