@@ -2,12 +2,20 @@
 //!
 //! Posts JSON to `{base_url}/v1/chat/completions` (or `{base_url}/chat/completions`
 //! when the base URL already ends in `/v1`) and parses the JSON response.
-//! Streaming responses are out of scope. The base URL must be absolute `http`;
-//! this slice is aimed at the deterministic test upstream.
+//! Streaming responses return unbuffered SSE bytes. The base URL must be
+//! absolute `http`; this slice is aimed at the deterministic test upstream.
 
+use super::stream::CancelToken;
+use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
-use std::time::Duration;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+use tokio_stream::Stream;
 
 /// Stub of Steve's structured error model.
 ///
@@ -32,6 +40,12 @@ pub enum SteveError {
 
     #[error("streaming chat completions are not supported by this client")]
     StreamingNotSupported,
+
+    #[error("upstream response content-type is not text/event-stream: {message}")]
+    UnexpectedContentType { message: String },
+
+    #[error("upstream request was cancelled")]
+    Cancelled,
 }
 
 /// HTTP client for one OpenAI-compatible chat-completions origin.
@@ -54,8 +68,8 @@ impl OpenAiUpstream {
         }
 
         let http = reqwest::Client::builder()
-            .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .pool_max_idle_per_host(0)
             .build()
             .map_err(|err| SteveError::Config {
                 message: format!("http client: {err}"),
@@ -106,6 +120,145 @@ impl OpenAiUpstream {
             .await
             .map_err(|err| map_http_error(err, self.timeout))
     }
+
+    /// POST a streaming chat completion and return the SSE body as bytes.
+    /// The timeout only bounds the response header wait; body reads are unbounded.
+    pub async fn chat_completion_stream(
+        &self,
+        request: &impl Serialize,
+        cancel: CancelToken,
+    ) -> Result<OpenAiEventStream, SteveError> {
+        if cancel.is_cancelled() {
+            return Err(SteveError::Cancelled);
+        }
+
+        let body = prepare_stream_body(request)?;
+        let send = self
+            .http
+            .post(chat_completions_url(&self.base_url))
+            .header(reqwest::header::ACCEPT, EVENT_STREAM)
+            .json(&body)
+            .send();
+        let cancel_for_wait = cancel.clone();
+        let response = tokio::select! {
+            biased;
+            () = cancel_for_wait.cancelled() => return Err(SteveError::Cancelled),
+            response = tokio::time::timeout(self.timeout, send) => {
+                match response {
+                    Ok(result) => result.map_err(|err| map_http_error(err, self.timeout))?,
+                    Err(_) => return Err(SteveError::Timeout { timeout_ms: duration_millis(self.timeout) }),
+                }
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SteveError::UpstreamStatus {
+                status: status.as_u16(),
+            });
+        }
+        if !is_event_stream(response.headers()) {
+            let message = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing")
+                .to_string();
+            return Err(SteveError::UnexpectedContentType { message });
+        }
+
+        Ok(OpenAiEventStream {
+            inner: Some(Box::pin(response.bytes_stream())),
+            cancel_fut: Box::pin(cancel.cancelled_future()),
+            _cancel: cancel,
+            finished: false,
+            timeout: self.timeout,
+        })
+    }
+}
+
+const EVENT_STREAM: &str = "text/event-stream";
+type UpstreamByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+/// Unbuffered OpenAI SSE body. Dropping it aborts the upstream response.
+pub struct OpenAiEventStream {
+    inner: Option<UpstreamByteStream>,
+    cancel_fut: Pin<Box<dyn Future<Output = ()> + Send>>,
+    _cancel: CancelToken,
+    finished: bool,
+    timeout: Duration,
+}
+
+impl OpenAiEventStream {
+    fn shutdown(&mut self) {
+        self.finished = true;
+        self.inner = None;
+    }
+}
+
+impl std::fmt::Debug for OpenAiEventStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiEventStream")
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Stream for OpenAiEventStream {
+    type Item = Result<Bytes, SteveError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        if this.cancel_fut.as_mut().poll(cx).is_ready() {
+            this.shutdown();
+            return Poll::Ready(Some(Err(SteveError::Cancelled)));
+        }
+        let Some(inner) = this.inner.as_mut() else {
+            this.finished = true;
+            return Poll::Ready(None);
+        };
+        match inner.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                this.shutdown();
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
+            Poll::Ready(Some(Err(err))) => {
+                let mapped = map_http_error(err, this.timeout);
+                this.shutdown();
+                Poll::Ready(Some(Err(mapped)))
+            }
+        }
+    }
+}
+
+fn prepare_stream_body(request: &impl Serialize) -> Result<Value, SteveError> {
+    let mut body = serde_json::to_value(request).map_err(|err| SteveError::Config {
+        message: format!("chat completion request is not valid JSON: {err}"),
+    })?;
+    if body.get("stream").and_then(Value::as_bool) == Some(false) {
+        return Err(SteveError::Config {
+            message: "SSE chat completion request must not set stream to false".into(),
+        });
+    }
+    let object = body.as_object_mut().ok_or_else(|| SteveError::Config {
+        message: "chat completion request must be a JSON object".into(),
+    })?;
+    object.insert("stream".into(), Value::Bool(true));
+    Ok(body)
+}
+
+fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(EVENT_STREAM))
 }
 
 fn normalize_base_url(raw: String) -> Result<String, SteveError> {
@@ -166,11 +319,17 @@ fn duration_millis(timeout: Duration) -> u64 {
 mod tests {
     use super::chat_completions_url;
     use crate::net::bind_listener;
+    use crate::proxy::stream::{pump_upstream, CancelToken, ReplayForbidden, ReplayGate};
     use crate::proxy::{OpenAiUpstream, SteveError};
     use crate::test_upstream;
-    use axum::{http::StatusCode, routing::post, Router};
+    use axum::{body::Body, http::StatusCode, routing::post, Router};
+    use bytes::Bytes;
+    use http_body_util::BodyExt;
     use serde_json::{json, Value};
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::Mutex;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
     #[test]
     fn base_url_joins_chat_completions_path() {
@@ -235,8 +394,182 @@ mod tests {
                 .await
                 .unwrap_or_else(|err| panic!("round trip {base_url}: {err}"));
             assert_chat_fixture(&body);
+
+            let stream = client
+                .chat_completion_stream(
+                    &json!({
+                        "model": "steve-test-model",
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    }),
+                    CancelToken::new(),
+                )
+                .await
+                .expect("sse round trip");
+            assert_eq!(collect_stream(stream).await, expected_chat_sse());
         }
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_yields_first_chunk_before_delayed_tail() {
+        let (tail_tx, tail_rx) = oneshot::channel::<()>();
+        let tail_rx = Arc::new(Mutex::new(Some(tail_rx)));
+        let (addr, server) = spawn(Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let tail_rx = tail_rx.clone();
+                move || {
+                    let tail_rx = tail_rx.clone();
+                    async move {
+                        let (tx, rx) = mpsc::channel(2);
+                        let _ = tx
+                            .send(Ok::<_, std::io::Error>(Bytes::from_static(
+                                b"data: first\n\n",
+                            )))
+                            .await;
+                        let tail_rx = tail_rx.lock().await.take().unwrap();
+                        tokio::spawn(async move {
+                            let _ = tail_rx.await;
+                            let _ = tx.send(Ok(Bytes::from_static(b"data: tail\n\n"))).await;
+                        });
+                        (
+                            [("content-type", "text/event-stream")],
+                            Body::from_stream(ReceiverStream::new(rx)),
+                        )
+                    }
+                }
+            }),
+        ))
+        .await;
+        let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let mut stream = client
+            .chat_completion_stream(&json!({"model":"m"}), CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"data: first\n\n")
+        );
+        tail_tx.send(()).unwrap();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"data: tail\n\n")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_dial_header_wait_and_body() {
+        let client = OpenAiUpstream::new("http://127.0.0.1:9", Duration::from_secs(1)).unwrap();
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            client
+                .chat_completion_stream(&json!({"model":"m"}), cancel)
+                .await,
+            Err(SteveError::Cancelled)
+        ));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(5)).unwrap();
+        let cancel = CancelToken::new();
+        let wait_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            client
+                .chat_completion_stream(&json!({"model":"m"}), wait_cancel)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        assert!(matches!(task.await.unwrap(), Err(SteveError::Cancelled)));
+        hold.abort();
+
+        let (addr, server) = spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { ([("content-type", "text/event-stream")], "data: first\n\n") }),
+        ))
+        .await;
+        let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let cancel = CancelToken::new();
+        let mut stream = client
+            .chat_completion_stream(&json!({"model":"m"}), cancel.clone())
+            .await
+            .unwrap();
+        assert!(stream.next().await.unwrap().is_ok());
+        cancel.cancel();
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(SteveError::Cancelled))
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn validates_sse_response_and_pumps_without_replay() {
+        let (status_addr, status_server) = spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { StatusCode::BAD_GATEWAY }),
+        ))
+        .await;
+        let client =
+            OpenAiUpstream::new(format!("http://{status_addr}"), Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            client
+                .chat_completion_stream(&json!({"model":"m"}), CancelToken::new())
+                .await,
+            Err(SteveError::UpstreamStatus { status: 502 })
+        ));
+        status_server.abort();
+        let (json_addr, json_server) = spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { ([("content-type", "application/json")], "{}") }),
+        ))
+        .await;
+        let client =
+            OpenAiUpstream::new(format!("http://{json_addr}"), Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            client
+                .chat_completion_stream(&json!({"model":"m"}), CancelToken::new())
+                .await,
+            Err(SteveError::UnexpectedContentType { .. })
+        ));
+        json_server.abort();
+
+        let (addr, server) = spawn(test_upstream::router()).await;
+        let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(1)).unwrap();
+        let cancel = CancelToken::new();
+        let gate = ReplayGate::new();
+        let stream = client
+            .chat_completion_stream(&json!({"model":"steve-test-model"}), cancel.clone())
+            .await
+            .unwrap();
+        let body = pump_upstream(&gate, cancel, stream)
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            expected_chat_sse()
+        );
+        assert!(gate.output_begun());
+        assert_eq!(
+            pump_upstream(
+                &gate,
+                CancelToken::new(),
+                tokio_stream::empty::<Result<Bytes, SteveError>>()
+            )
+            .err(),
+            Some(ReplayForbidden)
+        );
         server.abort();
     }
 
@@ -371,5 +704,31 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
         (addr, handle)
+    }
+
+    async fn collect_stream(mut stream: super::OpenAiEventStream) -> String {
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        String::from_utf8(body).unwrap()
+    }
+
+    fn expected_chat_sse() -> String {
+        let mut body = String::new();
+        for (index, content) in ["steve-test-", "response"].iter().enumerate() {
+            let mut delta = json!({"content": content});
+            if index == 0 {
+                delta["role"] = json!("assistant");
+            }
+            let finish_reason = if index == 1 {
+                json!("stop")
+            } else {
+                Value::Null
+            };
+            body.push_str(&format!("data: {}\n\n", json!({"id":"chatcmpl-steve-test","object":"chat.completion.chunk","created":0,"model":"steve-test-model","choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]})));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
     }
 }
