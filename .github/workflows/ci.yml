@@ -69,9 +69,11 @@ jobs:
 
       - name: Start S3-compatible test server
         run: |
-          python -m pip install "moto[server]==5.2.3"
-          # pip --user places moto_server in ~/.local/bin, which is not on PATH
-          # in this job. Invoke the module with the same interpreter instead.
+          # Distro pyOpenSSL still references cryptography's GEN_EMAIL symbol.
+          # Moto upgrades cryptography, so install a matching pyOpenSSL into the
+          # user site, where it is imported ahead of the distro package.
+          # The moto_server script lands in ~/.local/bin, which is not on PATH.
+          python -m pip install "moto[server]==5.2.3" "pyOpenSSL==26.4.0"
           S3_IGNORE_SUBDOMAIN_BUCKETNAME=true python -m moto.server -H 127.0.0.1 -p 5000 >/tmp/moto.log 2>&1 &
           python - <<'PY'
           import socket
