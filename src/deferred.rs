@@ -215,11 +215,7 @@ fn start_accounting_journal(
             let mut writer = BufWriter::new(file);
             while let Ok(event) = rx.recv() {
                 let write_result = serde_json::to_writer(&mut writer, &event)
-                    .and_then(|_| {
-                        writer
-                            .write_all(b"\n")
-                            .map_err(serde_json::Error::io)
-                    })
+                    .and_then(|_| writer.write_all(b"\n").map_err(serde_json::Error::io))
                     .and_then(|_| writer.flush().map_err(serde_json::Error::io));
 
                 if let Err(err) = write_result {
