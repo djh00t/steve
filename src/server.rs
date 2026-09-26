@@ -4,7 +4,7 @@ use crate::{
     lifecycle::{Lifecycle, Phase},
     models::{self, ModelList},
     net::{bind_listener, is_dual_stack_address},
-    proxy::openai_chat,
+    proxy::{anthropic_messages, openai_chat},
     storage::{Database, ObjectStorage},
 };
 use anyhow::{Context, Result};
@@ -198,6 +198,7 @@ fn inference_router(state: Arc<AppState>) -> Router {
         .route("/health/ready", get(ready))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(messages))
         .route("/api/v1/test/echo", post(echo))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -280,6 +281,19 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
 async fn drain(State(state): State<Arc<AppState>>) -> Json<Value> {
     state.lifecycle.drain("management_api");
     Json(json!({"phase": "draining"}))
+}
+
+async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
+    let Some(_guard) = state.lifecycle.enter() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "draining"})),
+        )
+            .into_response();
+    };
+
+    let reply = anthropic_messages::handle_messages(&body);
+    (reply.status, Json(reply.body)).into_response()
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
