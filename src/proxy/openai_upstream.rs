@@ -1,0 +1,375 @@
+//! Non-streaming OpenAI-compatible chat completions client.
+//!
+//! Posts JSON to `{base_url}/v1/chat/completions` (or `{base_url}/chat/completions`
+//! when the base URL already ends in `/v1`) and parses the JSON response.
+//! Streaming responses are out of scope. The base URL must be absolute `http`;
+//! this slice is aimed at the deterministic test upstream.
+
+use serde::Serialize;
+use serde_json::Value;
+use std::time::Duration;
+
+/// Stub of Steve's structured error model.
+///
+/// Only failures this client can observe are represented. Later proxy stages
+/// extend the same model.
+#[derive(Debug, thiserror::Error)]
+pub enum SteveError {
+    #[error("upstream client configuration is invalid: {message}")]
+    Config { message: String },
+
+    #[error("upstream request timed out after {timeout_ms}ms")]
+    Timeout { timeout_ms: u64 },
+
+    #[error("upstream transport failed: {message}")]
+    Transport { message: String },
+
+    #[error("upstream returned HTTP {status}")]
+    UpstreamStatus { status: u16 },
+
+    #[error("upstream response was not valid JSON: {message}")]
+    InvalidJson { message: String },
+
+    #[error("streaming chat completions are not supported by this client")]
+    StreamingNotSupported,
+}
+
+/// HTTP client for one OpenAI-compatible chat-completions origin.
+#[derive(Clone, Debug)]
+pub struct OpenAiUpstream {
+    base_url: String,
+    timeout: Duration,
+    http: reqwest::Client,
+}
+
+impl OpenAiUpstream {
+    /// `base_url` is an absolute `http` origin or an OpenAI-style `/v1` root.
+    /// `timeout` bounds connect, response headers, and the JSON body.
+    pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, SteveError> {
+        let base_url = normalize_base_url(base_url.into())?;
+        if timeout.is_zero() {
+            return Err(SteveError::Config {
+                message: "timeout must be greater than zero".into(),
+            });
+        }
+
+        let http = reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| SteveError::Config {
+                message: format!("http client: {err}"),
+            })?;
+
+        Ok(Self {
+            base_url,
+            timeout,
+            http,
+        })
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// POST a non-streaming chat completion and return the parsed JSON body.
+    ///
+    /// `request` is encoded as the JSON body. `stream: true` is rejected.
+    pub async fn chat_completion(&self, request: &impl Serialize) -> Result<Value, SteveError> {
+        let body = serde_json::to_value(request).map_err(|err| SteveError::Config {
+            message: format!("chat completion request is not valid JSON: {err}"),
+        })?;
+        if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            return Err(SteveError::StreamingNotSupported);
+        }
+
+        let url = chat_completions_url(&self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .timeout(self.timeout)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| map_http_error(err, self.timeout))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SteveError::UpstreamStatus {
+                status: status.as_u16(),
+            });
+        }
+
+        response
+            .json()
+            .await
+            .map_err(|err| map_http_error(err, self.timeout))
+    }
+}
+
+fn normalize_base_url(raw: String) -> Result<String, SteveError> {
+    let trimmed = raw.trim().trim_end_matches('/').to_string();
+    if trimmed.is_empty() {
+        return Err(SteveError::Config {
+            message: "base URL is empty".into(),
+        });
+    }
+
+    let url = reqwest::Url::parse(&trimmed).map_err(|err| SteveError::Config {
+        message: format!("base URL is invalid: {err}"),
+    })?;
+    if url.scheme() != "http" {
+        return Err(SteveError::Config {
+            message: "base URL must use http".into(),
+        });
+    }
+    if url.host_str().is_none() {
+        return Err(SteveError::Config {
+            message: "base URL is missing a host".into(),
+        });
+    }
+
+    Ok(trimmed)
+}
+
+fn chat_completions_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    }
+}
+
+fn map_http_error(err: reqwest::Error, timeout: Duration) -> SteveError {
+    if err.is_timeout() {
+        SteveError::Timeout {
+            timeout_ms: duration_millis(timeout),
+        }
+    } else if err.is_decode() {
+        SteveError::InvalidJson {
+            message: err.to_string(),
+        }
+    } else {
+        SteveError::Transport {
+            message: err.to_string(),
+        }
+    }
+}
+
+fn duration_millis(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat_completions_url;
+    use crate::net::bind_listener;
+    use crate::proxy::{OpenAiUpstream, SteveError};
+    use crate::test_upstream;
+    use axum::{http::StatusCode, routing::post, Router};
+    use serde_json::{json, Value};
+    use std::time::Duration;
+
+    #[test]
+    fn base_url_joins_chat_completions_path() {
+        assert_eq!(
+            chat_completions_url("http://127.0.0.1:18080"),
+            "http://127.0.0.1:18080/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("http://127.0.0.1:18080/"),
+            "http://127.0.0.1:18080/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("http://127.0.0.1:18080/v1"),
+            "http://127.0.0.1:18080/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("http://127.0.0.1:18080/v1/"),
+            "http://127.0.0.1:18080/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_base_url_and_zero_timeout() {
+        for base_url in ["", "   ", "/v1", "127.0.0.1:18080", "https://127.0.0.1/v1"] {
+            let err = OpenAiUpstream::new(base_url, Duration::from_secs(1)).expect_err(base_url);
+            match err {
+                SteveError::Config { message } => assert!(!message.is_empty()),
+                other => panic!("expected config error for {base_url}, got {other}"),
+            }
+        }
+
+        let err = OpenAiUpstream::new("http://127.0.0.1:9", Duration::ZERO).expect_err("zero");
+        match err {
+            SteveError::Config { message } => assert!(message.contains("timeout")),
+            other => panic!("expected config error, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn round_trip_against_test_upstream() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        assert!(addr.ip().is_loopback());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, test_upstream::router())
+                .await
+                .expect("serve test upstream");
+        });
+
+        let request = json!({
+            "model": "steve-test-model",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        for base_url in [format!("http://{addr}"), format!("http://{addr}/v1")] {
+            let client =
+                OpenAiUpstream::new(base_url.as_str(), Duration::from_secs(2)).expect("client");
+            assert_eq!(client.timeout(), Duration::from_secs(2));
+            let body = client
+                .chat_completion(&request)
+                .await
+                .unwrap_or_else(|err| panic!("round trip {base_url}: {err}"));
+            assert_chat_fixture(&body);
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_timeout_maps_to_error_stub() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        assert!(addr.ip().is_loopback());
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let _hold = socket;
+            std::future::pending::<()>().await;
+        });
+
+        let timeout = Duration::from_millis(200);
+        let client = OpenAiUpstream::new(format!("http://{addr}"), timeout).expect("client");
+        assert_eq!(client.timeout(), timeout);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.chat_completion(&json!({"model": "steve-test-model", "messages": []})),
+        )
+        .await
+        .expect("client timeout did not fire")
+        .expect_err("hung upstream should fail");
+
+        let message = err.to_string();
+        match err {
+            SteveError::Timeout { timeout_ms } => {
+                assert_eq!(timeout_ms, 200);
+                assert!(message.contains("timed out"));
+            }
+            other => panic!("expected timeout, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn maps_transport_status_and_invalid_json() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let closed = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        let client = OpenAiUpstream::new(format!("http://{closed}"), Duration::from_secs(1))
+            .expect("client");
+        let err = client
+            .chat_completion(&json!({"model": "m"}))
+            .await
+            .expect_err("refused");
+        match err {
+            SteveError::Transport { message } => assert!(!message.is_empty()),
+            other => panic!("expected transport error, got {other}"),
+        }
+
+        let (status_addr, status_server) = spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { StatusCode::BAD_GATEWAY }),
+        ))
+        .await;
+        let client = OpenAiUpstream::new(format!("http://{status_addr}"), Duration::from_secs(1))
+            .expect("client");
+        let err = client
+            .chat_completion(&json!({"model": "m"}))
+            .await
+            .expect_err("status");
+        match err {
+            SteveError::UpstreamStatus { status } => assert_eq!(status, 502),
+            other => panic!("expected status error, got {other}"),
+        }
+        status_server.abort();
+
+        let (json_addr, json_server) = spawn(Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    "not-json",
+                )
+            }),
+        ))
+        .await;
+        let client = OpenAiUpstream::new(format!("http://{json_addr}"), Duration::from_secs(1))
+            .expect("client");
+        let err = client
+            .chat_completion(&json!({"model": "m"}))
+            .await
+            .expect_err("json");
+        match err {
+            SteveError::InvalidJson { message } => assert!(!message.is_empty()),
+            other => panic!("expected invalid json, got {other}"),
+        }
+        json_server.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_streaming_requests_before_dialing() {
+        let client =
+            OpenAiUpstream::new("http://127.0.0.1:9", Duration::from_secs(1)).expect("client");
+        let err = client
+            .chat_completion(&json!({"model": "m", "stream": true}))
+            .await
+            .expect_err("stream");
+        assert!(matches!(err, SteveError::StreamingNotSupported));
+    }
+
+    fn assert_chat_fixture(body: &Value) {
+        assert_eq!(body["id"], "chatcmpl-steve-test");
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["model"], "steve-test-model");
+        assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "steve-test-response"
+        );
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["prompt_tokens"], 10);
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+        assert_eq!(body["usage"]["total_tokens"], 13);
+    }
+
+    async fn spawn(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        assert!(addr.ip().is_loopback());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (addr, handle)
+    }
+}
