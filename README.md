@@ -68,7 +68,7 @@ The MVP stays a complete vertical slice. Delivery order is in the [MVP plan](doc
 
 ## Chat Completions forwarding
 
-Set `server.openai_upstream_url` to an HTTP OpenAI-compatible origin (for example `http://127.0.0.1:18080` for `make test-upstream`). `POST /v1/chat/completions` forwards validated non-stream JSON and returns the upstream JSON. A completed attempt is recorded in memory and logged as `Success`; upstream failures return HTTP 502 (HTTP 504 for timeouts). Without an upstream URL, the existing HTTP 501 stub remains. Streaming still returns HTTP 501.
+Set `server.openai_upstream_url` to an HTTP OpenAI-compatible origin (for example `http://127.0.0.1:18080` for `make test-upstream`). `POST /v1/chat/completions` forwards validated non-stream JSON and returns the upstream JSON. An HTTP 503 receives one retry; each attempt is recorded in memory and logged with its outcome and timestamps. Other upstream failures, including other 5xx responses, 4xx responses, transport failures, and invalid JSON, are not retried and return HTTP 502; timeouts are not retried and return HTTP 504. Without an upstream URL, the existing HTTP 501 stub remains. Streaming still returns HTTP 501.
 
 ## Anthropic Messages ingress
 

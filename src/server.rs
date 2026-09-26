@@ -355,11 +355,16 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
     } else {
         openai_chat::handle_chat_completions(&body)
     };
-    if let Some(attempt) = &reply.attempt {
+    let attempt_count = reply
+        .request
+        .as_ref()
+        .map_or(0, |request| request.attempts.len());
+    for attempt in &reply.attempts {
         if attempt.finished_at.is_some() {
             tracing::info!(
                 request_id = %attempt.request_id.0,
                 attempt_id = %attempt.id.0,
+                attempt_count,
                 status = ?attempt.status,
                 finished_at = ?attempt.finished_at,
                 "chat completions upstream attempt finished"
