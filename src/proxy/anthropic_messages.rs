@@ -8,9 +8,8 @@
 //!
 //! A minimal body is `model`, `max_tokens`, and `messages`, with optional
 //! `stream` (default `false`). Invalid bodies are HTTP 400 in the Steve error
-//! model. A valid body forwards through a configured upstream when
-//! non-streaming; unconfigured and streaming requests return HTTP 501 with a
-//! typed stub.
+//! model. Valid requests forward through a configured upstream as JSON or
+//! SSE; unconfigured requests return HTTP 501 with a typed stub.
 
 use super::{
     stream::{pump_upstream, CancelToken, ReplayGate, SSE_CONTENT_TYPE},
