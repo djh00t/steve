@@ -8,10 +8,14 @@
 //!
 //! A minimal body is `model`, `max_tokens`, and `messages`, with optional
 //! `stream` (default `false`). Invalid bodies are HTTP 400 in the Steve error
-//! model. A valid body has no upstream in this slice, so the route returns
-//! HTTP 501 with a typed stub.
+//! model. A valid body forwards through a configured upstream when
+//! non-streaming; unconfigured and streaming requests return HTTP 501 with a
+//! typed stub.
 
-use super::{AttemptId, AttemptStatus, Request, RequestAttempt, RequestId};
+use super::{
+    AnthropicError as UpstreamError, AnthropicUpstream, AttemptId, AttemptStatus, Request,
+    RequestAttempt, RequestId,
+};
 use axum::http::StatusCode;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -89,11 +93,13 @@ impl From<&MessagesHandoff> for MessagesStub {
 pub(crate) enum MessagesReplyBody {
     Error(SteveErrorResponse),
     Stub(MessagesStub),
+    Success(Value),
 }
 
 pub(crate) struct MessagesReply {
     pub(crate) status: StatusCode,
     pub(crate) body: MessagesReplyBody,
+    pub(crate) attempt: Option<RequestAttempt>,
 }
 
 pub(crate) fn handle_messages(body: &[u8]) -> MessagesReply {
@@ -103,12 +109,73 @@ pub(crate) fn handle_messages(body: &[u8]) -> MessagesReply {
             MessagesReply {
                 status: StatusCode::NOT_IMPLEMENTED,
                 body: MessagesReplyBody::Stub(MessagesStub::from(&handoff)),
+                attempt: Some(handoff.attempt),
             }
         }
         Err(error) => MessagesReply {
             status: StatusCode::BAD_REQUEST,
             body: MessagesReplyBody::Error(SteveErrorResponse { error }),
+            attempt: None,
         },
+    }
+}
+
+pub(crate) async fn handle_messages_with_upstream(
+    body: &[u8],
+    upstream: &AnthropicUpstream,
+) -> MessagesReply {
+    let mut handoff = match parse_messages(body) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            return MessagesReply {
+                status: StatusCode::BAD_REQUEST,
+                body: MessagesReplyBody::Error(SteveErrorResponse { error }),
+                attempt: None,
+            }
+        }
+    };
+    record_handoff(&handoff);
+    if handoff.stream {
+        return MessagesReply {
+            status: StatusCode::NOT_IMPLEMENTED,
+            body: MessagesReplyBody::Stub(MessagesStub::from(&handoff)),
+            attempt: Some(handoff.attempt),
+        };
+    }
+
+    handoff.attempt.provider = "anthropic".into();
+    let request: Value = serde_json::from_slice(body).expect("validated JSON");
+    let result = upstream.create_message(&request).await;
+    handoff.attempt.finished_at = Some(Utc::now());
+    let (status, response) = match result {
+        Ok(value) => {
+            handoff.attempt.status = AttemptStatus::Success;
+            (StatusCode::OK, MessagesReplyBody::Success(value))
+        }
+        Err(error) => {
+            handoff.attempt.status = AttemptStatus::UpstreamError;
+            let status = if matches!(error, UpstreamError::Timeout { .. }) {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                status,
+                MessagesReplyBody::Error(SteveErrorResponse {
+                    error: SteveError {
+                        message: error.to_string(),
+                        kind: "api_error",
+                        code: "upstream_error",
+                        param: None,
+                    },
+                }),
+            )
+        }
+    };
+    MessagesReply {
+        status,
+        body: response,
+        attempt: Some(handoff.attempt),
     }
 }
 
@@ -233,19 +300,46 @@ fn record_handoff(handoff: &MessagesHandoff) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{net::bind_listener, test_upstream};
     use serde_json::json;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn non_stream_messages_reaches_test_upstream_and_finishes_attempt() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, test_upstream::router())
+                .await
+                .unwrap();
+        });
+        let client =
+            AnthropicUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let raw = br#"{"model":"steve-test-model","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
+
+        let reply = handle_messages_with_upstream(raw, &client).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            serde_json::to_value(&reply.body).unwrap()["content"][0]["text"],
+            "steve-test-response"
+        );
+        let attempt = reply.attempt.expect("request attempt");
+        assert_eq!(attempt.status, AttemptStatus::Success);
+        assert!(attempt.finished_at.is_some());
+        server.abort();
+    }
 
     fn error_body(reply: MessagesReply) -> SteveErrorResponse {
         match reply.body {
             MessagesReplyBody::Error(error) => error,
-            MessagesReplyBody::Stub(_) => panic!("expected Steve error"),
+            _ => panic!("expected Steve error"),
         }
     }
 
     fn stub_body(reply: MessagesReply) -> MessagesStub {
         match reply.body {
             MessagesReplyBody::Stub(stub) => stub,
-            MessagesReplyBody::Error(_) => panic!("expected typed stub"),
+            _ => panic!("expected typed stub"),
         }
     }
 
