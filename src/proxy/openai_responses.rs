@@ -166,9 +166,9 @@ pub(crate) async fn handle_responses_with_upstream(
     if handoff.stream {
         let cancel = CancelToken::new();
         let gate = ReplayGate::new();
-        let mut pending = PendingStreamAttempt {
+        let mut pending = PendingAttempt {
             attempt: attempt.clone(),
-            cancel: cancel.clone(),
+            cancel: Some(cancel.clone()),
             armed: true,
         };
         match upstream
@@ -195,7 +195,12 @@ pub(crate) async fn handle_responses_with_upstream(
         }
     }
 
-    match upstream.create_response(&request).await {
+    let mut pending = PendingAttempt {
+        attempt: attempt.clone(),
+        cancel: None,
+        armed: true,
+    };
+    let reply = match upstream.create_response(&request).await {
         Ok(value) => {
             finish_attempt(&attempt, AttemptStatus::Success);
             ResponsesReply {
@@ -205,7 +210,9 @@ pub(crate) async fn handle_responses_with_upstream(
             }
         }
         Err(error) => upstream_failure(attempt, error),
-    }
+    };
+    pending.armed = false;
+    reply
 }
 
 fn upstream_failure(attempt: Arc<Mutex<RequestAttempt>>, error: UpstreamError) -> ResponsesReply {
@@ -245,16 +252,18 @@ fn finish_attempt(attempt: &Arc<Mutex<RequestAttempt>>, status: AttemptStatus) {
     );
 }
 
-struct PendingStreamAttempt {
+struct PendingAttempt {
     attempt: Arc<Mutex<RequestAttempt>>,
-    cancel: CancelToken,
+    cancel: Option<CancelToken>,
     armed: bool,
 }
 
-impl Drop for PendingStreamAttempt {
+impl Drop for PendingAttempt {
     fn drop(&mut self) {
         if self.armed {
-            self.cancel.cancel();
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
             finish_attempt(&self.attempt, AttemptStatus::Cancelled);
         }
     }
@@ -495,9 +504,9 @@ mod tests {
             let attempt = attempt.clone();
             let cancel = cancel.clone();
             async move {
-                let _pending = PendingStreamAttempt {
+                let _pending = PendingAttempt {
                     attempt,
-                    cancel,
+                    cancel: Some(cancel),
                     armed: true,
                 };
                 ready_tx.send(()).unwrap();
@@ -512,6 +521,63 @@ mod tests {
         let attempt = attempt.lock().unwrap();
         assert_eq!(attempt.status, AttemptStatus::Cancelled);
         assert!(attempt.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn aborted_json_response_wait_cancels_pending_attempt() {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            let reached = reached.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    axum::Router::new().route(
+                        "/v1/responses",
+                        axum::routing::post(move || {
+                            let reached = reached.clone();
+                            async move {
+                                reached.notify_one();
+                                std::future::pending::<StatusCode>().await
+                            }
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let upstream =
+            OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let handoff = parse_responses(br#"{"model":"m","input":"hi"}"#).unwrap();
+        let attempt = Arc::new(Mutex::new(handoff.attempt));
+        let waiting = tokio::spawn({
+            let attempt = attempt.clone();
+            async move {
+                let _pending = PendingAttempt {
+                    attempt,
+                    cancel: None,
+                    armed: true,
+                };
+                let _ = upstream
+                    .create_response(&json!({"model":"m","input":"hi"}))
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), reached.notified())
+            .await
+            .expect("upstream received JSON request");
+        assert_eq!(attempt.lock().unwrap().status, AttemptStatus::Pending);
+        waiting.abort();
+        let _ = waiting.await;
+        {
+            let attempt = attempt.lock().unwrap();
+            assert_eq!(attempt.status, AttemptStatus::Cancelled);
+            assert!(attempt.finished_at.is_some());
+        }
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
