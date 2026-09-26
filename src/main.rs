@@ -1,6 +1,7 @@
 mod config;
 mod deferred;
 mod lifecycle;
+mod models;
 mod net;
 mod server;
 mod storage;

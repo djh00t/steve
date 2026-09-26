@@ -15,8 +15,22 @@ pub struct Config {
     pub object_storage: ObjectStorageConfig,
     pub queues: QueueConfig,
     pub logging: LoggingConfig,
+    pub models: Vec<ModelConfig>,
     #[serde(skip)]
     source: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct ModelConfig {
+    pub id: String,
+    #[serde(default = "default_model_owner")]
+    pub owned_by: String,
+    #[serde(default)]
+    pub created: i64,
+}
+
+fn default_model_owner() -> String {
+    "steve".to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -209,6 +223,41 @@ mod tests {
         let server = ServerConfig::default();
         assert_eq!(server.inference_bind, "[::]:11435");
         assert_eq!(server.management_bind, "[::]:8790");
+    }
+
+    #[test]
+    fn configured_models_parse_from_toml() {
+        let raw = r#"
+            [[models]]
+            id = "gpt-local"
+            owned_by = "lab"
+            created = 42
+
+            [[models]]
+            id = "bare-model"
+        "#;
+        let cfg: Config = toml::from_str(raw).expect("parse");
+        assert_eq!(
+            cfg.models,
+            vec![
+                ModelConfig {
+                    id: "gpt-local".into(),
+                    owned_by: "lab".into(),
+                    created: 42,
+                },
+                ModelConfig {
+                    id: "bare-model".into(),
+                    owned_by: "steve".into(),
+                    created: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_models_section_is_empty_until_catalogue_resolution() {
+        let cfg = Config::default();
+        assert!(cfg.models.is_empty());
     }
 
     #[test]
