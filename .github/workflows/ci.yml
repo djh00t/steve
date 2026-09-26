@@ -16,6 +16,4 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+      - run: make quality-gates
