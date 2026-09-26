@@ -1,5 +1,6 @@
 pub(crate) mod anthropic_messages;
 pub(crate) mod openai_chat;
+pub(crate) mod openai_responses;
 #[cfg_attr(not(test), allow(dead_code))]
 mod openai_upstream;
 mod types;
