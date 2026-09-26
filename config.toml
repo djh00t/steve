@@ -13,6 +13,8 @@ root = "data/objects"
 
 [queues]
 accounting = 4096
+accounting_journal = "data/accounting-overflow.jsonl"
+accounting_journal_queue = 1024
 history = 2048
 telemetry = 8192
 

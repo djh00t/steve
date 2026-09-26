@@ -50,6 +50,8 @@ pub struct ObjectStorageConfig {
 #[serde(default)]
 pub struct QueueConfig {
     pub accounting: usize,
+    pub accounting_journal: String,
+    pub accounting_journal_queue: usize,
     pub history: usize,
     pub telemetry: usize,
 }
@@ -98,6 +100,8 @@ impl Default for QueueConfig {
     fn default() -> Self {
         Self {
             accounting: 4096,
+            accounting_journal: "data/accounting-overflow.jsonl".into(),
+            accounting_journal_queue: 1024,
             history: 2048,
             telemetry: 8192,
         }

@@ -67,7 +67,7 @@ async fn serve(cfg: Config) -> Result<()> {
     db.migrate().await?;
     let objects = ObjectStorage::from_config(&cfg.object_storage).await?;
     let lifecycle = Lifecycle::new();
-    let deferred = DeferredQueues::start(&cfg, db.background().clone(), objects.clone());
+    let deferred = DeferredQueues::start(&cfg, db.background(), objects.clone()).await?;
 
     server::run(cfg, db, objects, deferred, lifecycle).await
 }

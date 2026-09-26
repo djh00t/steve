@@ -22,6 +22,9 @@ root = "data/objects"
 
 [queues]
 accounting = 4096
+# Authoritative accounting spills here if the primary async queue or DB is unavailable.
+accounting_journal = "data/accounting-overflow.jsonl"
+accounting_journal_queue = 1024
 history = 2048
 telemetry = 8192
 
