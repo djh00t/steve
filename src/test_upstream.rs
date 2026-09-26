@@ -68,7 +68,8 @@ pub async fn run(listen: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-fn router() -> Router {
+/// Routes for the deterministic test upstream. Tests serve this on loopback.
+pub(crate) fn router() -> Router {
     Router::new()
         .route("/health/live", get(|| async { "ok" }))
         .route("/v1/chat/completions", post(chat_completions))
