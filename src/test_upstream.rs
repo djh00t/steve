@@ -53,6 +53,8 @@ const DEFAULT_MODEL: &str = "steve-test-model";
 const CHAT_CONTENT_CHUNKS: [&str; 2] = ["steve-test-", "response"];
 const MESSAGE_ID: &str = "msg_steve_test";
 const MESSAGE_TEXT: &str = "steve-test-response";
+const RESPONSE_ID: &str = "resp_steve_test";
+const RESPONSE_TEXT_CHUNKS: [&str; 2] = ["steve-test-", "response"];
 
 pub async fn run(listen: SocketAddr) -> Result<()> {
     let listener = bind_listener(listen).await?;
@@ -153,14 +155,22 @@ fn chat_sse_payload(model: &str) -> String {
     body
 }
 
-async fn responses(Json(request): Json<Value>) -> Json<Value> {
+async fn responses(Json(request): Json<Value>) -> Response {
     let model = request
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("steve-test-model");
+        .unwrap_or(DEFAULT_MODEL);
 
-    Json(json!({
-        "id": "resp_steve_test",
+    if request.get("stream").and_then(Value::as_bool) == Some(true) {
+        return responses_stream(model);
+    }
+
+    Json(response_json(model)).into_response()
+}
+
+fn response_json(model: &str) -> Value {
+    json!({
+        "id": RESPONSE_ID,
         "object": "response",
         "status": "completed",
         "model": model,
@@ -177,7 +187,47 @@ async fn responses(Json(request): Json<Value>) -> Json<Value> {
             "output_tokens": 3,
             "total_tokens": 13
         }
-    }))
+    })
+}
+
+fn responses_stream(model: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+
+    let mut body = String::new();
+    body.push_str(&sse_event(
+        "response.created",
+        &json!({
+            "type": "response.created",
+            "response": {
+                "id": RESPONSE_ID,
+                "object": "response",
+                "status": "in_progress",
+                "model": model
+            }
+        }),
+    ));
+    for chunk in RESPONSE_TEXT_CHUNKS {
+        body.push_str(&sse_event(
+            "response.output_text.delta",
+            &json!({
+                "type": "response.output_text.delta",
+                "delta": chunk
+            }),
+        ));
+    }
+    body.push_str(&sse_event(
+        "response.completed",
+        &json!({
+            "type": "response.completed",
+            "response": response_json(model)
+        }),
+    ));
+    (headers, body).into_response()
 }
 
 async fn anthropic_messages(Json(request): Json<Value>) -> Response {
@@ -404,6 +454,72 @@ mod tests {
         );
         assert!(sse_body.contains(MESSAGE_TEXT));
         assert!(sse_body.contains("claude-fixture"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn responses_json_and_sse_on_bound_addr() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        assert!(
+            addr.ip().is_loopback(),
+            "test dials only the bound loopback"
+        );
+
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router()).await.expect("serve");
+        });
+
+        let (json_head, json_body) = post_raw(
+            addr,
+            "/v1/responses",
+            r#"{"model":"responses-fixture","input":"hi"}"#,
+        )
+        .await;
+        assert!(json_head.starts_with("HTTP/1.1 200"), "{json_head}");
+        assert!(
+            json_head
+                .to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "json content-type: {json_head}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&json_body).expect("response json"),
+            response_json("responses-fixture")
+        );
+
+        let (sse_head, sse_body) = post_raw(
+            addr,
+            "/v1/responses",
+            r#"{"model":"responses-fixture","stream":true,"input":"hi"}"#,
+        )
+        .await;
+        assert!(sse_head.starts_with("HTTP/1.1 200"), "{sse_head}");
+        assert!(
+            sse_head
+                .to_ascii_lowercase()
+                .contains("content-type: text/event-stream"),
+            "sse content-type: {sse_head}"
+        );
+        let event_types: Vec<&str> = sse_body
+            .lines()
+            .filter_map(|line| line.strip_prefix("event: "))
+            .collect();
+        assert_eq!(
+            event_types,
+            [
+                "response.created",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.completed"
+            ]
+        );
+        assert!(sse_body.contains(RESPONSE_TEXT_CHUNKS[0]));
+        assert!(sse_body.contains(RESPONSE_TEXT_CHUNKS[1]));
+        assert!(sse_body.contains(&response_json("responses-fixture").to_string()));
 
         server.abort();
     }
