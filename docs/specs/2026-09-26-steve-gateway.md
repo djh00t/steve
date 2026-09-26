@@ -457,3 +457,144 @@ Avoid high-cardinality metric labels such as request IDs, prompt text, or user e
 - Make every automatic routing choice explainable.
 - Keep business/accounting data separate from high-volume telemetry.
 - No dependency name or implementation detail becomes part of Steve's public identity.
+
+
+## 17. Hot-path isolation and deferred work
+
+The forwarding and UI/API hot paths are latency-critical. Steve must not synchronously wait for work that is not required to produce the immediate response.
+
+### Hot-path rule
+
+A request may synchronously wait only for work required to safely select and execute an upstream request, including:
+
+- authentication/access checks needed to authorize the call;
+- session/account/routing state required for the current decision;
+- provider selection;
+- protocol transformation required for forwarding;
+- the provider call and streamed response itself.
+
+The hot path must not wait for:
+
+- telemetry export;
+- log shipping;
+- analytics aggregation;
+- usage rollups;
+- chat-history/object-store writes;
+- nonessential audit enrichment;
+- pricing refresh;
+- FX refresh;
+- report generation;
+- Grafana/OTLP delivery;
+- UI cache refresh.
+
+### Deferred-work architecture
+
+Noncritical side effects are published to bounded in-process queues and consumed by background workers.
+
+Requirements:
+
+- use Tokio async tasks and nonblocking channels;
+- never use an unbounded queue;
+- hot-path producers prefer `try_send`/equivalent over awaiting queue capacity;
+- queue pressure is observable;
+- work classes have independent queues/budgets so slow object storage cannot starve accounting or telemetry;
+- critical accounting/audit events may spill to a local durable journal when their queue is saturated rather than blocking forwarding;
+- lossy telemetry may be sampled or dropped under pressure, with explicit dropped-event counters;
+- background workers use bounded concurrency, timeouts, retries, and circuit breakers;
+- CPU-heavy serialization/compression/cryptography must use bounded blocking/worker pools rather than occupying async reactor threads;
+- database connection pools for request-critical reads and background writes are isolated or reserved so background work cannot exhaust the hot-path pool;
+- management/UI endpoints use independent concurrency limits from inference forwarding.
+
+The intended topology is:
+
+```text
+request/stream hot path
+  |
+  +--> immediate upstream forwarding
+  |
+  +--> try_enqueue accounting --------> durable/background accounting worker
+  +--> try_enqueue history -----------> object-store worker
+  +--> try_enqueue telemetry ---------> OTLP/log worker
+  +--> try_enqueue aggregation -------> rollup worker
+```
+
+Backpressure must degrade observability/history before it degrades forwarding. Authoritative accounting/audit data must not be silently lost: when it cannot be queued, Steve must use a durable local fallback journal and reconcile it asynchronously.
+
+### Cached routing state
+
+Routing must not run analytical database queries per request when avoidable.
+
+Maintain in-memory snapshots/caches for:
+
+- provider/account eligibility;
+- model capabilities;
+- price tables;
+- FX tables;
+- quota/rate-limit state;
+- rolling latency/reliability summaries;
+- active profiles/routes.
+
+Background tasks refresh those snapshots. Routing reads immutable/current snapshots with minimal locking and records the version used in each decision.
+
+## 18. Lifecycle, draining, and hitless upgrades
+
+Steve is designed for hitless or near-hitless upgrades.
+
+A process has explicit lifecycle states:
+
+```text
+starting -> ready -> draining -> stopped
+```
+
+Readiness is distinct from liveness:
+
+- liveness means the process is functioning;
+- readiness means it may accept new inference work;
+- a draining worker remains live but becomes unready immediately.
+
+Steve tracks active requests/streams. During drain:
+
+1. stop assigning new requests to the old worker;
+2. keep all existing HTTP/SSE streams alive;
+3. finish queued critical accounting/audit work or hand it to the replacement worker/durable journal;
+4. flush bounded state required for correctness;
+5. terminate only when active work reaches zero or the configured maximum drain deadline expires.
+
+### Upgrade coordinator
+
+The upgrade design must not require the serving worker to replace itself in-place.
+
+Use a small Steve supervisor/coordinator mode for managed native installs:
+
+```text
+stable client endpoint/listener
+        |
+   Steve supervisor
+      /       \
+ old worker  new worker
+ draining      ready
+```
+
+The supervisor owns or mediates the stable endpoint and worker lifecycle. An upgrade:
+
+1. downloads the new signed release to a versioned path;
+2. verifies checksum/signature and compatibility;
+3. starts the new worker with the same external configuration;
+4. waits for migrations/compatibility checks and readiness;
+5. atomically directs new work to the new worker;
+6. marks the old worker draining;
+7. waits for its active streams/tasks to complete;
+8. terminates the old worker;
+9. rolls back routing to the old worker automatically if the new worker fails before cutover completes.
+
+Container/Kubernetes deployments use the same readiness/drain semantics but normally delegate process replacement to the container orchestrator. Steve must support rolling upgrades with multiple replicas and must not depend on in-process self-update in that environment.
+
+Upgrade policy can be:
+
+- manual;
+- scheduled;
+- automatic within an allowed maintenance window.
+
+Database migrations required for hitless upgrades must follow expand/contract compatibility: a new release must be able to operate while the previous release is still draining. Destructive schema changes require a later cleanup release after all old workers are gone.
+
+Native macOS/Windows/Linux packaging can implement platform-specific listener handoff underneath the same supervisor contract. The public management API and lifecycle semantics remain cross-platform.
