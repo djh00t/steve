@@ -53,3 +53,35 @@ impl ObjectStorage {
         Ok(())
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ObjectStorageConfig;
+
+    #[tokio::test]
+    async fn filesystem_backend_round_trips_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = ObjectStorageConfig {
+            kind: "fs".into(),
+            root: dir.path().to_string_lossy().into_owned(),
+            bucket: None,
+            endpoint: None,
+            region: None,
+            access_key_id: None,
+            secret_access_key: None,
+        };
+
+        let store = ObjectStorage::from_config(&cfg).await.expect("create store");
+        store
+            .put("sessions/test.json", Bytes::from_static(br#"{"ok":true}"#))
+            .await
+            .expect("write");
+
+        let got = store.get("sessions/test.json").await.expect("read");
+        assert_eq!(got.as_ref(), br#"{"ok":true}"#);
+
+        store.delete("sessions/test.json").await.expect("delete");
+    }
+}
