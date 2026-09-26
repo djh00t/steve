@@ -337,8 +337,12 @@ async fn responses(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Re
             .into_response();
     };
 
-    let reply = openai_responses::handle_responses(&body);
-    (reply.status, Json(reply.body)).into_response()
+    let reply = if let Some(upstream) = &state.openai_upstream {
+        openai_responses::handle_responses_with_upstream(&body, upstream).await
+    } else {
+        openai_responses::handle_responses(&body)
+    };
+    reply.into_response()
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
