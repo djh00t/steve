@@ -86,7 +86,3 @@ Other Makefile targets: `make help`.
 - [MVP plan and backlog](docs/plans/2026-09-26-steve-mvp.md)
 
 M0 (clean foundation) is on `main`. Next work is M1 (real proxy hot path), issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10). Do not start M1 inside an unrelated hygiene change.
-
-## License
-
-Steve is Apache-2.0. See [LICENSE](LICENSE).
