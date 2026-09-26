@@ -1,9 +1,11 @@
-use crate::{config::Config, storage::ObjectStorage};
+use crate::{
+    config::Config,
+    storage::{DatabasePool, ObjectStorage},
+};
 use bytes::Bytes;
 use chrono::Utc;
 use serde::Serialize;
 use serde_json::Value;
-use sqlx::AnyPool;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -47,7 +49,7 @@ struct HistoryEvent {
 }
 
 impl DeferredQueues {
-    pub fn start(cfg: &Config, background_db: AnyPool, objects: ObjectStorage) -> Self {
+    pub fn start(cfg: &Config, background_db: DatabasePool, objects: ObjectStorage) -> Self {
         let (accounting_tx, mut accounting_rx) = mpsc::channel::<Event>(cfg.queues.accounting);
         let (history_tx, mut history_rx) = mpsc::channel::<HistoryEvent>(cfg.queues.history);
         let (telemetry_tx, mut telemetry_rx) = mpsc::channel::<Event>(cfg.queues.telemetry);
@@ -55,15 +57,14 @@ impl DeferredQueues {
 
         tokio::spawn(async move {
             while let Some(event) = accounting_rx.recv().await {
-                let result = sqlx::query(
-                    "INSERT INTO steve_background_events(id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
-                )
-                .bind(Uuid::now_v7().to_string())
-                .bind(event.kind)
-                .bind(event.payload.to_string())
-                .bind(Utc::now().to_rfc3339())
-                .execute(&background_db)
-                .await;
+                let result = background_db
+                    .insert_background_event(
+                        &Uuid::now_v7().to_string(),
+                        event.kind,
+                        &event.payload.to_string(),
+                        &Utc::now().to_rfc3339(),
+                    )
+                    .await;
                 if let Err(err) = result {
                     error!(%err, "background accounting write failed");
                 }
