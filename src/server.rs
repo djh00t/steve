@@ -4,7 +4,7 @@ use crate::{
     lifecycle::{Lifecycle, Phase},
     models::{self, ModelList},
     net::{bind_listener, is_dual_stack_address},
-    proxy::{anthropic_messages, openai_chat, openai_responses},
+    proxy::{anthropic_messages, openai_chat, openai_responses, OpenAiUpstream},
     storage::{Database, ObjectStorage},
 };
 use anyhow::{Context, Result};
@@ -50,6 +50,7 @@ struct AppState {
     inference_bind: String,
     management_bind: String,
     models: Arc<[ModelConfig]>,
+    openai_upstream: Option<OpenAiUpstream>,
 }
 
 #[derive(Clone)]
@@ -126,6 +127,12 @@ pub async fn run(
     );
 
     let counters = Arc::new(RequestCounters::default());
+    let openai_upstream = cfg
+        .server
+        .openai_upstream_url
+        .as_ref()
+        .map(|url| OpenAiUpstream::new(url, Duration::from_secs(30)))
+        .transpose()?;
     let state = Arc::new(AppState {
         lifecycle: lifecycle.clone(),
         deferred,
@@ -138,6 +145,7 @@ pub async fn run(
         inference_bind: cfg.server.inference_bind.clone(),
         management_bind: cfg.server.management_bind.clone(),
         models: catalogue,
+        openai_upstream,
     });
 
     let inference_app = inference_router(state.clone());
@@ -319,7 +327,22 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
             .into_response();
     };
 
-    let reply = openai_chat::handle_chat_completions(&body);
+    let reply = if let Some(upstream) = &state.openai_upstream {
+        openai_chat::handle_chat_completions_with_upstream(&body, upstream).await
+    } else {
+        openai_chat::handle_chat_completions(&body)
+    };
+    if let Some(attempt) = &reply.attempt {
+        if attempt.finished_at.is_some() {
+            tracing::info!(
+                request_id = %attempt.request_id.0,
+                attempt_id = %attempt.id.0,
+                status = ?attempt.status,
+                finished_at = ?attempt.finished_at,
+                "chat completions upstream attempt finished"
+            );
+        }
+    }
     (reply.status, Json(reply.body)).into_response()
 }
 
