@@ -103,18 +103,14 @@ impl DeferredQueues {
 
     pub fn history(&self, key: String, data: Bytes) {
         if self.history.try_send(HistoryEvent { key, data }).is_err() {
-            self.stats
-                .history_dropped
-                .fetch_add(1, Ordering::Relaxed);
+            self.stats.history_dropped.fetch_add(1, Ordering::Relaxed);
             warn!("history queue saturated; payload dropped");
         }
     }
 
     pub fn telemetry(&self, kind: &'static str, payload: Value) {
         if self.telemetry.try_send(Event { kind, payload }).is_err() {
-            self.stats
-                .telemetry_dropped
-                .fetch_add(1, Ordering::Relaxed);
+            self.stats.telemetry_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
