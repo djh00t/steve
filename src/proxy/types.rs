@@ -15,6 +15,7 @@ pub struct AttemptId(pub Uuid);
 /// Outcome of one upstream attempt. `Pending` means the attempt has started and not finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum AttemptStatus {
     Pending,
     UpstreamError,
