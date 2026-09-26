@@ -1,6 +1,9 @@
 use crate::{net::bind_listener, server::shutdown_signal};
 use anyhow::Result;
-use axum::{routing::{get, post}, Json, Router};
+use axum::{
+    routing::{get, post},
+    Json, Router,
+};
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 
