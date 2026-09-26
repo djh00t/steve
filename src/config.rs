@@ -130,9 +130,7 @@ impl Config {
         } else if override_path.is_some() || std::env::var_os("STEVE_CONFIG").is_some() {
             anyhow::bail!("configuration file not found: {}", path.display());
         } else {
-            let mut cfg = Self::default();
-            cfg.source = None;
-            cfg
+            Self::default()
         };
 
         if let Ok(v) = std::env::var("STEVE_BIND") {
