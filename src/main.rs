@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use deferred::DeferredQueues;
 use lifecycle::Lifecycle;
+use std::path::PathBuf;
 use storage::{Database, ObjectStorage};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -16,7 +17,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(name = "steve", version, about)]
 struct Cli {
     #[arg(long, global = true, env = "STEVE_CONFIG")]
-    config: Option<std::path::PathBuf>,
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -33,6 +34,15 @@ async fn main() -> Result<()> {
     let cfg = Config::load(cli.config.as_deref())?;
     init_tracing(&cfg);
 
+    tracing::info!(
+        event = "config_loaded",
+        source = %cfg.source_display(),
+        bind = %cfg.server.bind,
+        database = %cfg.database.backend(),
+        object_storage = %cfg.object_storage.kind,
+        "configuration loaded"
+    );
+
     match cli.command {
         Command::Serve => serve(cfg).await,
         Command::Doctor => doctor(cfg).await,
@@ -44,7 +54,9 @@ fn init_tracing(cfg: &Config) {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let registry = tracing_subscriber::registry().with(filter);
     if cfg.logging.json {
-        registry.with(tracing_subscriber::fmt::layer().json()).init();
+        registry
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
     } else {
         registry.with(tracing_subscriber::fmt::layer()).init();
     }
@@ -67,6 +79,6 @@ async fn doctor(cfg: Config) -> Result<()> {
     objects.check().await?;
     println!("database: ok");
     println!("object_storage: ok");
-    println!("configuration: ok");
+    println!("configuration: ok ({})", cfg.source_display());
     Ok(())
 }

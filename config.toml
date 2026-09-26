@@ -1,5 +1,4 @@
 [server]
-# [::] with dual-stack enabled accepts both IPv6 and IPv4 connections.
 bind = "[::]:11435"
 drain_timeout_seconds = 60
 
@@ -11,14 +10,6 @@ background_max_connections = 4
 [object_storage]
 kind = "fs"
 root = "data/objects"
-# For S3-compatible storage:
-# kind = "s3"
-# root = "/steve"
-# bucket = "steve"
-# endpoint = "http://127.0.0.1:9000"
-# region = "us-east-1"
-# access_key_id = "..."
-# secret_access_key = "..."
 
 [queues]
 accounting = 4096

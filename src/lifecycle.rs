@@ -14,6 +14,17 @@ pub enum Phase {
     Stopped,
 }
 
+impl Phase {
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Starting => 0,
+            Self::Ready => 1,
+            Self::Draining => 2,
+            Self::Stopped => 3,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Lifecycle {
     phase: Arc<AtomicU8>,
@@ -27,11 +38,17 @@ pub struct InflightGuard {
 
 impl Lifecycle {
     pub fn new() -> Self {
-        Self {
-            phase: Arc::new(AtomicU8::new(0)),
+        let lifecycle = Self {
+            phase: Arc::new(AtomicU8::new(Phase::Starting.as_u8())),
             inflight: Arc::new(AtomicU64::new(0)),
             changed: Arc::new(Notify::new()),
-        }
+        };
+        tracing::info!(
+            event = "state_initialized",
+            state = ?Phase::Starting,
+            "server state initialized"
+        );
+        lifecycle
     }
 
     pub fn phase(&self) -> Phase {
@@ -43,32 +60,59 @@ impl Lifecycle {
         }
     }
 
-    pub fn is_ready(&self) -> bool { self.phase() == Phase::Ready }
-    pub fn inflight(&self) -> u64 { self.inflight.load(Ordering::Acquire) }
-
-    pub fn ready(&self) {
-        self.phase.store(1, Ordering::Release);
-        self.changed.notify_waiters();
+    pub fn is_ready(&self) -> bool {
+        self.phase() == Phase::Ready
     }
 
-    pub fn drain(&self) {
-        self.phase.store(2, Ordering::Release);
-        self.changed.notify_waiters();
+    pub fn inflight(&self) -> u64 {
+        self.inflight.load(Ordering::Acquire)
     }
 
-    pub fn stopped(&self) {
-        self.phase.store(3, Ordering::Release);
+    pub fn ready(&self, reason: &'static str) {
+        self.transition(Phase::Ready, reason);
+    }
+
+    pub fn drain(&self, reason: &'static str) {
+        self.transition(Phase::Draining, reason);
+    }
+
+    pub fn stopped(&self, reason: &'static str) {
+        self.transition(Phase::Stopped, reason);
+    }
+
+    fn transition(&self, next: Phase, reason: &'static str) {
+        let previous = self.phase();
+        if previous == next {
+            return;
+        }
+
+        self.phase.store(next.as_u8(), Ordering::Release);
         self.changed.notify_waiters();
+
+        tracing::info!(
+            event = "state_changed",
+            from = ?previous,
+            to = ?next,
+            reason,
+            inflight = self.inflight(),
+            "server state changed"
+        );
     }
 
     pub fn enter(&self) -> Option<InflightGuard> {
-        if !self.is_ready() { return None; }
+        if !self.is_ready() {
+            return None;
+        }
+
         self.inflight.fetch_add(1, Ordering::AcqRel);
         if !self.is_ready() {
             self.inflight.fetch_sub(1, Ordering::AcqRel);
             return None;
         }
-        Some(InflightGuard { lifecycle: self.clone() })
+
+        Some(InflightGuard {
+            lifecycle: self.clone(),
+        })
     }
 
     pub async fn wait_for_zero(&self) {
@@ -86,7 +130,6 @@ impl Drop for InflightGuard {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,12 +137,14 @@ mod tests {
     #[tokio::test]
     async fn drain_rejects_new_work_and_waits_for_inflight() {
         let lifecycle = Lifecycle::new();
-        lifecycle.ready();
+        lifecycle.ready("test");
 
-        let guard = lifecycle.enter().expect("ready lifecycle should accept work");
+        let guard = lifecycle
+            .enter()
+            .expect("ready lifecycle should accept work");
         assert_eq!(lifecycle.inflight(), 1);
 
-        lifecycle.drain();
+        lifecycle.drain("test");
         assert_eq!(lifecycle.phase(), Phase::Draining);
         assert!(lifecycle.enter().is_none());
 
