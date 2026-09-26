@@ -2,26 +2,38 @@ use crate::{
     config::Config,
     deferred::DeferredQueues,
     lifecycle::{Lifecycle, Phase},
+    net::{bind_listener, is_dual_stack_address},
     storage::{Database, ObjectStorage},
 };
 use anyhow::{Context, Result};
 use axum::{
-    extract::State,
+    extract::{Request, State},
     http::StatusCode,
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    net::{SocketAddr, TcpListener as StdTcpListener},
-    sync::Arc,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
-use tokio::{net::TcpListener, signal};
+use tokio::{signal, sync::watch};
 use tower_http::trace::TraceLayer;
+use uuid::Uuid;
+
+#[derive(Default)]
+struct RequestCounters {
+    inference: AtomicU64,
+    management: AtomicU64,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -29,6 +41,12 @@ struct AppState {
     deferred: DeferredQueues,
     _db: Database,
     _objects: ObjectStorage,
+    counters: Arc<RequestCounters>,
+    instance_id: String,
+    generation: String,
+    started_at: String,
+    inference_bind: String,
+    management_bind: String,
 }
 
 #[derive(Serialize)]
@@ -50,6 +68,12 @@ struct EchoRequest {
     value: Value,
 }
 
+#[derive(Clone)]
+enum RequestClass {
+    Inference(Arc<RequestCounters>),
+    Management(Arc<RequestCounters>),
+}
+
 pub async fn run(
     cfg: Config,
     db: Database,
@@ -57,79 +81,118 @@ pub async fn run(
     deferred: DeferredQueues,
     lifecycle: Lifecycle,
 ) -> Result<()> {
+    let inference_addr: SocketAddr = cfg
+        .server
+        .inference_bind
+        .parse()
+        .context("parsing inference bind address")?;
+    let management_addr: SocketAddr = cfg
+        .server
+        .management_bind
+        .parse()
+        .context("parsing management bind address")?;
+
+    if inference_addr == management_addr {
+        anyhow::bail!("inference and management listeners must use different addresses");
+    }
+
+    let inference_listener = bind_listener(inference_addr).await?;
+    let management_listener = bind_listener(management_addr).await?;
+    let inference_local = inference_listener.local_addr()?;
+    let management_local = management_listener.local_addr()?;
+
+    let counters = Arc::new(RequestCounters::default());
     let state = Arc::new(AppState {
         lifecycle: lifecycle.clone(),
         deferred,
         _db: db,
         _objects: objects,
+        counters: counters.clone(),
+        instance_id: Uuid::now_v7().to_string(),
+        generation: std::env::var("STEVE_GENERATION").unwrap_or_else(|_| "standalone".into()),
+        started_at: Utc::now().to_rfc3339(),
+        inference_bind: cfg.server.inference_bind.clone(),
+        management_bind: cfg.server.management_bind.clone(),
     });
-    let app = Router::new()
+
+    let inference_app = inference_router(state.clone());
+    let management_app = management_router(state.clone());
+
+    lifecycle.ready("listeners_bound");
+    tracing::info!(
+        event = "listeners_ready",
+        inference = %inference_local,
+        inference_dual_stack = is_dual_stack_address(inference_addr),
+        management = %management_local,
+        management_dual_stack = is_dual_stack_address(management_addr),
+        instance_id = %state.instance_id,
+        generation = %state.generation,
+        pid = std::process::id(),
+        "Steve ready"
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_lifecycle = lifecycle.clone();
+    let timeout = Duration::from_secs(cfg.server.drain_timeout_seconds);
+    let signal_tx = shutdown_tx.clone();
+
+    let signal_task = tokio::spawn(async move {
+        let reason = shutdown_signal().await;
+        shutdown_lifecycle.drain(reason);
+
+        let result = tokio::time::timeout(timeout, shutdown_lifecycle.wait_for_zero()).await;
+        if result.is_err() {
+            tracing::warn!(
+                event = "drain_timeout",
+                timeout_seconds = timeout.as_secs(),
+                inflight = shutdown_lifecycle.inflight(),
+                "drain deadline reached"
+            );
+        }
+
+        let _ = signal_tx.send(true);
+    });
+
+    let inference = axum::serve(inference_listener, inference_app)
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+    let management = axum::serve(management_listener, management_app)
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx));
+
+    let result = tokio::try_join!(inference, management);
+    let _ = shutdown_tx.send(true);
+    signal_task.abort();
+
+    lifecycle.stopped("listeners_exited");
+    result?;
+    Ok(())
+}
+
+fn inference_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health/live", get(live))
+        .route("/health/ready", get(ready))
+        .route("/api/v1/test/echo", post(echo))
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            RequestClass::Inference(state.counters.clone()),
+            track_requests,
+        ))
+        .with_state(state)
+}
+
+fn management_router(state: Arc<AppState>) -> Router {
+    Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/api/v1/system/version", get(version))
         .route("/api/v1/system/status", get(status))
         .route("/api/v1/system/drain", post(drain))
-        .route("/api/v1/test/echo", post(echo))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
-
-    let addr: SocketAddr = cfg
-        .server
-        .bind
-        .parse()
-        .context("parsing server bind address")?;
-    let listener = bind_listener(addr).await?;
-    let local_addr = listener.local_addr()?;
-
-    lifecycle.ready("listener_bound");
-    tracing::info!(
-        event = "listener_ready",
-        %local_addr,
-        dual_stack = is_dual_stack_address(addr),
-        "Steve ready"
-    );
-
-    let shutdown_lifecycle = lifecycle.clone();
-    let timeout = Duration::from_secs(cfg.server.drain_timeout_seconds);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let reason = shutdown_signal().await;
-            shutdown_lifecycle.drain(reason);
-            let result = tokio::time::timeout(timeout, shutdown_lifecycle.wait_for_zero()).await;
-            if result.is_err() {
-                tracing::warn!(
-                    event = "drain_timeout",
-                    timeout_seconds = timeout.as_secs(),
-                    inflight = shutdown_lifecycle.inflight(),
-                    "drain deadline reached"
-                );
-            }
-        })
-        .await?;
-
-    lifecycle.stopped("server_exited");
-    Ok(())
-}
-
-async fn bind_listener(addr: SocketAddr) -> Result<TcpListener> {
-    if is_dual_stack_address(addr) {
-        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_only_v6(false)?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&addr.into())?;
-        socket.listen(1024)?;
-        socket.set_nonblocking(true)?;
-        let listener: StdTcpListener = socket.into();
-        return TcpListener::from_std(listener).context("creating dual-stack listener");
-    }
-
-    TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding listener on {addr}"))
-}
-
-fn is_dual_stack_address(addr: SocketAddr) -> bool {
-    addr.is_ipv6() && addr.ip().is_unspecified()
+        .layer(middleware::from_fn_with_state(
+            RequestClass::Management(state.counters.clone()),
+            track_requests,
+        ))
+        .with_state(state)
 }
 
 async fn live(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -150,6 +213,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         phase: state.lifecycle.phase(),
         inflight: state.lifecycle.inflight(),
     };
+
     if state.lifecycle.is_ready() {
         (StatusCode::OK, Json(health)).into_response()
     } else {
@@ -166,8 +230,18 @@ async fn version() -> Json<Version> {
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
+        "name": "steve",
+        "version": env!("CARGO_PKG_VERSION"),
+        "pid": std::process::id(),
+        "instance_id": state.instance_id,
+        "generation": state.generation,
+        "started_at": state.started_at,
         "phase": state.lifecycle.phase(),
         "inflight": state.lifecycle.inflight(),
+        "active_inference_requests": state.counters.inference.load(Ordering::Relaxed),
+        "active_management_requests": state.counters.management.load(Ordering::Relaxed),
+        "inference_bind": state.inference_bind,
+        "management_bind": state.management_bind,
         "queues": state.deferred.snapshot(),
     }))
 }
@@ -192,14 +266,44 @@ async fn echo(
     state.deferred.accounting("test.echo", payload.clone());
     state.deferred.telemetry("test.echo", payload.clone());
     state.deferred.history(
-        format!("test/{}.json", uuid::Uuid::now_v7()),
+        format!("test/{}.json", Uuid::now_v7()),
         bytes::Bytes::from(payload.to_string()),
     );
 
     (StatusCode::OK, Json(payload))
 }
 
-async fn shutdown_signal() -> &'static str {
+async fn track_requests(
+    State(class): State<RequestClass>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let (counter, class_name) = match &class {
+        RequestClass::Inference(counters) => (&counters.inference, "inference"),
+        RequestClass::Management(counters) => (&counters.management, "management"),
+    };
+
+    counter.fetch_add(1, Ordering::Relaxed);
+    let response = next.run(request).await;
+    counter.fetch_sub(1, Ordering::Relaxed);
+
+    tracing::trace!(request_class = class_name, "request completed");
+    response
+}
+
+async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+}
+
+pub(crate) async fn shutdown_signal() -> &'static str {
     let ctrl_c = async {
         signal::ctrl_c().await.expect("install Ctrl+C handler");
         "ctrl_c"
@@ -220,22 +324,5 @@ async fn shutdown_signal() -> &'static str {
     tokio::select! {
         reason = ctrl_c => reason,
         reason = terminate => reason,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unspecified_ipv6_is_dual_stack() {
-        let addr: SocketAddr = "[::]:11435".parse().expect("parse");
-        assert!(is_dual_stack_address(addr));
-    }
-
-    #[test]
-    fn loopback_ipv6_is_not_marked_dual_stack() {
-        let addr: SocketAddr = "[::1]:11435".parse().expect("parse");
-        assert!(!is_dual_stack_address(addr));
     }
 }

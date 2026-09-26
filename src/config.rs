@@ -22,7 +22,9 @@ pub struct Config {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
-    pub bind: String,
+    #[serde(alias = "bind")]
+    pub inference_bind: String,
+    pub management_bind: String,
     pub drain_timeout_seconds: u64,
 }
 
@@ -66,7 +68,8 @@ pub struct LoggingConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind: "[::]:11435".into(),
+            inference_bind: "[::]:11435".into(),
+            management_bind: "[::]:8790".into(),
             drain_timeout_seconds: 60,
         }
     }
@@ -138,7 +141,13 @@ impl Config {
         };
 
         if let Ok(v) = std::env::var("STEVE_BIND") {
-            cfg.server.bind = v;
+            cfg.server.inference_bind = v;
+        }
+        if let Ok(v) = std::env::var("STEVE_INFERENCE_BIND") {
+            cfg.server.inference_bind = v;
+        }
+        if let Ok(v) = std::env::var("STEVE_MANAGEMENT_BIND") {
+            cfg.server.management_bind = v;
         }
         if let Ok(v) = std::env::var("STEVE_DATABASE_URL") {
             cfg.database.url = v;
@@ -196,8 +205,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_dual_stack() {
-        assert_eq!(ServerConfig::default().bind, "[::]:11435");
+    fn defaults_are_dual_stack() {
+        let server = ServerConfig::default();
+        assert_eq!(server.inference_bind, "[::]:11435");
+        assert_eq!(server.management_bind, "[::]:8790");
     }
 
     #[test]

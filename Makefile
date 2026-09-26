@@ -3,12 +3,13 @@ SHELL := /bin/sh
 CARGO ?= cargo
 IMAGE ?= steve:dev
 
-.PHONY: help run doctor build test check quality-gates install update clean hooks docker-build
+.PHONY: help run doctor test-upstream build test check quality-gates install update clean hooks docker-build
 
 help:
 	@printf '%s\n' \
 		'make run            Run Steve using config.toml by default' \
 		'make doctor         Validate database, object storage and config' \
+		'make test-upstream  Run deterministic development upstream on :18080' \
 		'make build          Build the debug binary' \
 		'make test           Run all tests' \
 		'make check          Pre-commit formatting/clippy/check gates' \
@@ -24,6 +25,9 @@ run:
 
 doctor:
 	$(CARGO) run -- doctor
+
+test-upstream:
+	$(CARGO) run -- test-upstream
 
 build:
 	$(CARGO) build --all-features

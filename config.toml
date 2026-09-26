@@ -1,5 +1,6 @@
 [server]
-bind = "[::]:11435"
+inference_bind = "[::]:11435"
+management_bind = "[::]:8790"
 drain_timeout_seconds = 60
 
 [database]

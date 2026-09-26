@@ -1,15 +1,17 @@
 mod config;
 mod deferred;
 mod lifecycle;
+mod net;
 mod server;
 mod storage;
+mod test_upstream;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::Config;
 use deferred::DeferredQueues;
 use lifecycle::Lifecycle;
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 use storage::{Database, ObjectStorage};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -26,6 +28,10 @@ struct Cli {
 enum Command {
     Serve,
     Doctor,
+    TestUpstream {
+        #[arg(long, default_value = "[::]:18080")]
+        listen: SocketAddr,
+    },
 }
 
 #[tokio::main]
@@ -37,7 +43,8 @@ async fn main() -> Result<()> {
     tracing::info!(
         event = "config_loaded",
         source = %cfg.source_display(),
-        bind = %cfg.server.bind,
+        inference_bind = %cfg.server.inference_bind,
+        management_bind = %cfg.server.management_bind,
         database = %cfg.database.backend(),
         object_storage = %cfg.object_storage.kind,
         "configuration loaded"
@@ -46,6 +53,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve => serve(cfg).await,
         Command::Doctor => doctor(cfg).await,
+        Command::TestUpstream { listen } => test_upstream::run(listen).await,
     }
 }
 
