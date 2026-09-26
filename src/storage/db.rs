@@ -27,7 +27,6 @@ impl Database {
         Ok(Self { hot, background })
     }
 
-    pub fn hot(&self) -> &AnyPool { &self.hot }
     pub fn background(&self) -> &AnyPool { &self.background }
 
     pub async fn migrate(&self) -> Result<()> {
