@@ -2,6 +2,7 @@ mod config;
 mod deferred;
 mod lifecycle;
 mod net;
+mod proxy;
 mod server;
 mod storage;
 mod test_upstream;
