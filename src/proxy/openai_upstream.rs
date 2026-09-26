@@ -69,7 +69,6 @@ impl OpenAiUpstream {
 
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(0)
             .build()
             .map_err(|err| SteveError::Config {
                 message: format!("http client: {err}"),
@@ -327,8 +326,9 @@ mod tests {
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
     use std::{sync::Arc, time::Duration};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Mutex;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{mpsc, oneshot, Notify};
     use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
     #[test]
@@ -474,8 +474,11 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(Notify::new());
+        let accepted_signal = accepted.clone();
         let hold = tokio::spawn(async move {
             let (_socket, _) = listener.accept().await.unwrap();
+            accepted_signal.notify_one();
             std::future::pending::<()>().await;
         });
         let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(5)).unwrap();
@@ -486,16 +489,29 @@ mod tests {
                 .chat_completion_stream(&json!({"model":"m"}), wait_cancel)
                 .await
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        accepted.notified().await;
         cancel.cancel();
         assert!(matches!(task.await.unwrap(), Err(SteveError::Cancelled)));
         hold.abort();
 
-        let (addr, server) = spawn(Router::new().route(
-            "/v1/chat/completions",
-            post(|| async { ([("content-type", "text/event-stream")], "data: first\n\n") }),
-        ))
-        .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = socket.read(&mut buf).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..count]);
+            }
+            socket.write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 1024\r\nconnection: close\r\n\r\ndata: first\n\n",
+            ).await.unwrap();
+            let _ = socket.read(&mut buf).await;
+        });
         let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
         let cancel = CancelToken::new();
         let mut stream = client
@@ -508,6 +524,37 @@ mod tests {
             stream.next().await,
             Some(Err(SteveError::Cancelled))
         ));
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("upstream socket was not dropped")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sse_header_wait_is_bounded() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(Notify::new());
+        let accepted_signal = accepted.clone();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            accepted_signal.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let timeout = Duration::from_millis(100);
+        let client = OpenAiUpstream::new(format!("http://{addr}"), timeout).unwrap();
+        let task = tokio::spawn(async move {
+            client
+                .chat_completion_stream(&json!({"model":"m"}), CancelToken::new())
+                .await
+        });
+        accepted.notified().await;
+        let err = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("header timeout did not finish")
+            .unwrap()
+            .expect_err("missing headers should time out");
+        assert!(matches!(err, SteveError::Timeout { timeout_ms: 100 }));
         server.abort();
     }
 
