@@ -2,10 +2,13 @@
 //!
 //! `POST /v1/chat/completions` becomes a logical [`Request`](crate::proxy::Request)
 //! and a pending [`RequestAttempt`](crate::proxy::RequestAttempt). Invalid bodies
-//! are HTTP 400 in the Steve error model. A valid body has no upstream in this
-//! slice, so the route returns HTTP 501 with a typed stub.
+//! are HTTP 400 in the Steve error model. Non-stream requests use the configured
+//! OpenAI-compatible upstream; streaming remains HTTP 501.
 
-use super::{AttemptId, AttemptStatus, Request, RequestAttempt, RequestId};
+use super::{
+    AttemptId, AttemptStatus, OpenAiUpstream, Request, RequestAttempt, RequestId,
+    SteveError as UpstreamError,
+};
 use axum::http::StatusCode;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -79,11 +82,13 @@ impl From<&ChatCompletionHandoff> for ChatCompletionStub {
 pub(crate) enum ChatCompletionReplyBody {
     Error(SteveErrorResponse),
     Stub(ChatCompletionStub),
+    Success(Value),
 }
 
 pub(crate) struct ChatCompletionReply {
     pub(crate) status: StatusCode,
     pub(crate) body: ChatCompletionReplyBody,
+    pub(crate) attempt: Option<RequestAttempt>,
 }
 
 pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
@@ -93,12 +98,72 @@ pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
             ChatCompletionReply {
                 status: StatusCode::NOT_IMPLEMENTED,
                 body: ChatCompletionReplyBody::Stub(ChatCompletionStub::from(&handoff)),
+                attempt: Some(handoff.attempt),
             }
         }
         Err(error) => ChatCompletionReply {
             status: StatusCode::BAD_REQUEST,
             body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
+            attempt: None,
         },
+    }
+}
+
+pub(crate) async fn handle_chat_completions_with_upstream(
+    body: &[u8],
+    upstream: &OpenAiUpstream,
+) -> ChatCompletionReply {
+    let mut handoff = match parse_chat_completions(body) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            return ChatCompletionReply {
+                status: StatusCode::BAD_REQUEST,
+                body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
+                attempt: None,
+            }
+        }
+    };
+    if handoff.stream {
+        return ChatCompletionReply {
+            status: StatusCode::NOT_IMPLEMENTED,
+            body: ChatCompletionReplyBody::Stub(ChatCompletionStub::from(&handoff)),
+            attempt: Some(handoff.attempt),
+        };
+    }
+
+    handoff.attempt.provider = "openai".into();
+    let request: Value = serde_json::from_slice(body).expect("validated JSON");
+    let result = upstream.chat_completion(&request).await;
+    handoff.attempt.finished_at = Some(Utc::now());
+    let (status, response) = match result {
+        Ok(value) => {
+            handoff.attempt.status = AttemptStatus::Success;
+            (StatusCode::OK, ChatCompletionReplyBody::Success(value))
+        }
+        Err(error) => {
+            handoff.attempt.status = AttemptStatus::UpstreamError;
+            let status = if matches!(error, UpstreamError::Timeout { .. }) {
+                StatusCode::GATEWAY_TIMEOUT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (
+                status,
+                ChatCompletionReplyBody::Error(SteveErrorResponse {
+                    error: SteveError {
+                        message: error.to_string(),
+                        kind: "api_error",
+                        code: "upstream_error",
+                        param: None,
+                    },
+                }),
+            )
+        }
+    };
+    ChatCompletionReply {
+        status,
+        body: response,
+        attempt: Some(handoff.attempt),
     }
 }
 
@@ -213,19 +278,47 @@ fn record_handoff(handoff: &ChatCompletionHandoff) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{net::bind_listener, test_upstream};
     use serde_json::json;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn non_stream_chat_reaches_test_upstream_and_finishes_attempt() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, test_upstream::router())
+                .await
+                .unwrap();
+        });
+        let client =
+            super::super::OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(2))
+                .unwrap();
+        let raw = br#"{"model":"steve-test-model","messages":[{"role":"user","content":"hi"}],"temperature":0.2}"#;
+
+        let reply = handle_chat_completions_with_upstream(raw, &client).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            serde_json::to_value(&reply.body).unwrap()["choices"][0]["message"]["content"],
+            "steve-test-response"
+        );
+        let attempt = reply.attempt.expect("request attempt");
+        assert_eq!(attempt.status, AttemptStatus::Success);
+        assert!(attempt.finished_at.is_some());
+        server.abort();
+    }
 
     fn error_body(reply: ChatCompletionReply) -> SteveErrorResponse {
         match reply.body {
             ChatCompletionReplyBody::Error(error) => error,
-            ChatCompletionReplyBody::Stub(_) => panic!("expected Steve error"),
+            _ => panic!("expected Steve error"),
         }
     }
 
     fn stub_body(reply: ChatCompletionReply) -> ChatCompletionStub {
         match reply.body {
             ChatCompletionReplyBody::Stub(stub) => stub,
-            ChatCompletionReplyBody::Error(_) => panic!("expected typed stub"),
+            _ => panic!("expected typed stub"),
         }
     }
 

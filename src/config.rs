@@ -40,6 +40,7 @@ pub struct ServerConfig {
     pub inference_bind: String,
     pub management_bind: String,
     pub drain_timeout_seconds: u64,
+    pub openai_upstream_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -85,6 +86,7 @@ impl Default for ServerConfig {
             inference_bind: "[::]:11435".into(),
             management_bind: "[::]:8790".into(),
             drain_timeout_seconds: 60,
+            openai_upstream_url: None,
         }
     }
 }

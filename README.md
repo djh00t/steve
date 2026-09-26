@@ -62,9 +62,13 @@ steve migrate
 
 **M0 — clean foundation: done.** It landed on `main` in [PR #1](https://github.com/djh00t/steve/pull/1) (`cbc2c44`). `steve serve` boots with SQLite or PostgreSQL, health and management endpoints respond, and local and S3-compatible object storage share one contract.
 
-**M1 — real proxy hot path: next.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. Anthropic Messages parsing is documented in [Anthropic Messages ingress](#anthropic-messages-ingress). Streaming, cancellation, and upstream forwarding remain later M1 work.
+**M1 — real proxy hot path: in progress.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. Non-stream Chat Completions can forward to a configured OpenAI-compatible upstream. Other forwarding and streaming remain later M1 work.
 
 The MVP stays a complete vertical slice. Delivery order is in the [MVP plan](docs/plans/2026-09-26-steve-mvp.md). Protocol and product boundaries are in the [architecture spec](docs/specs/2026-09-26-steve-gateway.md).
+
+## Chat Completions forwarding
+
+Set `server.openai_upstream_url` to an HTTP OpenAI-compatible origin (for example `http://127.0.0.1:18080` for `make test-upstream`). `POST /v1/chat/completions` forwards validated non-stream JSON and returns the upstream JSON. A completed attempt is recorded in memory and logged as `Success`; upstream failures return HTTP 502 (HTTP 504 for timeouts). Without an upstream URL, the existing HTTP 501 stub remains. Streaming still returns HTTP 501.
 
 ## Anthropic Messages ingress
 
