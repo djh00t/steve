@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use axum::{
-    body::{Body, BodyDataStream},
+    body::{Body, HttpBody},
     extract::{FromRef, Request, State},
     http::StatusCode,
     middleware::{self, Next},
@@ -18,9 +18,11 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use http_body::{Frame, SizeHint};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    future::Future,
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -31,7 +33,6 @@ use std::{
     time::Duration,
 };
 use tokio::{signal, sync::watch};
-use tokio_stream::Stream;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -181,35 +182,65 @@ pub async fn run(
     let timeout = Duration::from_secs(cfg.server.drain_timeout_seconds);
     let signal_tx = shutdown_tx.clone();
 
-    let signal_task = tokio::spawn(async move {
-        let reason = shutdown_signal().await;
-        shutdown_lifecycle.drain(reason);
-
-        let result = tokio::time::timeout(timeout, shutdown_lifecycle.wait_for_zero()).await;
-        if result.is_err() {
-            tracing::warn!(
-                event = "drain_timeout",
-                timeout_seconds = timeout.as_secs(),
-                inflight = shutdown_lifecycle.inflight(),
-                "drain deadline reached"
-            );
-        }
-
-        let _ = signal_tx.send(true);
-    });
-
     let inference = axum::serve(inference_listener, inference_app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
     let management = axum::serve(management_listener, management_app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx));
 
-    let result = tokio::try_join!(inference, management);
+    let result = serve_until_drained(
+        async { tokio::try_join!(inference, management).map(|_| ()) },
+        shutdown_signal(),
+        shutdown_lifecycle,
+        timeout,
+        signal_tx,
+    )
+    .await;
     let _ = shutdown_tx.send(true);
-    signal_task.abort();
 
     lifecycle.stopped("listeners_exited");
     result?;
     Ok(())
+}
+
+async fn serve_until_drained<S, F>(
+    serving: S,
+    signal: F,
+    lifecycle: Lifecycle,
+    timeout: Duration,
+    shutdown_tx: watch::Sender<bool>,
+) -> std::io::Result<()>
+where
+    S: Future<Output = std::io::Result<()>>,
+    F: Future<Output = &'static str>,
+{
+    let drain = async {
+        lifecycle.drain(signal.await);
+        let timed_out = tokio::time::timeout(timeout, lifecycle.wait_for_zero())
+            .await
+            .is_err();
+        if timed_out {
+            tracing::warn!(
+                event = "drain_timeout",
+                timeout_seconds = timeout.as_secs(),
+                inflight = lifecycle.inflight(),
+                "drain deadline reached"
+            );
+        }
+        let _ = shutdown_tx.send(true);
+        timed_out
+    };
+
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => result,
+        timed_out = drain => {
+            if timed_out {
+                Ok(())
+            } else {
+                serving.await
+            }
+        }
+    }
 }
 
 fn inference_router(state: Arc<AppState>) -> Router {
@@ -331,31 +362,47 @@ async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Res
 }
 
 fn hold_inflight_until_body_end(response: Response, guard: InflightGuard) -> Response {
+    hold_guard_until_body_end(response, guard)
+}
+
+fn hold_guard_until_body_end<G: Send + Unpin + 'static>(response: Response, guard: G) -> Response {
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        Body::from_stream(InflightBody {
-            inner: body.into_data_stream(),
+        Body::new(GuardedBody {
+            inner: body,
             guard: Some(guard),
         }),
     )
 }
 
-struct InflightBody {
-    inner: BodyDataStream,
-    guard: Option<InflightGuard>,
+struct GuardedBody<G> {
+    inner: Body,
+    guard: Option<G>,
 }
 
-impl Stream for InflightBody {
-    type Item = Result<bytes::Bytes, axum::Error>;
+impl<G: Unpin> HttpBody for GuardedBody<G> {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        let result = Pin::new(&mut this.inner).poll_next(cx);
+        let result = Pin::new(&mut this.inner).poll_frame(cx);
         if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
             this.guard.take();
         }
         result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -427,17 +474,40 @@ async fn track_requests(
     request: Request,
     next: Next,
 ) -> Response {
-    let (counter, class_name) = match &class {
-        RequestClass::Inference(counters) => (&counters.inference, "inference"),
-        RequestClass::Management(counters) => (&counters.management, "management"),
-    };
-
-    counter.fetch_add(1, Ordering::Relaxed);
+    let guard = RequestCounterGuard::new(class);
     let response = next.run(request).await;
-    counter.fetch_sub(1, Ordering::Relaxed);
+    hold_guard_until_body_end(response, guard)
+}
 
-    tracing::trace!(request_class = class_name, "request completed");
-    response
+struct RequestCounterGuard(RequestClass);
+
+impl RequestCounterGuard {
+    fn new(class: RequestClass) -> Self {
+        class.counter().fetch_add(1, Ordering::Relaxed);
+        Self(class)
+    }
+}
+
+impl RequestClass {
+    fn counter(&self) -> &AtomicU64 {
+        match self {
+            Self::Inference(counters) => &counters.inference,
+            Self::Management(counters) => &counters.management,
+        }
+    }
+}
+
+impl Drop for RequestCounterGuard {
+    fn drop(&mut self) {
+        self.0.counter().fetch_sub(1, Ordering::Relaxed);
+        tracing::trace!(
+            request_class = match self.0 {
+                RequestClass::Inference(_) => "inference",
+                RequestClass::Management(_) => "management",
+            },
+            "request completed"
+        );
+    }
 }
 
 async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
@@ -479,10 +549,298 @@ pub(crate) async fn shutdown_signal() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use axum::{body::HttpBody, http::Request};
     use http_body_util::BodyExt;
-    use tokio_stream::StreamExt;
+    use tokio_stream::{Stream, StreamExt};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn drain_deadline_cancels_stuck_serving_future() {
+        let lifecycle = Lifecycle::new();
+        lifecycle.ready("test");
+        let _guard = lifecycle.enter().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (serve_tx, serve_rx) = tokio::sync::oneshot::channel::<()>();
+        let serving = async move {
+            let _ = serve_rx.await;
+            Ok(())
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            serve_until_drained(
+                serving,
+                async { "test" },
+                lifecycle.clone(),
+                Duration::from_millis(10),
+                shutdown_tx,
+            ),
+        )
+        .await
+        .expect("drain deadline must end the serving wait")
+        .unwrap();
+
+        assert_eq!(lifecycle.phase(), Phase::Draining);
+        assert!(*shutdown_rx.borrow());
+        assert!(serve_tx.is_closed());
+    }
+
+    fn tracked_stream_router(
+        counters: Arc<RequestCounters>,
+        rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+    ) -> Router {
+        let rx = Arc::new(std::sync::Mutex::new(Some(rx)));
+        Router::new()
+            .route(
+                "/",
+                get(move || {
+                    let rx = rx.clone();
+                    async move {
+                        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(
+                            rx.lock().unwrap().take().unwrap(),
+                        ))
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                RequestClass::Inference(counters),
+                track_requests,
+            ))
+    }
+
+    #[tokio::test]
+    async fn request_counter_stays_active_until_stream_eof() {
+        let counters = Arc::new(RequestCounters::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let response = tracked_stream_router(counters.clone(), rx)
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+
+        tx.send(Ok(bytes::Bytes::from_static(b"data: done\n\n")))
+            .await
+            .unwrap();
+        drop(tx);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            bytes::Bytes::from_static(b"data: done\n\n")
+        );
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn request_counter_decrements_when_stream_body_is_dropped() {
+        let counters = Arc::new(RequestCounters::default());
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let response = tracked_stream_router(counters.clone(), rx)
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+
+        drop(response);
+
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn tracked_response_preserves_size_hint_and_trailers() {
+        let counters = Arc::new(RequestCounters::default());
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Body::new(Body::from("ok").with_trailers(async {
+                        let mut trailers = axum::http::HeaderMap::new();
+                        trailers.insert("x-final-status", "complete".parse().unwrap());
+                        Some(Ok(trailers))
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                RequestClass::Inference(counters.clone()),
+                track_requests,
+            ));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+
+        assert_eq!(body.size_hint().exact(), Some(2));
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            bytes::Bytes::from_static(b"ok")
+        );
+        assert_eq!(
+            body.frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_trailers()
+                .unwrap()["x-final-status"],
+            "complete"
+        );
+        assert!(body.frame().await.is_none());
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn request_counter_decrements_when_handler_is_cancelled() {
+        let counters = Arc::new(RequestCounters::default());
+        let app = Router::new()
+            .route("/", get(|| async { std::future::pending::<()>().await }))
+            .layer(middleware::from_fn_with_state(
+                RequestClass::Inference(counters.clone()),
+                track_requests,
+            ));
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    struct PendingSse {
+        first: Option<bytes::Bytes>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Stream for PendingSse {
+        type Item = Result<bytes::Bytes, std::io::Error>;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            match this.first.take() {
+                Some(first) => Poll::Ready(Some(Ok(first))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl Drop for PendingSse {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    async fn messages_test_state(upstream_url: String) -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.database.url = "sqlite::memory:".into();
+        cfg.object_storage.root = dir.path().join("objects").to_string_lossy().into_owned();
+        cfg.queues.accounting_journal = dir
+            .path()
+            .join("accounting.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let db = Database::connect(&cfg.database).await.unwrap();
+        db.migrate().await.unwrap();
+        let objects = ObjectStorage::from_config(&cfg.object_storage)
+            .await
+            .unwrap();
+        let deferred = DeferredQueues::start(&cfg, db.background(), objects.clone())
+            .await
+            .unwrap();
+        let lifecycle = Lifecycle::new();
+        lifecycle.ready("test");
+        let counters = Arc::new(RequestCounters::default());
+        let state = Arc::new(AppState {
+            lifecycle,
+            deferred,
+            _db: db,
+            _objects: objects,
+            counters,
+            instance_id: "test".into(),
+            generation: "test".into(),
+            started_at: "test".into(),
+            inference_bind: "127.0.0.1:0".into(),
+            management_bind: "127.0.0.1:0".into(),
+            models: models::resolve_catalogue(&[]).into(),
+            openai_upstream: None,
+            anthropic_upstream: Some(
+                AnthropicUpstream::new(upstream_url, Duration::from_secs(2)).unwrap(),
+            ),
+        });
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn messages_route_disconnect_cancels_upstream_and_releases_guards() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let dropped_tx = Arc::new(std::sync::Mutex::new(Some(dropped_tx)));
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/messages",
+                    post(move || {
+                        let dropped = dropped_tx.lock().unwrap().take().unwrap();
+                        async move {
+                            (
+                                [("content-type", "text/event-stream")],
+                                Body::from_stream(PendingSse {
+                                    first: Some(bytes::Bytes::from_static(
+                                        b"event: message_start\ndata: {}\n\n",
+                                    )),
+                                    dropped: Some(dropped),
+                                }),
+                            )
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let (state, _dir) = messages_test_state(format!("http://{addr}")).await;
+        let counters = state.counters.clone();
+        let lifecycle = state.lifecycle.clone();
+        let response = inference_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","max_tokens":1,"messages":[{"role":"user"}],"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.inflight(), 1);
+        let mut body = response.into_body();
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            bytes::Bytes::from_static(b"event: message_start\ndata: {}\n\n")
+        );
+
+        drop(body);
+
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("client disconnect did not abort upstream")
+            .unwrap();
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+        assert_eq!(lifecycle.inflight(), 0);
+        upstream_server.abort();
+        let _ = upstream_server.await;
+    }
 
     #[tokio::test]
     async fn streaming_response_keeps_drain_waiting_until_body_ends() {
