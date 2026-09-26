@@ -32,3 +32,9 @@ telemetry = 8192
 [logging]
 level = "info"
 json = false
+
+# Served by GET /v1/models. Steve reads this catalogue locally and does not
+# query providers. Omit [[models]] to use the built-in catalogue.
+[[models]]
+id = "steve-test-model"
+owned_by = "steve"

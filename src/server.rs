@@ -1,13 +1,14 @@
 use crate::{
-    config::Config,
+    config::{Config, ModelConfig},
     deferred::DeferredQueues,
     lifecycle::{Lifecycle, Phase},
+    models::{self, ModelList},
     net::{bind_listener, is_dual_stack_address},
     storage::{Database, ObjectStorage},
 };
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Request, State},
+    extract::{FromRef, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -47,6 +48,16 @@ struct AppState {
     started_at: String,
     inference_bind: String,
     management_bind: String,
+    models: Arc<[ModelConfig]>,
+}
+
+#[derive(Clone)]
+struct Catalogue(Arc<[ModelConfig]>);
+
+impl FromRef<Arc<AppState>> for Catalogue {
+    fn from_ref(state: &Arc<AppState>) -> Self {
+        Self(Arc::clone(&state.models))
+    }
 }
 
 #[derive(Serialize)]
@@ -101,6 +112,18 @@ pub async fn run(
     let inference_local = inference_listener.local_addr()?;
     let management_local = management_listener.local_addr()?;
 
+    let catalogue: Arc<[ModelConfig]> = models::resolve_catalogue(&cfg.models).into();
+    tracing::info!(
+        event = "model_catalogue_loaded",
+        count = catalogue.len(),
+        source = if cfg.models.is_empty() {
+            "static"
+        } else {
+            "config"
+        },
+        "model catalogue loaded"
+    );
+
     let counters = Arc::new(RequestCounters::default());
     let state = Arc::new(AppState {
         lifecycle: lifecycle.clone(),
@@ -113,6 +136,7 @@ pub async fn run(
         started_at: Utc::now().to_rfc3339(),
         inference_bind: cfg.server.inference_bind.clone(),
         management_bind: cfg.server.management_bind.clone(),
+        models: catalogue,
     });
 
     let inference_app = inference_router(state.clone());
@@ -171,6 +195,7 @@ fn inference_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
+        .route("/v1/models", get(list_models))
         .route("/api/v1/test/echo", post(echo))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -193,6 +218,10 @@ fn management_router(state: Arc<AppState>) -> Router {
             track_requests,
         ))
         .with_state(state)
+}
+
+async fn list_models(State(Catalogue(catalogue)): State<Catalogue>) -> Json<ModelList> {
+    Json(ModelList::from_catalogue(&catalogue))
 }
 
 async fn live(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -324,5 +353,82 @@ pub(crate) async fn shutdown_signal() -> &'static str {
     tokio::select! {
         reason = ctrl_c => reason,
         reason = terminate => reason,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn models_router(catalogue: Arc<[ModelConfig]>) -> Router {
+        Router::new()
+            .route("/v1/models", get(list_models))
+            .with_state(Catalogue(catalogue))
+    }
+
+    async fn get_models(catalogue: Arc<[ModelConfig]>) -> (StatusCode, Value) {
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            models_router(catalogue).oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("model listing must not wait on an upstream")
+        .expect("response");
+
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = serde_json::from_slice(&bytes).expect("json");
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn get_v1_models_lists_configured_models() {
+        let catalogue: Arc<[ModelConfig]> = vec![
+            ModelConfig {
+                id: "alpha".into(),
+                owned_by: "lab".into(),
+                created: 7,
+            },
+            ModelConfig {
+                id: "beta".into(),
+                owned_by: "lab".into(),
+                created: 8,
+            },
+        ]
+        .into();
+
+        let (status, body) = get_models(catalogue).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({
+                "object": "list",
+                "data": [
+                    {"id": "alpha", "object": "model", "created": 7, "owned_by": "lab"},
+                    {"id": "beta", "object": "model", "created": 8, "owned_by": "lab"}
+                ]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn get_v1_models_uses_static_catalogue_when_unconfigured() {
+        let catalogue: Arc<[ModelConfig]> = models::resolve_catalogue(&[]).into();
+        let (status, body) = get_models(catalogue).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = body["data"].as_array().expect("data array");
+        assert!(!data.is_empty());
+        assert_eq!(body["object"], "list");
+        assert_eq!(data[0]["id"], "steve-test-model");
+        assert_eq!(data[0]["object"], "model");
+        assert_eq!(data[0]["owned_by"], "steve");
     }
 }

@@ -22,3 +22,7 @@ telemetry = 8192
 [logging]
 level = "info"
 json = false
+
+[[models]]
+id = "steve-test-model"
+owned_by = "steve"
