@@ -1,7 +1,7 @@
 use crate::{
     config::{Config, ModelConfig},
     deferred::DeferredQueues,
-    lifecycle::{Lifecycle, Phase},
+    lifecycle::{InflightGuard, Lifecycle, Phase},
     models::{self, ModelList},
     net::{bind_listener, is_dual_stack_address},
     proxy::{anthropic_messages, openai_chat, openai_responses, AnthropicUpstream, OpenAiUpstream},
@@ -9,6 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use axum::{
+    body::{Body, BodyDataStream},
     extract::{FromRef, Request, State},
     http::StatusCode,
     middleware::{self, Next},
@@ -21,13 +22,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
 use tokio::{signal, sync::watch};
+use tokio_stream::Stream;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -301,7 +305,7 @@ async fn drain(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
-    let Some(_guard) = state.lifecycle.enter() else {
+    let Some(guard) = state.lifecycle.enter() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "draining"})),
@@ -314,18 +318,45 @@ async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Res
     } else {
         anthropic_messages::handle_messages(&body)
     };
-    if let Some(attempt) = &reply.attempt {
-        if attempt.finished_at.is_some() {
-            tracing::info!(
-                request_id = %attempt.request_id.0,
-                attempt_id = %attempt.id.0,
-                status = ?attempt.status,
-                finished_at = ?attempt.finished_at,
-                "messages upstream attempt finished"
-            );
-        }
+    let streaming = matches!(
+        &reply.body,
+        anthropic_messages::MessagesReplyBody::Stream(_)
+    );
+    let response = reply.into_response();
+    if streaming {
+        hold_inflight_until_body_end(response, guard)
+    } else {
+        response
     }
-    (reply.status, Json(reply.body)).into_response()
+}
+
+fn hold_inflight_until_body_end(response: Response, guard: InflightGuard) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::from_stream(InflightBody {
+            inner: body.into_data_stream(),
+            guard: Some(guard),
+        }),
+    )
+}
+
+struct InflightBody {
+    inner: BodyDataStream,
+    guard: Option<InflightGuard>,
+}
+
+impl Stream for InflightBody {
+    type Item = Result<bytes::Bytes, axum::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_next(cx);
+        if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
+            this.guard.take();
+        }
+        result
+    }
 }
 
 async fn responses(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
@@ -450,7 +481,62 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
     use http_body_util::BodyExt;
+    use tokio_stream::StreamExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn streaming_response_keeps_drain_waiting_until_body_ends() {
+        let lifecycle = Lifecycle::new();
+        lifecycle.ready("test");
+        let guard = lifecycle.enter().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+        let response = (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        )
+            .into_response();
+        let response = hold_inflight_until_body_end(response, guard);
+        assert_eq!(lifecycle.inflight(), 1);
+
+        lifecycle.drain("test");
+        let waiter = tokio::spawn({
+            let lifecycle = lifecycle.clone();
+            async move { lifecycle.wait_for_zero().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tx.send(Ok(bytes::Bytes::from_static(b"data: done\n\n")))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"data: done\n\n")
+        );
+        assert!(body.next().await.is_none());
+        waiter.await.unwrap();
+        assert_eq!(lifecycle.inflight(), 0);
+    }
+
+    #[test]
+    fn dropping_streaming_response_releases_inflight_guard() {
+        let lifecycle = Lifecycle::new();
+        lifecycle.ready("test");
+        let guard = lifecycle.enter().unwrap();
+        let response = hold_inflight_until_body_end(
+            Body::from_stream(tokio_stream::pending::<Result<bytes::Bytes, std::io::Error>>())
+                .into_response(),
+            guard,
+        );
+        assert_eq!(lifecycle.inflight(), 1);
+
+        drop(response);
+
+        assert_eq!(lifecycle.inflight(), 0);
+    }
 
     fn models_router(catalogue: Arc<[ModelConfig]>) -> Router {
         Router::new()
