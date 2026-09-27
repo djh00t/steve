@@ -22,7 +22,37 @@ Replacing one implementation leaf with three and adding the fixture produced 386
 
 The next implementation wave must use exact accepted contract revisions and runnable predecessor commands. Register each endpoint with its implementation so its HTTP acceptance can run immediately; serialize shared router, schema, configuration, fixture and CI files. Apply the same rule to clients: qualify an executable target and one working connection before adding views.
 
-## Readiness summary
+## Accounting contract decomposition
+
+The settled policy remains **preserve forwarding; fail visibly and stop later inference**. [#84](https://github.com/djh00t/steve/issues/84) is now a coordination parent, not a ten-minute implementation leaf. Its remaining proposals own disjoint artifacts:
+
+| Package | Output | Readiness |
+| --- | --- | --- |
+| [STV-M0-16 #483](https://github.com/djh00t/steve/issues/483) | Incident/admission state, exact HTTP/status fields and incident lifetime | READY to propose |
+| [STV-M0-17 #484](https://github.com/djh00t/steve/issues/484) | Journal ownership, replacement overlap and recovery boundaries | READY to propose in parallel |
+| [STV-M0-18 #485](https://github.com/djh00t/steve/issues/485) | Drain/replay acknowledgements and completion evidence | BLOCKED on accepted #483/#484 artifacts |
+
+Replacing one leaf with three brought that snapshot to **390 active leaves**, including the buffering runner #480. Coordination parents #84 and #91 are excluded. This does not reopen the accepted M0 foundation or approve any proposed persistence mechanism. David/Cos accepts exact contract revisions through review and merge; #85/#86/#87/#94 remain blocked until their interfaces and small implementation briefs are updated. No event ID can reconstruct a discarded payload, and a journal enqueue is not a durable write.
+
+## Provider transport contract decomposition
+
+[#132](https://github.com/djh00t/steve/issues/132) now coordinates two bounded proposals: [STV-PROV-38 TLS trust #491](https://github.com/djh00t/steve/issues/491) is READY to propose; [STV-PROV-39 credential transport #492](https://github.com/djh00t/steve/issues/492) waits for the existing account schema/lifecycle contract [#100](https://github.com/djh00t/steve/issues/100). Their artifact ownership is disjoint; provider work must not redefine account grants, secret references or rotation.
+
+The TLS fixture #133 and HTTPS-only OpenAI/Anthropic leaves #134/#135 depend on accepted #491 rather than the whole coordination parent or account schema. #133 owns the manifest; URL policy #495 and shared CA/client wiring #496 precede protocol proof #134, then #135. Certificate rejection #497 follows both positive proofs; redirect refusal #498 follows #497 to serialize their shared test file. They remain BLOCKED until exact trust/fixture inputs and executable prerequisites exist. Account-sourced credential isolation remains in #398 after #492 and its account prerequisites; no acceptance requirement was removed. The [TLS proposal](providers/tls-contract.md) and issue briefs record exact ownership, acceptance commands and mutation expectations; confirm accepted producer interfaces before dispatch.
+
+Replacing #132 with two proposal leaves brought that snapshot to 391 active leaves. Tracking four TLS implementation/qualification handoffs (#495–#498) brought that snapshot to **395 active leaves**. Coordination parents #84/#91/#132 are excluded; the original table below remains historical. [The provider contract index](providers/transport-auth-contract.md) points to the child artifacts and acceptance gates, not a second credential schema.
+
+## Identity and client-auth contract decomposition
+
+[#99](https://github.com/djh00t/steve/issues/99) is now a coordinator for three independently reviewed artifacts: principal IDs/relationships [#500](https://github.com/djh00t/steve/issues/500), local bootstrap/client credential lifecycle [#501](https://github.com/djh00t/steve/issues/501), and inference auth/resolved identity [#502](https://github.com/djh00t/steve/issues/502). #500 is READY to propose; #501 waits for accepted #500 and management/listener contract #106; #502 waits for accepted #500/#501. #106 has no new prerequisite on #99 or the bootstrap child.
+
+Existing #99 consumers keep that acceptance gate until the child artifacts compose, exact revisions are accepted, and consumer briefs are re-sized against actual interfaces. #100 keeps provider credentials and access grants; #106 management/listener security; #110 audit schema; #116 session association. The [identity contract index](contracts/stv-m2-01.md) records ownership, not a new security policy.
+
+Replacing one leaf with three brings the current inventory to **397 active leaves** (M2 now has 47). Coordinators #84/#91/#99/#132 are excluded. The original readiness snapshot below remains historical. Original M0 acceptance is unchanged.
+
+## Original 385-item readiness snapshot (historical)
+
+These counts describe the original audit, not today's issue graph. For example, the current provider table has 40 active leaves plus coordination parent #132 (2 proposal-ready, 29 blocked, 9 deferred; TLS proposal awaits acceptance); its historical row below remains 35. Use current issue bodies and the decomposition sections for dispatch.
 
 | Area | READY | BLOCKED | DEFERRED | Total |
 | --- | ---: | ---: | ---: | ---: |
@@ -78,7 +108,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | --- | --- | --- | --- |
 | [STV-M0-05](https://github.com/djh00t/steve/issues/80) | Prove SQLite and PostgreSQL serve parity | BLOCKED | #72 |
 | [STV-M0-06](https://github.com/djh00t/steve/issues/81) | Prove filesystem and S3 object-store parity | BLOCKED | #72 |
-| [STV-M0-01](https://github.com/djh00t/steve/issues/84) | Resolve authoritative accounting overflow semantics | READY | None |
+| [STV-M0-01](https://github.com/djh00t/steve/issues/84) | Coordinate accounting failure contracts | COORDINATION | #483, #484, #485 |
 | [STV-M0-02](https://github.com/djh00t/steve/issues/85) | Preserve journal framing and report corrupt tails | BLOCKED | #84, #72 |
 | [STV-M0-03](https://github.com/djh00t/steve/issues/86) | Retry accounting reconciliation without startup loss | BLOCKED | #84, #72 |
 | [STV-M0-04](https://github.com/djh00t/steve/issues/87) | Prove idempotent journal replay after partial DB success | BLOCKED | #84, #72 |
@@ -104,7 +134,10 @@ Start with the real-process harness and independent contract decisions. Complete
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-M2-01](https://github.com/djh00t/steve/issues/99) | Freeze local identity and client-auth contract | READY | None |
+| [STV-M2-01](https://github.com/djh00t/steve/issues/99) | Coordinate local identity and client-auth contracts | COORDINATION | #500, #501, #502 |
+| [STV-M2-60](https://github.com/djh00t/steve/issues/500) | Propose local principal IDs and relationships | READY to propose | None |
+| [STV-M2-61](https://github.com/djh00t/steve/issues/501) | Propose local bootstrap and client credential lifecycle | BLOCKED | #500, #106 |
+| [STV-M2-62](https://github.com/djh00t/steve/issues/502) | Propose inference auth and resolved identity semantics | BLOCKED | #500, #501 |
 | [STV-M2-02](https://github.com/djh00t/steve/issues/100) | Freeze provider account, credentials, access and binding contract | BLOCKED | #99 |
 | [STV-M2-03](https://github.com/djh00t/steve/issues/101) | Freeze account pool policy, routing and affinity semantics | BLOCKED | #100 |
 | [STV-M2-04](https://github.com/djh00t/steve/issues/105) | Add relational organisation, user and client schema | BLOCKED | #99, #103, #104, #72 |
@@ -190,10 +223,16 @@ Start with the real-process harness and independent contract decisions. Complete
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-PROV-02](https://github.com/djh00t/steve/issues/132) | Decide HTTPS transport and credential boundary | READY | None |
-| [STV-PROV-37](https://github.com/djh00t/steve/issues/133) | Provide and qualify local TLS upstream fixture | BLOCKED | #132, #72, #73 |
-| [STV-PROV-32](https://github.com/djh00t/steve/issues/134) | Wire OpenAI upstream through HTTPS transport | BLOCKED | #132, #133, #100, #72, #73 |
-| [STV-PROV-36](https://github.com/djh00t/steve/issues/135) | Wire Anthropic upstream through HTTPS transport | BLOCKED | #132, #133, #100, #72, #73 |
+| [STV-PROV-02](https://github.com/djh00t/steve/issues/132) | Coordinate TLS and credential transport contracts | COORDINATION | #491, #492 |
+| [STV-PROV-38](https://github.com/djh00t/steve/issues/491) | Define upstream TLS backend and trust contract | READY to propose | None |
+| [STV-PROV-39](https://github.com/djh00t/steve/issues/492) | Bind accepted account credentials to upstream protocol requests | BLOCKED | #100 |
+| [STV-PROV-37](https://github.com/djh00t/steve/issues/133) | Provide and qualify local TLS upstream fixture | BLOCKED | #491, #72, #73 |
+| [STV-PROV-32](https://github.com/djh00t/steve/issues/134) | Wire OpenAI upstream through HTTPS transport | BLOCKED | #491, #133, #495, #496, #72, #73 |
+| [STV-PROV-36](https://github.com/djh00t/steve/issues/135) | Wire Anthropic upstream through HTTPS transport | BLOCKED | #491, #133, #134, #495, #496, #72, #73 |
+| [STV-PROV-40](https://github.com/djh00t/steve/issues/495) | Enforce provider URL scheme and loopback policy | BLOCKED | #491, #72, #73 |
+| [STV-PROV-41](https://github.com/djh00t/steve/issues/496) | Wire shared additive TLS trust through provider clients | BLOCKED | #491, #133, #495, #72, #73 |
+| [STV-PROV-42](https://github.com/djh00t/steve/issues/497) | Reject invalid TLS certificates on both providers | BLOCKED | #491, #133, #496, #134, #135, #72, #73 |
+| [STV-PROV-43](https://github.com/djh00t/steve/issues/498) | Prevent redirects across requests and health probes | BLOCKED | #491, #133, #496, #134, #135, #497, #72, #73 |
 | [STV-PROV-01](https://github.com/djh00t/steve/issues/380) | Inventory required presets and assign protocol review ownership | READY | None |
 | [STV-PROV-03](https://github.com/djh00t/steve/issues/383) | Review OpenAI API protocol contract | BLOCKED | #380, #132 |
 | [STV-PROV-04](https://github.com/djh00t/steve/issues/384) | Review Gemini protocol contract | BLOCKED | #380, #132 |
@@ -212,7 +251,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-PROV-19](https://github.com/djh00t/steve/issues/395) | Discover Azure OpenAI and Foundry endpoint contracts | DEFERRED | #98 |
 | [STV-PROV-20](https://github.com/djh00t/steve/issues/396) | Discover Google Vertex AI endpoint and identity contract | DEFERRED | #98 |
 | [STV-PROV-21](https://github.com/djh00t/steve/issues/397) | Discover Jev decision/evaluation integration boundary | DEFERRED | #291, #98 |
-| [STV-PROV-33](https://github.com/djh00t/steve/issues/398) | Assert provider auth headers and credential isolation | BLOCKED | #132, #100, #112, #125, #136, #131, #72, #73 |
+| [STV-PROV-33](https://github.com/djh00t/steve/issues/398) | Assert provider auth headers and credential isolation | BLOCKED | #492, #100, #112, #125, #136, #131, #72, #73 |
 | [STV-PROV-22](https://github.com/djh00t/steve/issues/400) | Implement declarative OpenAI API preset | BLOCKED | #383, #100, #112, #125, #136, #131, #134, #398, #72, #73 |
 | [STV-PROV-35](https://github.com/djh00t/steve/issues/399) | Review Anthropic API protocol contract | BLOCKED | #380, #132 |
 | [STV-PROV-23](https://github.com/djh00t/steve/issues/403) | Implement declarative Anthropic API preset | BLOCKED | #399, #100, #112, #125, #136, #131, #135, #398, #72, #73 |

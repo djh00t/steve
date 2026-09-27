@@ -4,10 +4,16 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 
 | Producer | Contract outcome | Canonical artifact | Status / prerequisites |
 | --- | --- | --- | --- |
-| [STV-M0-01 (#84)](https://github.com/djh00t/steve/issues/84) | Accounting overflow semantics | `docs/contracts/stv-m0-01.md` | READY: proposal only |
-| [STV-M0-09 (#90)](https://github.com/djh00t/steve/issues/90) | Independent admission budgets | [Admission proposal](stv-m0-09.md) | Proposed until [#466](https://github.com/djh00t/steve/pull/466) merges; then accepted at its merge SHA; consumers need re-sized briefs |
+| [STV-M0-01 (#84)](https://github.com/djh00t/steve/issues/84) | Coordinate accounting failure contracts | Child artifacts below; former umbrella draft is unaccepted | COORDINATION: #483/#484/#485 plus consumer handoff |
+| [STV-M0-16 (#483)](https://github.com/djh00t/steve/issues/483) | Incident/admission state, HTTP/status contract and incident lifetime | `docs/contracts/stv-m0-16.md` | READY: proposal only; David/Cos reviews exact artifact |
+| [STV-M0-17 (#484)](https://github.com/djh00t/steve/issues/484) | Journal ownership and replacement overlap | `docs/contracts/stv-m0-17.md` | READY: proposal only; parallel with #483 |
+| [STV-M0-18 (#485)](https://github.com/djh00t/steve/issues/485) | Drain/replay acknowledgement and completion evidence | `docs/contracts/stv-m0-18.md` | BLOCKED on accepted #483/#484 artifacts |
+| [STV-M0-09 (#90)](https://github.com/djh00t/steve/issues/90) | Independent admission budgets | [Admission proposal](stv-m0-09.md) | Accepted via [#466](https://github.com/djh00t/steve/pull/466) at `63f9cce`; implementation leaves #468-470 merged, composed #92 remains separate |
 | [STV-M1-04 (#94)](https://github.com/djh00t/steve/issues/94) | Chat accounting event identity, payload and emission cardinality | `docs/m1-acceptance.md` (contract note only) | BLOCKED by STV-M0-01 (#84) |
-| [STV-M2-01 (#99)](https://github.com/djh00t/steve/issues/99) | Local identity and client authentication | `docs/contracts/stv-m2-01.md` | READY: proposal only |
+| [STV-M2-01 (#99)](https://github.com/djh00t/steve/issues/99) | Coordinate local identity and client authentication | [Identity contract index](stv-m2-01.md) | COORDINATION: child acceptance and consumer handoffs |
+| [STV-M2-60 (#500)](https://github.com/djh00t/steve/issues/500) | Principal IDs, relationships and legacy attribution | `docs/contracts/stv-m2-60.md` | READY: proposal only |
+| [STV-M2-61 (#501)](https://github.com/djh00t/steve/issues/501) | Local bootstrap and client credential lifecycle | `docs/contracts/stv-m2-61.md` | BLOCKED on accepted #500/#106 |
+| [STV-M2-62 (#502)](https://github.com/djh00t/steve/issues/502) | Inference auth wire and resolved identity | `docs/contracts/stv-m2-62.md` | BLOCKED on accepted #500/#501 |
 | [STV-M2-02 (#100)](https://github.com/djh00t/steve/issues/100) | Provider accounts, credentials, access and bindings | `docs/contracts/stv-m2-02.md` | BLOCKED by STV-M2-01 |
 | [STV-M2-03 (#101)](https://github.com/djh00t/steve/issues/101) | Account-pool policy, routing and affinity | `docs/contracts/stv-m2-03.md` | BLOCKED by STV-M2-02 |
 | [STV-M2-14 (#106)](https://github.com/djh00t/steve/issues/106) | Listener exposure and management authentication | `docs/contracts/stv-m2-14.md` | READY: proposal only |
@@ -35,7 +41,9 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | [STV-API-20 (#319)](https://github.com/djh00t/steve/issues/319) | Observability settings API | `docs/contracts/stv-api-20.md` | BLOCKED by STV-M5-04, STV-M2-14 |
 | [STV-API-25 (#299)](https://github.com/djh00t/steve/issues/299) | Normalized error query API | `docs/contracts/stv-api-25.md` | BLOCKED by STV-M5-03, STV-M2-14 |
 | [STV-PROV-01 (#380)](https://github.com/djh00t/steve/issues/380) | Required provider inventory and protocol review ownership | `docs/providers/mvp-preset-matrix.md` | READY: inventory proposal only |
-| [STV-PROV-02 (#132)](https://github.com/djh00t/steve/issues/132) | HTTPS transport and credential boundary | `docs/providers/transport-auth-contract.md` | READY: proposal only |
+| [STV-PROV-02 (#132)](https://github.com/djh00t/steve/issues/132) | Coordinate provider transport contracts | [Provider contract index](../providers/transport-auth-contract.md) | COORDINATION; #491/#492 acceptance and consumer handoff |
+| [STV-PROV-38 (#491)](https://github.com/djh00t/steve/issues/491) | TLS backend and trust | `docs/providers/tls-contract.md` | READY: proposal only; runtime consumers blocked |
+| [STV-PROV-39 (#492)](https://github.com/djh00t/steve/issues/492) | Account credential to protocol binding | `docs/providers/credential-transport-contract.md` | BLOCKED on accepted #100; no duplicate account schema |
 | [STV-PROV-03/04/05/06/07/08/09/10/35 (#383–390, #399)](https://github.com/djh00t/steve/issues/383) | Required OpenAI, Anthropic, Gemini, xAI, DeepSeek, Groq, OpenRouter, generic/local protocol rows | `docs/providers/mvp-preset-matrix.md` | BLOCKED by STV-PROV-01 and STV-PROV-02; one writer serializes edits to this shared file, with row responsibility staying on each producer issue |
 | [STV-PROV-13/14 (#381, #382)](https://github.com/djh00t/steve/issues/381) | Subscription authentication discovery | `docs/providers/experimental-auth-decisions.md` | DEFERRED until scope activation |
 | [STV-PROV-15/16/17/21 (#391, #392, #393, #397)](https://github.com/djh00t/steve/issues/391) | Experimental provider and gateway discovery | `docs/providers/experimental-provider-matrix.md` | DEFERRED; STV-PROV-21 also depends on STV-M6-ACCEPT-01 |
