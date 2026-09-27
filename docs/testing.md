@@ -32,6 +32,8 @@ Each fixture owns ephemeral listeners and temporary data. Readiness uses a bound
 
 Use SQLite/filesystem for the fast default scenario. Repeat representative persistence scenarios against PostgreSQL and an S3-compatible fixture to verify supported backends, without multiplying every scenario across every storage combination. Official SDK smoke tests separately qualify SDK compatibility; raw HTTP tests alone must not be labelled SDK proof. Live-provider qualification is opt-in and reported separately from deterministic CI evidence.
 
+Run the real-process database serve parity contract with SQLite using `cargo test --test e2e --all-features database_backend_contract`. To include PostgreSQL, set `STEVE_TEST_POSTGRES_URL` to a reachable test database URL for the same command; the test runs SQLite first, then PostgreSQL, and fails if the configured PostgreSQL database cannot be used. CI sets this variable to its provisioned PostgreSQL service URL. `cargo run -- doctor` checks database connectivity only and does not prove serve or persistence parity.
+
 ## Shared scenario families
 
 | Scenario | What it proves | Representative fault to detect |

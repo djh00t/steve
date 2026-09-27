@@ -7,13 +7,30 @@ mod upstream;
 
 use process::SteveProcess;
 use serde_json::{json, Value};
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::{postgres::PgPoolOptions, sqlite::SqlitePoolOptions};
 use std::time::Duration;
 use tokio::time::Instant;
 
 #[tokio::test]
-async fn process_management_and_deferred_event() {
-    let mut steve = SteveProcess::start().expect("start Steve process");
+async fn database_backend_contract() {
+    run_database_backend_contract(None).await;
+    if let Some(database_url) = std::env::var_os("STEVE_TEST_POSTGRES_URL") {
+        let database_url = database_url
+            .into_string()
+            .expect("STEVE_TEST_POSTGRES_URL must be valid UTF-8");
+        run_database_backend_contract(Some(&database_url)).await;
+    }
+}
+
+type EventRow = (String, String, String, String);
+
+async fn run_database_backend_contract(postgres_url: Option<&str>) {
+    let mut steve = match postgres_url {
+        Some(url) => {
+            SteveProcess::start_with_database_url(url).expect("start Steve process with PostgreSQL")
+        }
+        None => SteveProcess::start().expect("start Steve process with SQLite"),
+    };
     let listeners = steve
         .wait_ready(Duration::from_secs(15))
         .await
@@ -95,41 +112,63 @@ async fn process_management_and_deferred_event() {
         .expect("parse echo barrier response");
     assert_eq!(barrier_reply, barrier_request);
 
-    let db_url = format!("sqlite://{}", steve.database_path().display());
-    let pool = tokio::time::timeout(
-        Duration::from_secs(2),
-        SqlitePoolOptions::new().max_connections(1).connect(&db_url),
-    )
-    .await
-    .expect("timed out connecting to Steve SQLite database")
-    .expect("connect to Steve SQLite database");
+    let pool = match postgres_url {
+        Some(url) => EventPool::Postgres(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                PgPoolOptions::new().max_connections(1).connect(url),
+            )
+            .await
+            .expect("timed out connecting to configured Steve PostgreSQL database")
+            .expect("connect to configured Steve PostgreSQL database"),
+        ),
+        None => {
+            let db_url = format!("sqlite://{}", steve.database_path().display());
+            EventPool::Sqlite(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    SqlitePoolOptions::new().max_connections(1).connect(&db_url),
+                )
+                .await
+                .expect("timed out connecting to Steve SQLite database")
+                .expect("connect to Steve SQLite database"),
+            )
+        }
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let payloads = tokio::time::timeout(
-            Duration::from_secs(2),
-            sqlx::query_scalar::<_, String>(
-                "SELECT payload FROM steve_background_events WHERE kind = ?",
-            )
-            .bind("test.echo")
-            .fetch_all(&pool),
-        )
-        .await
-        .expect("timed out querying deferred events")
-        .expect("query deferred events");
-        let events: Vec<Value> = payloads
-            .into_iter()
-            .filter_map(|payload| serde_json::from_str(&payload).ok())
-            .collect();
-        let matching: Vec<_> = events
+        let rows = tokio::time::timeout(Duration::from_secs(2), pool.events(&run, &barrier_run))
+            .await
+            .expect("timed out querying deferred events")
+            .expect("query deferred events");
+        let matching: Vec<_> = rows
             .iter()
-            .filter(|payload| {
-                payload.pointer("/value/run").and_then(Value::as_str) == Some(run.as_str())
+            .filter(|(_, _, payload, _)| {
+                serde_json::from_str::<Value>(payload)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .pointer("/value/run")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(run.as_str())
             })
             .collect();
-        let barrier: Vec<_> = events
+        let barrier: Vec<_> = rows
             .iter()
-            .filter(|payload| {
-                payload.pointer("/value/run").and_then(Value::as_str) == Some(barrier_run.as_str())
+            .filter(|(_, _, payload, _)| {
+                serde_json::from_str::<Value>(payload)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .pointer("/value/run")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(barrier_run.as_str())
             })
             .collect();
         assert!(
@@ -142,8 +181,26 @@ async fn process_management_and_deferred_event() {
                 1,
                 "expected exactly one deferred event for run {run}"
             );
-            assert_eq!(matching[0], &request);
-            assert_eq!(barrier[0], &barrier_request);
+            let row = matching[0];
+            assert_eq!(row.1, "test.echo");
+            let persisted_payload: Value =
+                serde_json::from_str(&row.2).expect("parse persisted payload");
+            assert_eq!(persisted_payload, request);
+            uuid::Uuid::parse_str(&row.0).expect("persisted event id is a UUID");
+            chrono::DateTime::parse_from_rfc3339(&row.3)
+                .expect("persisted event timestamp is RFC 3339");
+            let by_id = tokio::time::timeout(Duration::from_secs(2), pool.event_by_id(&row.0))
+                .await
+                .expect("timed out retrieving persisted event by id")
+                .expect("retrieve persisted event by id");
+            assert_eq!(
+                &by_id, row,
+                "event fields remain stable when retrieved by id"
+            );
+            let barrier_payload: Value =
+                serde_json::from_str(&barrier[0].2).expect("parse barrier payload");
+            assert_eq!(barrier[0].1, "test.echo");
+            assert_eq!(barrier_payload, barrier_request);
             break;
         }
         assert!(
@@ -153,6 +210,66 @@ async fn process_management_and_deferred_event() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     pool.close().await;
+}
+
+enum EventPool {
+    Sqlite(sqlx::SqlitePool),
+    Postgres(sqlx::PgPool),
+}
+
+impl EventPool {
+    async fn events(&self, run: &str, barrier: &str) -> Result<Vec<EventRow>, sqlx::Error> {
+        let run_pattern = format!("%{run}%");
+        let barrier_pattern = format!("%{barrier}%");
+        match self {
+            Self::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT id, kind, payload, created_at FROM steve_background_events
+                 WHERE kind = ? AND (payload LIKE ? OR payload LIKE ?) ORDER BY id LIMIT 3",
+                )
+                .bind("test.echo")
+                .bind(run_pattern)
+                .bind(barrier_pattern)
+                .fetch_all(pool)
+                .await
+            }
+            Self::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT id, kind, payload, created_at FROM steve_background_events
+                 WHERE kind = $1 AND (payload LIKE $2 OR payload LIKE $3) ORDER BY id LIMIT 3",
+                )
+                .bind("test.echo")
+                .bind(run_pattern)
+                .bind(barrier_pattern)
+                .fetch_all(pool)
+                .await
+            }
+        }
+    }
+
+    async fn event_by_id(&self, id: &str) -> Result<EventRow, sqlx::Error> {
+        match self {
+            Self::Sqlite(pool) => sqlx::query_as(
+                "SELECT id, kind, payload, created_at FROM steve_background_events WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await,
+            Self::Postgres(pool) => sqlx::query_as(
+                "SELECT id, kind, payload, created_at FROM steve_background_events WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(pool)
+            .await,
+        }
+    }
+
+    async fn close(self) {
+        match self {
+            Self::Sqlite(pool) => pool.close().await,
+            Self::Postgres(pool) => pool.close().await,
+        }
+    }
 }
 
 #[cfg(unix)]
