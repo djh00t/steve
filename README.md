@@ -62,13 +62,13 @@ steve migrate
 
 **M0 — clean foundation: done.** It landed on `main` in [PR #1](https://github.com/djh00t/steve/pull/1) (`cbc2c44`). `steve serve` boots with SQLite or PostgreSQL, health and management endpoints respond, and local and S3-compatible object storage share one contract.
 
-**M1 — real proxy hot path: in progress.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. Non-stream Chat Completions and Anthropic Messages can forward to configured upstreams. Other forwarding and streaming remain later M1 work.
+**M1 — real proxy hot path: in progress.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. Non-stream Chat Completions includes bounded retry/multi-attempt tracking; Responses JSON/SSE and Anthropic Messages JSON/SSE forward to configured local fixtures; the OpenAI Chat SSE upstream pipe and management provider-health probes are implemented. Route-level Chat streaming and final M1 acceptance/deferred side-effect integration remain.
 
 The MVP stays a complete vertical slice. Delivery order is in the [MVP plan](docs/plans/2026-09-26-steve-mvp.md). Protocol and product boundaries are in the [architecture spec](docs/specs/2026-09-26-steve-gateway.md).
 
 ## Chat Completions forwarding
 
-Set `server.openai_upstream_url` to an HTTP OpenAI-compatible origin (for example `http://127.0.0.1:18080` for `make test-upstream`). `POST /v1/chat/completions` forwards validated non-stream JSON and returns the upstream JSON. A completed attempt is recorded in memory and logged as `Success`; upstream failures return HTTP 502 (HTTP 504 for timeouts). Without an upstream URL, the existing HTTP 501 stub remains. Streaming still returns HTTP 501.
+Set `server.openai_upstream_url` to an HTTP OpenAI-compatible origin (for example `http://127.0.0.1:18080` for `make test-upstream`). `POST /v1/chat/completions` forwards validated non-stream JSON and returns the upstream JSON. An HTTP 503 receives one retry; each attempt is recorded in memory and logged with its outcome and timestamps. Other upstream failures, including other 5xx responses, 4xx responses, transport failures, and invalid JSON, are not retried and return HTTP 502; timeouts are not retried and return HTTP 504. Without an upstream URL, the existing HTTP 501 stub remains. Streaming still returns HTTP 501.
 
 ## Anthropic Messages ingress
 
@@ -86,7 +86,7 @@ A minimal body is `model`, `max_tokens`, and `messages`. `stream` is optional an
 {"model":"claude-test","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}
 ```
 
-Invalid JSON or a missing or empty required field returns HTTP 400 with the Steve error model (`error.message`, `error.type`, `error.code`, `error.param`). Set `server.anthropic_upstream_url` to the unauthenticated local `make test-upstream` fixture origin to forward validated non-stream JSON and return the upstream JSON. Authenticated provider accounts are later work; Steve does not forward the inbound `x-api-key` to the upstream. Successful upstream attempts are logged as `Success`; failed attempts are logged as `UpstreamError` and return HTTP 502 (HTTP 504 for timeouts). Streaming still returns HTTP 501. Without an upstream URL, a valid body returns HTTP 501 with a typed stub (`request_id`, `attempt_id`, `model`, `max_tokens`, `stream`, `status`).
+Invalid JSON or a missing or empty required field returns HTTP 400 with the Steve error model (`error.message`, `error.type`, `error.code`, `error.param`). Set `server.anthropic_upstream_url` to the unauthenticated local `make test-upstream` fixture origin to forward validated non-stream JSON and return the upstream JSON, or to pass through `stream:true` responses as SSE. The streaming path cancels the upstream when the client disconnects, never silently replays output after it begins, and records `Success`, `Cancelled`, or `UpstreamError` for the attempt. This is fixture-only forwarding: authenticated provider accounts are later work, and Steve does not forward the inbound `x-api-key` to the upstream. Without an upstream URL, a valid body returns HTTP 501 with a typed stub (`request_id`, `attempt_id`, `model`, `max_tokens`, `stream`, `status`).
 
 ## Provider health
 

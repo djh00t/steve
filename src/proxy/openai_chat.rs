@@ -88,7 +88,8 @@ pub(crate) enum ChatCompletionReplyBody {
 pub(crate) struct ChatCompletionReply {
     pub(crate) status: StatusCode,
     pub(crate) body: ChatCompletionReplyBody,
-    pub(crate) attempt: Option<RequestAttempt>,
+    pub(crate) request: Option<Request>,
+    pub(crate) attempts: Vec<RequestAttempt>,
 }
 
 pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
@@ -98,13 +99,15 @@ pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
             ChatCompletionReply {
                 status: StatusCode::NOT_IMPLEMENTED,
                 body: ChatCompletionReplyBody::Stub(ChatCompletionStub::from(&handoff)),
-                attempt: Some(handoff.attempt),
+                request: Some(handoff.request),
+                attempts: vec![handoff.attempt],
             }
         }
         Err(error) => ChatCompletionReply {
             status: StatusCode::BAD_REQUEST,
             body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
-            attempt: None,
+            request: None,
+            attempts: Vec::new(),
         },
     }
 }
@@ -119,7 +122,8 @@ pub(crate) async fn handle_chat_completions_with_upstream(
             return ChatCompletionReply {
                 status: StatusCode::BAD_REQUEST,
                 body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
-                attempt: None,
+                request: None,
+                attempts: Vec::new(),
             }
         }
     };
@@ -128,14 +132,36 @@ pub(crate) async fn handle_chat_completions_with_upstream(
         return ChatCompletionReply {
             status: StatusCode::NOT_IMPLEMENTED,
             body: ChatCompletionReplyBody::Stub(ChatCompletionStub::from(&handoff)),
-            attempt: Some(handoff.attempt),
+            request: Some(handoff.request),
+            attempts: vec![handoff.attempt],
         };
     }
 
     handoff.attempt.provider = "openai".into();
     let request: Value = serde_json::from_slice(body).expect("validated JSON");
-    let result = upstream.chat_completion(&request).await;
-    handoff.attempt.finished_at = Some(Utc::now());
+    let mut attempts = Vec::new();
+    let result = loop {
+        let result = upstream.chat_completion(&request).await;
+        handoff.attempt.finished_at = Some(Utc::now());
+        let retry = result.as_ref().err().is_some_and(is_retryable) && attempts.is_empty();
+        if retry {
+            handoff.attempt.status = AttemptStatus::UpstreamError;
+            attempts.push(handoff.attempt.clone());
+            let attempt_id = AttemptId(Uuid::now_v7());
+            handoff.request.attempts.push(attempt_id);
+            handoff.attempt = RequestAttempt {
+                id: attempt_id,
+                request_id: handoff.request.id,
+                provider: "openai".into(),
+                account: UNASSIGNED.into(),
+                status: AttemptStatus::Pending,
+                started_at: Utc::now(),
+                finished_at: None,
+            };
+            continue;
+        }
+        break result;
+    };
     let (status, response) = match result {
         Ok(value) => {
             handoff.attempt.status = AttemptStatus::Success;
@@ -161,11 +187,17 @@ pub(crate) async fn handle_chat_completions_with_upstream(
             )
         }
     };
+    attempts.push(handoff.attempt.clone());
     ChatCompletionReply {
         status,
         body: response,
-        attempt: Some(handoff.attempt),
+        request: Some(handoff.request),
+        attempts,
     }
+}
+
+fn is_retryable(error: &UpstreamError) -> bool {
+    matches!(error, UpstreamError::UpstreamStatus { status: 503 })
 }
 
 fn parse_chat_completions(body: &[u8]) -> Result<ChatCompletionHandoff, SteveError> {
@@ -280,8 +312,15 @@ fn record_handoff(handoff: &ChatCompletionHandoff) {
 mod tests {
     use super::*;
     use crate::{net::bind_listener, test_upstream};
+    use axum::{response::IntoResponse, routing::post, Router};
     use serde_json::json;
-    use std::time::Duration;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
 
     #[tokio::test]
     async fn non_stream_chat_reaches_test_upstream_and_finishes_attempt() {
@@ -303,10 +342,104 @@ mod tests {
             serde_json::to_value(&reply.body).unwrap()["choices"][0]["message"]["content"],
             "steve-test-response"
         );
-        let attempt = reply.attempt.expect("request attempt");
-        assert_eq!(attempt.status, AttemptStatus::Success);
-        assert!(attempt.finished_at.is_some());
+        assert_eq!(reply.attempts.len(), 1);
+        assert_eq!(reply.attempts[0].status, AttemptStatus::Success);
+        assert!(reply.attempts[0].finished_at.is_some());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn retries_one_transient_failure_and_records_both_attempts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let calls = Arc::clone(&handler_calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    } else {
+                        axum::Json(json!({"id":"retry-success","choices":[]})).into_response()
+                    }
+                }
+            }),
+        );
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let raw = br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}"#;
+
+        let reply = handle_chat_completions_with_upstream(raw, &client).await;
+
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(reply.attempts.len(), 2);
+        assert_ne!(reply.attempts[0].id, reply.attempts[1].id);
+        assert_eq!(reply.attempts[0].status, AttemptStatus::UpstreamError);
+        assert_eq!(reply.attempts[1].status, AttemptStatus::Success);
+        assert!(reply
+            .attempts
+            .iter()
+            .all(|attempt| attempt.finished_at.is_some()));
+        assert_eq!(reply.attempts[0].request_id, reply.attempts[1].request_id);
+        let request = reply.request.expect("logical request");
+        assert_eq!(
+            request.attempts,
+            reply
+                .attempts
+                .iter()
+                .map(|attempt| attempt.id)
+                .collect::<Vec<_>>()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stops_after_one_retry_when_503_repeats() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let raw = br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}"#;
+
+        let reply = handle_chat_completions_with_upstream(raw, &client).await;
+
+        assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(reply.attempts.len(), 2);
+        assert!(reply.attempts.iter().all(|attempt| {
+            attempt.status == AttemptStatus::UpstreamError && attempt.finished_at.is_some()
+        }));
+        assert_eq!(
+            reply.request.expect("logical request").attempts,
+            reply
+                .attempts
+                .iter()
+                .map(|attempt| attempt.id)
+                .collect::<Vec<_>>()
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn retries_only_http_503() {
+        assert!(is_retryable(&UpstreamError::UpstreamStatus { status: 503 }));
+        for error in [
+            UpstreamError::UpstreamStatus { status: 500 },
+            UpstreamError::UpstreamStatus { status: 501 },
+            UpstreamError::UpstreamStatus { status: 504 },
+            UpstreamError::Timeout { timeout_ms: 1 },
+            UpstreamError::Transport {
+                message: "closed".into(),
+            },
+        ] {
+            assert!(!is_retryable(&error));
+        }
     }
 
     fn error_body(reply: ChatCompletionReply) -> SteveErrorResponse {
