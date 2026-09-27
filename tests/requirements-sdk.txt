@@ -1,0 +1,3 @@
+# Dependency Advisor: Python conservative policy, minimum release age 720h.
+# Approved 2026-09-27; exact report is recorded in the qualification PR.
+anthropic==1.2.0

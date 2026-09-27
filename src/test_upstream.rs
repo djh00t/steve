@@ -27,8 +27,9 @@
 //! ```
 //!
 //! Streaming Anthropic Messages (`stream` set to `true`). The body is
-//! `text/event-stream` with this subset, in order: `message_start`,
-//! `content_block_delta`, `message_stop`.
+//! `text/event-stream` with a complete text block lifecycle: `message_start`,
+//! `content_block_start`, `content_block_delta`, `content_block_stop`,
+//! `message_delta`, `message_stop`.
 //!
 //! ```text
 //! curl -N http://127.0.0.1:18080/v1/messages \
@@ -295,6 +296,11 @@ fn anthropic_message_sse(model: &str) -> String {
         }),
     ));
     body.push_str(&sse_event(
+        "content_block_start",
+        &json!({"type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""}}),
+    ));
+    body.push_str(&sse_event(
         "content_block_delta",
         &json!({
             "type": "content_block_delta",
@@ -304,6 +310,16 @@ fn anthropic_message_sse(model: &str) -> String {
                 "text": MESSAGE_TEXT
             }
         }),
+    ));
+    body.push_str(&sse_event(
+        "content_block_stop",
+        &json!({"type": "content_block_stop", "index": 0}),
+    ));
+    body.push_str(&sse_event(
+        "message_delta",
+        &json!({"type": "message_delta", "delta": {
+            "stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": 3}}),
     ));
     body.push_str(&sse_event("message_stop", &json!({"type": "message_stop"})));
     body
@@ -451,7 +467,14 @@ mod tests {
             .collect();
         assert_eq!(
             events,
-            ["message_start", "content_block_delta", "message_stop"]
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop"
+            ]
         );
         assert!(sse_body.contains(MESSAGE_TEXT));
         assert!(sse_body.contains("claude-fixture"));
