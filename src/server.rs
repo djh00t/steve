@@ -45,6 +45,34 @@ struct RequestCounters {
     management: AtomicU64,
 }
 
+struct AdmissionBudget {
+    semaphore: Arc<Semaphore>,
+    rejected_total: AtomicU64,
+}
+
+impl AdmissionBudget {
+    fn new(limit: u32) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(limit as usize)),
+            rejected_total: AtomicU64::new(0),
+        }
+    }
+
+    fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match self.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                let _ = self.rejected_total.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |total| Some(total.saturating_add(1)),
+                );
+                None
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     lifecycle: Lifecycle,
@@ -58,6 +86,7 @@ struct AppState {
     inference_bind: String,
     management_bind: String,
     models: Arc<[ModelConfig]>,
+    inference_admission: Arc<AdmissionBudget>,
     openai_upstream: Option<OpenAiUpstream>,
     anthropic_upstream: Option<AnthropicUpstream>,
     provider_probe: ProviderProbeState,
@@ -196,6 +225,7 @@ pub async fn run(
         inference_bind: cfg.server.inference_bind.clone(),
         management_bind: cfg.server.management_bind.clone(),
         models: catalogue,
+        inference_admission: Arc::new(AdmissionBudget::new(32)),
         openai_upstream,
         anthropic_upstream,
         provider_probe,
@@ -293,6 +323,10 @@ fn inference_router(state: Arc<AppState>) -> Router {
         .route("/v1/responses", post(responses))
         .route("/api/v1/test/echo", post(echo))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admit_inference,
+        ))
         .layer(middleware::from_fn_with_state(
             RequestClass::Inference(state.counters.clone()),
             track_requests,
@@ -592,6 +626,33 @@ async fn track_requests(
     hold_guard_until_body_end(response, guard)
 }
 
+async fn admit_inference(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let exempt = request.method() == axum::http::Method::GET
+        && matches!(request.uri().path(), "/health/live" | "/health/ready");
+    if exempt || state.lifecycle.phase() == Phase::Draining {
+        return next.run(request).await;
+    }
+
+    let Some(permit) = state.inference_admission.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("content-type", "application/json"),
+                ("cache-control", "no-store"),
+                ("retry-after", "1"),
+            ],
+            r#"{"error":{"type":"overloaded","code":"admission_limit","message":"inference capacity exhausted"}}"#,
+        )
+            .into_response();
+    };
+
+    hold_guard_until_body_end(next.run(request).await, permit)
+}
+
 struct RequestCounterGuard(RequestClass);
 
 impl RequestCounterGuard {
@@ -878,6 +939,7 @@ mod tests {
             inference_bind: "127.0.0.1:0".into(),
             management_bind: "127.0.0.1:0".into(),
             models: models::resolve_catalogue(&[]).into(),
+            inference_admission: Arc::new(AdmissionBudget::new(32)),
             openai_upstream: None,
             anthropic_upstream: Some(
                 AnthropicUpstream::new(upstream_url, Duration::from_secs(2)).unwrap(),
@@ -885,6 +947,71 @@ mod tests {
             provider_probe: ProviderProbeState::new(None, None).unwrap(),
         });
         (state, dir)
+    }
+
+    #[tokio::test]
+    async fn inference_admission_holds_permit_until_body_end() {
+        let (state, _dir) = messages_test_state("http://127.0.0.1:1".into()).await;
+        let lifecycle = state.lifecycle.clone();
+        let app = inference_router(state);
+        let request = || {
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let mut held = Vec::new();
+        for _ in 0..32 {
+            let response = app.clone().oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+
+        let overloaded = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()["content-type"], "application/json");
+        assert_eq!(overloaded.headers()["cache-control"], "no-store");
+        assert_eq!(overloaded.headers()["retry-after"], "1");
+        assert_eq!(
+            overloaded.into_body().collect().await.unwrap().to_bytes(),
+            bytes::Bytes::from_static(
+                br#"{"error":{"type":"overloaded","code":"admission_limit","message":"inference capacity exhausted"}}"#
+            )
+        );
+
+        for path in ["/health/live", "/health/ready"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().collect().await.unwrap();
+        }
+
+        drop(held.pop());
+        let resumed = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(resumed.status(), StatusCode::OK);
+        drop(resumed);
+        held.push(app.clone().oneshot(request()).await.unwrap());
+
+        lifecycle.drain("test");
+        let draining = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(draining.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            draining.into_body().collect().await.unwrap().to_bytes(),
+            bytes::Bytes::from_static(br#"{"error":"draining"}"#)
+        );
+        drop(held);
     }
 
     #[tokio::test]
