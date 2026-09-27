@@ -17,3 +17,7 @@ The [backlog index](backlog-index.md) and linked GitHub issues hold package deta
 Treat [testing (#61)](https://github.com/djh00t/steve/issues/61), [provider qualification (#70)](https://github.com/djh00t/steve/issues/70) and control surfaces as cross-cutting workstreams, not phases that serialize the core. Derive each wave from merged issue prerequisites and exact file ownership. Keep one writer for shared migrations, Rust module registration, CI workflow, fixture controls and UI route inventories. A shared file does not make the whole feature family serial: one integrator can serialize route registration while endpoint behavior, tests and registration land together in each useful slice.
 
 Every phase exit names its composed scenario, exact command, and tested combined SHA. Passing isolated package checks is necessary evidence for those packages, not phase completion. See [readiness and dispatch rules](work-packages.md) and the [contract registry](contracts/README.md).
+
+## Identity decision ordering
+
+#99 coordinates #500 principal data, #501 bootstrap/client credentials and #502 inference wire identity. Only #500 is READY to propose; #501 consumes accepted #500/#106, then #502 consumes #500/#501. Existing implementation and contract consumers retain #99 until composed acceptance and bounded handoffs are recorded. This split approves no identity or authentication policy. See [the canonical index](contracts/stv-m2-01.md).

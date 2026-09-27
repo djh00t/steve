@@ -40,7 +40,15 @@ Replacing one leaf with three brought that snapshot to **390 active leaves**, in
 
 The TLS fixture #133 and HTTPS-only OpenAI/Anthropic leaves #134/#135 depend on accepted #491 rather than the whole coordination parent or account schema. #133 owns the manifest; URL policy #495 and shared CA/client wiring #496 precede protocol proof #134, then #135. Certificate rejection #497 follows both positive proofs; redirect refusal #498 follows #497 to serialize their shared test file. They remain BLOCKED until exact trust/fixture inputs and executable prerequisites exist. Account-sourced credential isolation remains in #398 after #492 and its account prerequisites; no acceptance requirement was removed. The [TLS proposal](providers/tls-contract.md) and issue briefs record exact ownership, acceptance commands and mutation expectations; confirm accepted producer interfaces before dispatch.
 
-Replacing #132 with two proposal leaves brought that snapshot to 391 active leaves. Tracking four TLS implementation/qualification handoffs (#495–#498) brings the current issue inventory to **395 active leaves**. Coordination parents #84/#91/#132 are excluded; the original table below remains historical. [The provider contract index](providers/transport-auth-contract.md) points to the child artifacts and acceptance gates, not a second credential schema.
+Replacing #132 with two proposal leaves brought that snapshot to 391 active leaves. Tracking four TLS implementation/qualification handoffs (#495–#498) brought that snapshot to **395 active leaves**. Coordination parents #84/#91/#132 are excluded; the original table below remains historical. [The provider contract index](providers/transport-auth-contract.md) points to the child artifacts and acceptance gates, not a second credential schema.
+
+## Identity and client-auth contract decomposition
+
+[#99](https://github.com/djh00t/steve/issues/99) is now a coordinator for three independently reviewed artifacts: principal IDs/relationships [#500](https://github.com/djh00t/steve/issues/500), local bootstrap/client credential lifecycle [#501](https://github.com/djh00t/steve/issues/501), and inference auth/resolved identity [#502](https://github.com/djh00t/steve/issues/502). #500 is READY to propose; #501 waits for accepted #500 and management/listener contract #106; #502 waits for accepted #500/#501. #106 has no new prerequisite on #99 or the bootstrap child.
+
+Existing #99 consumers keep that acceptance gate until the child artifacts compose, exact revisions are accepted, and consumer briefs are re-sized against actual interfaces. #100 keeps provider credentials and access grants; #106 management/listener security; #110 audit schema; #116 session association. The [identity contract index](contracts/stv-m2-01.md) records ownership, not a new security policy.
+
+Replacing one leaf with three brings the current inventory to **397 active leaves** (M2 now has 47). Coordinators #84/#91/#99/#132 are excluded. The original readiness snapshot below remains historical. Original M0 acceptance is unchanged.
 
 ## Original 385-item readiness snapshot (historical)
 
@@ -126,7 +134,10 @@ Start with the real-process harness and independent contract decisions. Complete
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-M2-01](https://github.com/djh00t/steve/issues/99) | Freeze local identity and client-auth contract | READY | None |
+| [STV-M2-01](https://github.com/djh00t/steve/issues/99) | Coordinate local identity and client-auth contracts | COORDINATION | #500, #501, #502 |
+| [STV-M2-60](https://github.com/djh00t/steve/issues/500) | Propose local principal IDs and relationships | READY to propose | None |
+| [STV-M2-61](https://github.com/djh00t/steve/issues/501) | Propose local bootstrap and client credential lifecycle | BLOCKED | #500, #106 |
+| [STV-M2-62](https://github.com/djh00t/steve/issues/502) | Propose inference auth and resolved identity semantics | BLOCKED | #500, #501 |
 | [STV-M2-02](https://github.com/djh00t/steve/issues/100) | Freeze provider account, credentials, access and binding contract | BLOCKED | #99 |
 | [STV-M2-03](https://github.com/djh00t/steve/issues/101) | Freeze account pool policy, routing and affinity semantics | BLOCKED | #100 |
 | [STV-M2-04](https://github.com/djh00t/steve/issues/105) | Add relational organisation, user and client schema | BLOCKED | #99, #103, #104, #72 |

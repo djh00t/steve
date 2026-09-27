@@ -10,7 +10,10 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | [STV-M0-18 (#485)](https://github.com/djh00t/steve/issues/485) | Drain/replay acknowledgement and completion evidence | `docs/contracts/stv-m0-18.md` | BLOCKED on accepted #483/#484 artifacts |
 | [STV-M0-09 (#90)](https://github.com/djh00t/steve/issues/90) | Independent admission budgets | [Admission proposal](stv-m0-09.md) | Accepted via [#466](https://github.com/djh00t/steve/pull/466) at `63f9cce`; implementation leaves #468-470 merged, composed #92 remains separate |
 | [STV-M1-04 (#94)](https://github.com/djh00t/steve/issues/94) | Chat accounting event identity, payload and emission cardinality | `docs/m1-acceptance.md` (contract note only) | BLOCKED by STV-M0-01 (#84) |
-| [STV-M2-01 (#99)](https://github.com/djh00t/steve/issues/99) | Local identity and client authentication | `docs/contracts/stv-m2-01.md` | READY: proposal only |
+| [STV-M2-01 (#99)](https://github.com/djh00t/steve/issues/99) | Coordinate local identity and client authentication | [Identity contract index](stv-m2-01.md) | COORDINATION: child acceptance and consumer handoffs |
+| [STV-M2-60 (#500)](https://github.com/djh00t/steve/issues/500) | Principal IDs, relationships and legacy attribution | `docs/contracts/stv-m2-60.md` | READY: proposal only |
+| [STV-M2-61 (#501)](https://github.com/djh00t/steve/issues/501) | Local bootstrap and client credential lifecycle | `docs/contracts/stv-m2-61.md` | BLOCKED on accepted #500/#106 |
+| [STV-M2-62 (#502)](https://github.com/djh00t/steve/issues/502) | Inference auth wire and resolved identity | `docs/contracts/stv-m2-62.md` | BLOCKED on accepted #500/#501 |
 | [STV-M2-02 (#100)](https://github.com/djh00t/steve/issues/100) | Provider accounts, credentials, access and bindings | `docs/contracts/stv-m2-02.md` | BLOCKED by STV-M2-01 |
 | [STV-M2-03 (#101)](https://github.com/djh00t/steve/issues/101) | Account-pool policy, routing and affinity | `docs/contracts/stv-m2-03.md` | BLOCKED by STV-M2-02 |
 | [STV-M2-14 (#106)](https://github.com/djh00t/steve/issues/106) | Listener exposure and management authentication | `docs/contracts/stv-m2-14.md` | READY: proposal only |
