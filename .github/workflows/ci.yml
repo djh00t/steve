@@ -110,6 +110,11 @@ jobs:
           s3.create_bucket(Bucket="steve")
           PY
 
+      - name: Object store backend parity
+        env:
+          STEVE_TEST_S3_ENDPOINT: http://127.0.0.1:5000
+        run: cargo test --bin steve --all-features object_store_backend_contract -- --nocapture
+
       - name: S3-compatible doctor
         env:
           STEVE_DATABASE_URL: sqlite:///tmp/steve-s3.db?mode=rwc

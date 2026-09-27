@@ -34,6 +34,25 @@ Use SQLite/filesystem for the fast default scenario. Repeat representative persi
 
 Run the real-process database serve parity contract with SQLite using `cargo test --test e2e --all-features database_backend_contract`. To include PostgreSQL, set `STEVE_TEST_POSTGRES_URL` to a reachable test database URL for the same command; the test runs SQLite first, then PostgreSQL, and fails if the configured PostgreSQL database cannot be used. CI sets this variable to its provisioned PostgreSQL service URL. `cargo run -- doctor` checks database connectivity only and does not prove serve or persistence parity.
 
+Run the object-store parity contract with `cargo test --bin steve --all-features object_store_backend_contract -- --nocapture`. It writes the same generated key and binary payload to a temporary filesystem store and, when `STEVE_TEST_S3_ENDPOINT` is set, to the `steve` S3 bucket using the local fixture credentials. Each backend must return identical bytes, delete the object, and report OpenDAL `NotFound` on a subsequent read. A configured but unreachable S3 endpoint fails the test.
+
+For a local Moto fixture, install `moto[server]==5.2.3` and `pyOpenSSL==26.4.0`, then start `S3_IGNORE_SUBDOMAIN_BUCKETNAME=true python -m moto.server -H 127.0.0.1 -p 5000`. Create the test bucket with:
+
+```sh
+python - <<'PY'
+import boto3
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://127.0.0.1:5000",
+    aws_access_key_id="test",
+    aws_secret_access_key="test",
+    region_name="us-east-1",
+)
+s3.create_bucket(Bucket="steve")
+PY
+STEVE_TEST_S3_ENDPOINT=http://127.0.0.1:5000 cargo test --bin steve --all-features object_store_backend_contract -- --nocapture
+```
+
 ## Shared scenario families
 
 | Scenario | What it proves | Representative fault to detect |
