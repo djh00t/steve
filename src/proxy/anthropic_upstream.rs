@@ -791,14 +791,18 @@ mod tests {
 
     fn assert_message_sse(body: &str, model: &str) {
         let events = sse_events(body);
-        assert_eq!(events.len(), 3, "{body}");
+        assert_eq!(events.len(), 6, "{body}");
         assert_eq!(events[0].0, "message_start");
         assert_eq!(events[0].1["message"]["id"], MESSAGE_ID);
         assert_eq!(events[0].1["message"]["model"], model);
-        assert_eq!(events[1].0, "content_block_delta");
-        assert_eq!(events[1].1["delta"]["text"], MESSAGE_TEXT);
-        assert_eq!(events[2].0, "message_stop");
-        assert_eq!(events[2].1["type"], "message_stop");
+        assert_eq!(events[1].0, "content_block_start");
+        assert_eq!(events[2].0, "content_block_delta");
+        assert_eq!(events[2].1["delta"]["text"], MESSAGE_TEXT);
+        assert_eq!(events[3].0, "content_block_stop");
+        assert_eq!(events[4].0, "message_delta");
+        assert_eq!(events[4].1["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[5].0, "message_stop");
+        assert_eq!(events[5].1["type"], "message_stop");
     }
 
     fn sse_events(body: &str) -> Vec<(String, Value)> {

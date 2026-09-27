@@ -18,6 +18,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make quality-gates
 
+  official-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned test SDKs
+        run: |
+          python3 -m venv "$RUNNER_TEMP/steve-sdk-venv"
+          "$RUNNER_TEMP/steve-sdk-venv/bin/python" -m pip install -r tests/requirements-sdk.txt
+          "$RUNNER_TEMP/steve-sdk-venv/bin/python" -c 'from importlib.metadata import version; print("anthropic=" + version("anthropic")); print("openai=" + version("openai"))'
+      - name: Build Steve
+        run: cargo build --all-features
+      - name: Exercise official SDKs against local Steve
+        timeout-minutes: 2
+        run: '"$RUNNER_TEMP/steve-sdk-venv/bin/python" scripts/sdk_smoke.py --provider all --binary target/debug/steve'
+
   cross-platform:
     strategy:
       matrix:

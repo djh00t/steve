@@ -491,12 +491,27 @@ mod tests {
                     }),
                 ),
                 (
+                    "content_block_start".to_string(),
+                    json!({"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "text", "text": ""}}),
+                ),
+                (
                     "content_block_delta".to_string(),
                     json!({
                         "type": "content_block_delta",
                         "index": 0,
                         "delta": {"type": "text_delta", "text": "steve-test-response"}
                     }),
+                ),
+                (
+                    "content_block_stop".to_string(),
+                    json!({"type": "content_block_stop", "index": 0}),
+                ),
+                (
+                    "message_delta".to_string(),
+                    json!({"type": "message_delta", "delta": {
+                        "stop_reason": "end_turn", "stop_sequence": null},
+                        "usage": {"output_tokens": 3}}),
                 ),
                 ("message_stop".to_string(), json!({"type": "message_stop"})),
             ]
