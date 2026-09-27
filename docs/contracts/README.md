@@ -23,8 +23,10 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | [STV-M5-02 (#175)](https://github.com/djh00t/steve/issues/175) | EWMA and reliability rules | `docs/contracts/stv-m5-02.md` | READY: proposal only |
 | [STV-M5-03 (#176)](https://github.com/djh00t/steve/issues/176) | Normalized error taxonomy | `docs/contracts/stv-m5-03.md` | READY: proposal only |
 | [STV-M5-04 (#177)](https://github.com/djh00t/steve/issues/177) | OpenTelemetry MVP boundary | `docs/contracts/stv-m5-04.md` | READY: proposal only |
-| [STV-M6-01 (#186)](https://github.com/djh00t/steve/issues/186) | Deterministic routing score | `docs/contracts/stv-m6-01.md` | READY: proposal only |
-| [STV-M6-02 (#187)](https://github.com/djh00t/steve/issues/187) | Fixed/rule routing precedence | `docs/contracts/stv-m6-02.md` | READY: proposal only |
+| [STV-M6-01 (#186)](https://github.com/djh00t/steve/issues/186) | Routing score coordination | Child artifacts `stv-m6-01a.md`–`stv-m6-01i.md` | Coordination only: #549–#557 own separate decisions; parent remains open |
+| [STV-M6-02 (#187)](https://github.com/djh00t/steve/issues/187) | Logical selection precedence | [Selection proposal](stv-m6-02.md) | PROPOSED: David/Cos acceptance pending; consumers remain blocked |
+| [STV-M6-01A (#549)](https://github.com/djh00t/steve/issues/549) | Neutral score-result envelope | [Envelope proposal](stv-m6-01a.md) | PROPOSED: David/Cos acceptance pending; no component formulas or routing policy |
+| [STV-M6-02A (#558)](https://github.com/djh00t/steve/issues/558) | Pure profile/alias/ordered-rule domain | `docs/contracts/stv-m6-02a.md` (planned) | BLOCKED by accepted #187 and #556; no persistence or API implementation |
 | [STV-M6-26 (#270)](https://github.com/djh00t/steve/issues/270) | Immutable routing snapshot | `docs/contracts/stv-m6-26.md` | BLOCKED by STV-M4-04, STV-M5-01, STV-M2-09/07/41, STV-M6-02 |
 | [STV-M6-35 (#272)](https://github.com/djh00t/steve/issues/272) | Switchyard adapter/dependency boundary | `docs/contracts/stv-m6-35.md` | BLOCKED by STV-M6-03 |
 | [STV-M6-42 (#273)](https://github.com/djh00t/steve/issues/273) | Profile/alias/rule management API | `docs/contracts/stv-m6-42.md` | BLOCKED by STV-M6-02, STV-M6-04 |
