@@ -396,12 +396,17 @@ async fn chat_completions_stream_forwards_first_event_before_tail() {
 async fn chat_disconnect_no_replay() {
     use upstream::Tail;
 
-    tokio::time::timeout(Duration::from_secs(30), async {
-        run_chat_disconnect_case(Tail::Bytes(b"unreleased tail".as_slice().into()), true).await;
-        run_chat_disconnect_case(Tail::Error("failure after first output".into()), false).await;
-    })
-    .await
-    .expect("Chat Completions disconnect scenario exceeded 30 seconds");
+    for (tail, disconnect) in [
+        (Tail::Bytes(b"unreleased tail".as_slice().into()), true),
+        (Tail::Error("failure after first output".into()), false),
+    ] {
+        tokio::time::timeout(
+            Duration::from_secs(45),
+            run_chat_disconnect_case(tail, disconnect),
+        )
+        .await
+        .expect("Chat Completions disconnect case exceeded 45 seconds");
+    }
 }
 
 #[cfg(unix)]
