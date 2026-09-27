@@ -1,5 +1,9 @@
 #[path = "support/process.rs"]
 mod process;
+#[cfg(unix)]
+#[allow(dead_code)]
+#[path = "support/upstream.rs"]
+mod upstream;
 
 use process::SteveProcess;
 use serde_json::{json, Value};
@@ -149,4 +153,118 @@ async fn process_management_and_deferred_event() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     pool.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn drain_active_stream() {
+    use tokio_stream::StreamExt;
+    use upstream::{ControlledUpstream, Tail};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let first = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fixture\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"steve-test-model\"}}\n\n";
+        let tail = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
+        let mut upstream = ControlledUpstream::start(
+            "/v1/responses",
+            first.as_slice(),
+            Tail::Bytes(tail.as_slice().into()),
+        )
+        .await
+        .expect("start controlled upstream");
+        let upstream_url = upstream.url();
+        let mut steve = SteveProcess::start_with_drain_timeout(Some(&upstream_url), None, 5)
+            .expect("start Steve process with a five-second drain timeout");
+        let listeners = steve
+            .wait_ready(Duration::from_secs(15))
+            .await
+            .expect("Steve listeners become ready");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .expect("build HTTP client");
+        let request = json!({"model":"steve-test-model","input":"hi","stream":true});
+        let response = client
+            .post(format!("http://{}/v1/responses", listeners.inference))
+            .json(&request)
+            .send()
+            .await
+            .expect("request Responses stream");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let mut response = response.bytes_stream();
+
+        let captured: Value = upstream
+            .wait_for_request(Duration::from_secs(5))
+            .await
+            .expect("upstream request timeout");
+        assert_eq!(captured, request);
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !received.ends_with(b"\n\n") {
+                let chunk = response
+                    .next()
+                    .await
+                    .expect("stream ended before the first SSE event")
+                    .expect("read first SSE event");
+                received.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("first SSE event was not forwarded");
+        assert_eq!(received, first);
+        assert!(!upstream.tail_was_sent());
+
+        let drain: Value = client
+            .post(format!("http://{}/api/v1/system/drain", listeners.management))
+            .send()
+            .await
+            .expect("request management drain")
+            .error_for_status()
+            .expect("management drain status")
+            .json()
+            .await
+            .expect("parse management drain response");
+        assert_eq!(drain["phase"], "draining");
+
+        let readiness = client
+            .get(format!("http://{}/health/ready", listeners.management))
+            .send()
+            .await
+            .expect("request readiness during drain");
+        assert_eq!(readiness.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let readiness: Value = readiness.json().await.expect("parse readiness response");
+        assert_eq!(readiness["status"], "not_ready");
+        assert_eq!(readiness["phase"], "draining");
+
+        let live = client
+            .get(format!("http://{}/health/live", listeners.management))
+            .send()
+            .await
+            .expect("request liveness during drain");
+        assert_eq!(live.status(), reqwest::StatusCode::OK);
+
+        let shutdown_started = Instant::now();
+        steve.send_sigterm().expect("send SIGTERM to Steve");
+        upstream.release_tail();
+        while let Some(chunk) = response.next().await {
+            received.extend_from_slice(&chunk.expect("read remaining Responses stream"));
+        }
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(tail);
+        assert_eq!(received, expected);
+        assert!(upstream.tail_was_sent());
+
+        let status = steve
+            .wait_for_exit(Duration::from_secs(8))
+            .await
+            .expect("Steve exits within the caller's timeout");
+        assert!(status.success(), "Steve exited unsuccessfully: {status}");
+        assert!(
+            shutdown_started.elapsed() < Duration::from_secs(5),
+            "Steve did not exit before its configured drain deadline"
+        );
+    })
+    .await
+    .expect("active stream drain scenario exceeded 30 seconds");
 }
