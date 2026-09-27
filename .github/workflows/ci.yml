@@ -147,7 +147,7 @@ jobs:
           changed=false
           while IFS= read -r path; do
             case "$path" in
-              .github/workflows/ci.yml|Cargo.toml|Cargo.lock|*/Cargo.toml|*/Cargo.lock|src/proxy/*.rs|src/server.rs|src/lifecycle.rs|src/test_upstream.rs|tests/e2e_messages.rs|tests/e2e_responses.rs|tests/e2e_provider_fixture.rs|tests/support/upstream.rs|tests/mutations/buffer-until-eof.patch|scripts/qualify_buffering.py|scripts/test_qualify_buffering.py|scripts/check_mutation_outcomes.py|scripts/test_check_mutation_outcomes.py)
+              .github/workflows/ci.yml|Cargo.toml|Cargo.lock|*/Cargo.toml|*/Cargo.lock|src/proxy/*.rs|src/server.rs|src/lifecycle.rs|src/test_upstream.rs|tests/e2e_messages.rs|tests/e2e_responses.rs|tests/e2e_provider_fixture.rs|tests/support/upstream.rs|tests/support/process.rs|tests/mutations/buffer-until-eof.patch|scripts/qualify_buffering.py|scripts/test_qualify_buffering.py|scripts/check_mutation_outcomes.py|scripts/test_check_mutation_outcomes.py)
                 changed=true
                 ;;
             esac
