@@ -13,7 +13,7 @@ help:
 		'make build          Build the debug binary' \
 		'make test           Run all tests' \
 		'make check          Pre-commit formatting/clippy/check gates' \
-		'make quality-gates  Pre-PR check, test and release-build gates' \
+		'make quality-gates  Hosted CI check, test and release-build gates' \
 		'make install        Install/update the steve binary with Cargo' \
 		'make update         Fast-forward source and reinstall' \
 		'make hooks          Enable repository pre-commit/pre-push hooks' \
@@ -52,7 +52,7 @@ update:
 
 hooks:
 	git config core.hooksPath .githooks
-	@echo "Git hooks enabled: pre-commit=make check, pre-push=make quality-gates"
+	@echo "Git hooks enabled: pre-commit=make check, pre-push=make check"
 
 docker-build:
 	docker build -t $(IMAGE) .
