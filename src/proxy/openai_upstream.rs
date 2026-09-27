@@ -1076,9 +1076,29 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
         (addr, handle)
-    }
-    async fn collect_stream(mut stream: super::OpenAiEventStream) -> String {
+    }    async fn collect_stream(mut stream: super::OpenAiEventStream) -> String {
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
             body.extend_from_slice(&chunk.unwrap());
         }
+        String::from_utf8(body).unwrap()
+    }
+
+    fn expected_chat_sse() -> String {
+        let mut body = String::new();
+        for (index, content) in ["steve-test-", "response"].iter().enumerate() {
+            let mut delta = json!({"content": content});
+            if index == 0 {
+                delta["role"] = json!("assistant");
+            }
+            let finish_reason = if index == 1 {
+                json!("stop")
+            } else {
+                Value::Null
+            };
+            body.push_str(&format!("data: {}\n\n", json!({"id":"chatcmpl-steve-test","object":"chat.completion.chunk","created":0,"model":"steve-test-model","choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]})));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+}

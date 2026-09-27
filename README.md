@@ -70,6 +70,20 @@ The MVP stays a complete vertical slice. Delivery order is in the [MVP plan](doc
 
 Set `server.openai_upstream_url` to an HTTP OpenAI-compatible origin (for example `http://127.0.0.1:18080` for `make test-upstream`). `POST /v1/chat/completions` forwards validated non-stream JSON and returns the upstream JSON. An HTTP 503 receives one retry; each attempt is recorded in memory and logged with its outcome and timestamps. Other upstream failures, including other 5xx responses, 4xx responses, transport failures, and invalid JSON, are not retried and return HTTP 502; timeouts are not retried and return HTTP 504. Without an upstream URL, the existing HTTP 501 stub remains. Streaming still returns HTTP 501.
 
+## Responses forwarding
+
+With `server.openai_upstream_url` set to the unauthenticated local `make test-upstream` fixture origin, `POST /v1/responses` forwards validated JSON and returns the upstream response. Set `"stream": true` to receive raw `text/event-stream` events. Steve logs the attempt as `Success` when the body ends, `UpstreamError` on an upstream failure, or `Cancelled` when the client disconnects. Upstream failures before the response starts return HTTP 502 (HTTP 504 for timeouts). Invalid input returns HTTP 400; without an upstream URL, valid input returns the existing HTTP 501 stub. Provider credentials are later work.
+
+```sh
+curl -sS http://127.0.0.1:11435/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"steve-test-model","input":"hi"}'
+
+curl -N http://127.0.0.1:11435/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"steve-test-model","input":"hi","stream":true}'
+```
+
 ## Anthropic Messages ingress
 
 `POST /v1/messages` on the inference listener (default `[::]:11435`).
