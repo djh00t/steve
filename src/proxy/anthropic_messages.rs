@@ -8,18 +8,29 @@
 //!
 //! A minimal body is `model`, `max_tokens`, and `messages`, with optional
 //! `stream` (default `false`). Invalid bodies are HTTP 400 in the Steve error
-//! model. A valid body forwards through a configured upstream when
-//! non-streaming; unconfigured and streaming requests return HTTP 501 with a
-//! typed stub.
+//! model. Valid requests forward through a configured upstream as JSON or
+//! SSE; unconfigured requests return HTTP 501 with a typed stub.
 
 use super::{
+    stream::{pump_upstream, CancelToken, ReplayGate, SSE_CONTENT_TYPE},
     AnthropicError as UpstreamError, AnthropicUpstream, AttemptId, AttemptStatus, Request,
     RequestAttempt, RequestId,
 };
-use axum::http::StatusCode;
+use axum::{
+    body::{Body, BodyDataStream},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+};
+use tokio_stream::Stream;
 use uuid::Uuid;
 
 const UNASSIGNED: &str = "unassigned";
@@ -88,18 +99,31 @@ impl From<&MessagesHandoff> for MessagesStub {
     }
 }
 
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
 pub(crate) enum MessagesReplyBody {
     Error(SteveErrorResponse),
     Stub(MessagesStub),
     Success(Value),
+    Stream(Body),
 }
 
 pub(crate) struct MessagesReply {
     pub(crate) status: StatusCode,
     pub(crate) body: MessagesReplyBody,
-    pub(crate) attempt: Option<RequestAttempt>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) attempt: Option<Arc<Mutex<RequestAttempt>>>,
+}
+
+impl IntoResponse for MessagesReply {
+    fn into_response(self) -> Response {
+        match self.body {
+            MessagesReplyBody::Error(body) => (self.status, Json(body)).into_response(),
+            MessagesReplyBody::Stub(body) => (self.status, Json(body)).into_response(),
+            MessagesReplyBody::Success(body) => (self.status, Json(body)).into_response(),
+            MessagesReplyBody::Stream(body) => {
+                (self.status, [("content-type", SSE_CONTENT_TYPE)], body).into_response()
+            }
+        }
+    }
 }
 
 pub(crate) fn handle_messages(body: &[u8]) -> MessagesReply {
@@ -109,7 +133,7 @@ pub(crate) fn handle_messages(body: &[u8]) -> MessagesReply {
             MessagesReply {
                 status: StatusCode::NOT_IMPLEMENTED,
                 body: MessagesReplyBody::Stub(MessagesStub::from(&handoff)),
-                attempt: Some(handoff.attempt),
+                attempt: Some(Arc::new(Mutex::new(handoff.attempt))),
             }
         }
         Err(error) => MessagesReply {
@@ -135,47 +159,141 @@ pub(crate) async fn handle_messages_with_upstream(
         }
     };
     record_handoff(&handoff);
+    handoff.attempt.provider = "anthropic".into();
+    let attempt = Arc::new(Mutex::new(handoff.attempt));
+    let request: Value = serde_json::from_slice(body).expect("validated JSON");
+
     if handoff.stream {
-        return MessagesReply {
-            status: StatusCode::NOT_IMPLEMENTED,
-            body: MessagesReplyBody::Stub(MessagesStub::from(&handoff)),
-            attempt: Some(handoff.attempt),
+        let cancel = CancelToken::new();
+        let gate = ReplayGate::new();
+        let mut pending = PendingAttempt {
+            attempt: attempt.clone(),
+            cancel: Some(cancel.clone()),
+            armed: true,
         };
+        match upstream
+            .create_message_stream(&request, cancel.clone())
+            .await
+        {
+            Ok(stream) => {
+                let body = pump_upstream(&gate, cancel, stream).expect("fresh replay gate");
+                pending.armed = false;
+                return MessagesReply {
+                    status: StatusCode::OK,
+                    body: MessagesReplyBody::Stream(Body::from_stream(AttemptBody {
+                        inner: body.into_data_stream(),
+                        attempt: attempt.clone(),
+                    })),
+                    attempt: Some(attempt),
+                };
+            }
+            Err(error) => {
+                let reply = upstream_failure(attempt, error);
+                pending.armed = false;
+                return reply;
+            }
+        }
     }
 
-    handoff.attempt.provider = "anthropic".into();
-    let request: Value = serde_json::from_slice(body).expect("validated JSON");
-    let result = upstream.create_message(&request).await;
-    handoff.attempt.finished_at = Some(Utc::now());
-    let (status, response) = match result {
+    let mut pending = PendingAttempt {
+        attempt: attempt.clone(),
+        cancel: None,
+        armed: true,
+    };
+    let reply = match upstream.create_message(&request).await {
         Ok(value) => {
-            handoff.attempt.status = AttemptStatus::Success;
-            (StatusCode::OK, MessagesReplyBody::Success(value))
+            finish_attempt(&attempt, AttemptStatus::Success);
+            MessagesReply {
+                status: StatusCode::OK,
+                body: MessagesReplyBody::Success(value),
+                attempt: Some(attempt),
+            }
         }
-        Err(error) => {
-            handoff.attempt.status = AttemptStatus::UpstreamError;
-            let status = if matches!(error, UpstreamError::Timeout { .. }) {
-                StatusCode::GATEWAY_TIMEOUT
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            (
-                status,
-                MessagesReplyBody::Error(SteveErrorResponse {
-                    error: SteveError {
-                        message: error.to_string(),
-                        kind: "api_error",
-                        code: "upstream_error",
-                        param: None,
-                    },
-                }),
-            )
-        }
+        Err(error) => upstream_failure(attempt, error),
+    };
+    pending.armed = false;
+    reply
+}
+
+fn upstream_failure(attempt: Arc<Mutex<RequestAttempt>>, error: UpstreamError) -> MessagesReply {
+    finish_attempt(&attempt, AttemptStatus::UpstreamError);
+    let status = if matches!(error, UpstreamError::Timeout { .. }) {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
     };
     MessagesReply {
         status,
-        body: response,
-        attempt: Some(handoff.attempt),
+        body: MessagesReplyBody::Error(SteveErrorResponse {
+            error: SteveError {
+                message: error.to_string(),
+                kind: "api_error",
+                code: "upstream_error",
+                param: None,
+            },
+        }),
+        attempt: Some(attempt),
+    }
+}
+
+fn finish_attempt(attempt: &Arc<Mutex<RequestAttempt>>, status: AttemptStatus) {
+    let mut attempt = attempt.lock().expect("attempt lock");
+    if attempt.finished_at.is_some() {
+        return;
+    }
+    attempt.status = status;
+    attempt.finished_at = Some(Utc::now());
+    tracing::info!(
+        request_id = %attempt.request_id.0,
+        attempt_id = %attempt.id.0,
+        status = ?attempt.status,
+        finished_at = ?attempt.finished_at,
+        "messages upstream attempt finished"
+    );
+}
+
+struct PendingAttempt {
+    attempt: Arc<Mutex<RequestAttempt>>,
+    cancel: Option<CancelToken>,
+    armed: bool,
+}
+
+impl Drop for PendingAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
+            finish_attempt(&self.attempt, AttemptStatus::Cancelled);
+        }
+    }
+}
+
+struct AttemptBody {
+    inner: BodyDataStream,
+    attempt: Arc<Mutex<RequestAttempt>>,
+}
+
+impl Stream for AttemptBody {
+    type Item = Result<bytes::Bytes, axum::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_next(cx);
+        match &result {
+            Poll::Ready(None) => finish_attempt(&this.attempt, AttemptStatus::Success),
+            Poll::Ready(Some(Err(_))) => {
+                finish_attempt(&this.attempt, AttemptStatus::UpstreamError)
+            }
+            _ => {}
+        }
+        result
+    }
+}
+
+impl Drop for AttemptBody {
+    fn drop(&mut self) {
+        finish_attempt(&self.attempt, AttemptStatus::Cancelled);
     }
 }
 
@@ -301,8 +419,10 @@ fn record_handoff(handoff: &MessagesHandoff) {
 mod tests {
     use super::*;
     use crate::{net::bind_listener, test_upstream};
+    use http_body_util::BodyExt;
     use serde_json::json;
     use std::time::Duration;
+    use tokio_stream::StreamExt;
 
     #[tokio::test]
     async fn non_stream_messages_reaches_test_upstream_and_finishes_attempt() {
@@ -319,14 +439,235 @@ mod tests {
 
         let reply = handle_messages_with_upstream(raw, &client).await;
         assert_eq!(reply.status, StatusCode::OK);
-        assert_eq!(
-            serde_json::to_value(&reply.body).unwrap()["content"][0]["text"],
-            "steve-test-response"
-        );
+        let MessagesReplyBody::Success(body) = reply.body else {
+            panic!("expected success body");
+        };
+        assert_eq!(body["content"][0]["text"], "steve-test-response");
         let attempt = reply.attempt.expect("request attempt");
+        let attempt = attempt.lock().unwrap();
         assert_eq!(attempt.status, AttemptStatus::Success);
         assert!(attempt.finished_at.is_some());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_stream_forwards_fixture_and_finishes_at_eof() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, test_upstream::router())
+                .await
+                .unwrap();
+        });
+        let client =
+            AnthropicUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let raw = br#"{"model":"claude-fixture","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+
+        let reply = handle_messages_with_upstream(raw, &client).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        let attempt = reply.attempt.as_ref().unwrap().clone();
+        assert_eq!(attempt.lock().unwrap().status, AttemptStatus::Pending);
+        let response = reply.into_response();
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert_eq!(
+            sse_events(body),
+            vec![
+                (
+                    "message_start".to_string(),
+                    json!({
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_steve_test",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": "claude-fixture",
+                            "stop_reason": null,
+                            "stop_sequence": null,
+                            "usage": {"input_tokens": 10, "output_tokens": 0}
+                        }
+                    }),
+                ),
+                (
+                    "content_block_delta".to_string(),
+                    json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": "steve-test-response"}
+                    }),
+                ),
+                ("message_stop".to_string(), json!({"type": "message_stop"})),
+            ]
+        );
+        let attempt = attempt.lock().unwrap();
+        assert_eq!(attempt.status, AttemptStatus::Success);
+        assert!(attempt.finished_at.is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_stream_body_cancels_attempt() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, test_upstream::router())
+                .await
+                .unwrap();
+        });
+        let client =
+            AnthropicUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let reply = handle_messages_with_upstream(
+            br#"{"model":"claude-fixture","max_tokens":16,"messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            &client,
+        )
+        .await;
+        let attempt = reply.attempt.as_ref().unwrap().clone();
+        assert_eq!(attempt.lock().unwrap().status, AttemptStatus::Pending);
+
+        drop(reply.into_response());
+
+        let attempt = attempt.lock().unwrap();
+        assert_eq!(attempt.status, AttemptStatus::Cancelled);
+        assert!(attempt.finished_at.is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_header_wait_cancels_token_and_attempt() {
+        let handoff = parse_messages(
+            br#"{"model":"m","max_tokens":1,"messages":[{"role":"user"}],"stream":true}"#,
+        )
+        .unwrap();
+        let attempt = Arc::new(Mutex::new(handoff.attempt));
+        let cancel = CancelToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let waiting = tokio::spawn({
+            let attempt = attempt.clone();
+            let cancel = cancel.clone();
+            async move {
+                let _pending = PendingAttempt {
+                    attempt,
+                    cancel: Some(cancel),
+                    armed: true,
+                };
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+        ready_rx.await.unwrap();
+        waiting.abort();
+        let _ = waiting.await;
+
+        assert!(cancel.is_cancelled());
+        let attempt = attempt.lock().unwrap();
+        assert_eq!(attempt.status, AttemptStatus::Cancelled);
+        assert!(attempt.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn stream_header_failure_finishes_attempt_as_upstream_error() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/messages",
+                    axum::routing::post(|| async { StatusCode::BAD_GATEWAY }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let client =
+            AnthropicUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let reply = handle_messages_with_upstream(
+            br#"{"model":"m","max_tokens":1,"messages":[{"role":"user"}],"stream":true}"#,
+            &client,
+        )
+        .await;
+
+        assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+        let attempt = reply.attempt.unwrap();
+        let attempt = attempt.lock().unwrap();
+        assert_eq!(attempt.status, AttemptStatus::UpstreamError);
+        assert!(attempt.finished_at.is_some());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stream_forwards_first_chunk_before_tail_is_available() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let rx = Arc::new(Mutex::new(Some(rx)));
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/messages",
+                    axum::routing::post(move || {
+                        let rx = rx.clone();
+                        async move {
+                            (
+                                [("content-type", "text/event-stream")],
+                                Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(
+                                    rx.lock().unwrap().take().unwrap(),
+                                )),
+                            )
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let first = bytes::Bytes::from_static(b"event: message_start\ndata: {}\n\n");
+        tx.send(Ok::<_, std::io::Error>(first.clone()))
+            .await
+            .unwrap();
+        let client =
+            AnthropicUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).unwrap();
+        let reply = handle_messages_with_upstream(
+            br#"{"model":"m","max_tokens":1,"messages":[{"role":"user"}],"stream":true}"#,
+            &client,
+        )
+        .await;
+        let mut body = reply.into_response().into_body().into_data_stream();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), body.next())
+                .await
+                .expect("first chunk was buffered behind the tail")
+                .unwrap()
+                .unwrap(),
+            first
+        );
+
+        let tail = bytes::Bytes::from_static(b"event: message_stop\ndata: {}\n\n");
+        tx.send(Ok(tail.clone())).await.unwrap();
+        drop(tx);
+        assert_eq!(body.next().await.unwrap().unwrap(), tail);
+        assert!(body.next().await.is_none());
+        server.abort();
+    }
+
+    fn sse_events(body: &str) -> Vec<(String, Value)> {
+        body.split("\n\n")
+            .filter(|block| !block.is_empty())
+            .map(|block| {
+                let event = block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("event: "))
+                    .unwrap();
+                let data = block
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap();
+                (event.to_string(), serde_json::from_str(data).unwrap())
+            })
+            .collect()
     }
 
     fn error_body(reply: MessagesReply) -> SteveErrorResponse {

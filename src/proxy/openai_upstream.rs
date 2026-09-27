@@ -1,9 +1,9 @@
 //! Non-streaming OpenAI-compatible chat completions client.
 //!
-//! Posts JSON to `{base_url}/v1/chat/completions` (or `{base_url}/chat/completions`
-//! when the base URL already ends in `/v1`) and parses the JSON response.
-//! Streaming responses return unbuffered SSE bytes. The base URL must be
-//! absolute `http`; this slice is aimed at the deterministic test upstream.
+//! Posts JSON to OpenAI-compatible chat completions and Responses endpoints.
+//! Responses SSE chunks are returned unbuffered so ingress can stop the
+//! upstream by dropping the stream. The base URL must be absolute `http`;
+//! this slice is aimed at the deterministic test upstream.
 
 use super::stream::CancelToken;
 use bytes::Bytes;
@@ -15,7 +15,9 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-use tokio_stream::Stream;
+use tokio_stream::{Stream, StreamExt};
+
+const EVENT_STREAM: &str = "text/event-stream";
 
 /// Stub of Steve's structured error model.
 ///
@@ -58,7 +60,7 @@ pub struct OpenAiUpstream {
 
 impl OpenAiUpstream {
     /// `base_url` is an absolute `http` origin or an OpenAI-style `/v1` root.
-    /// `timeout` bounds connect, response headers, and the JSON body.
+    /// `timeout` bounds JSON calls and the response-header wait for SSE.
     pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, SteveError> {
         let base_url = normalize_base_url(base_url.into())?;
         if timeout.is_zero() {
@@ -174,9 +176,89 @@ impl OpenAiUpstream {
             timeout: self.timeout,
         })
     }
+    /// POST a non-streaming Responses request and return its parsed JSON body.
+    ///
+    /// `stream: true` is rejected before opening a connection.
+    pub async fn create_response(&self, request: &impl Serialize) -> Result<Value, SteveError> {
+        let body = prepare_responses_body(request, false)?;
+        let response = self
+            .post_responses(&body, "application/json")
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|err| map_http_error(err, self.timeout))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SteveError::UpstreamStatus {
+                status: status.as_u16(),
+            });
+        }
+        response
+            .json()
+            .await
+            .map_err(|err| map_http_error(err, self.timeout))
+    }
+
+    /// POST a streaming Responses request and yield SSE bytes as they arrive.
+    ///
+    /// The timeout and `cancel` apply only while waiting for response headers.
+    /// The returned body stream does not buffer; dropping it aborts the
+    /// upstream request, including when the ingress pump cancels its body.
+    pub async fn create_response_stream(
+        &self,
+        request: &impl Serialize,
+        cancel: CancelToken,
+    ) -> Result<impl Stream<Item = Result<Bytes, SteveError>> + Send + 'static, SteveError> {
+        if cancel.is_cancelled() {
+            return Err(SteveError::Cancelled);
+        }
+        let body = prepare_responses_body(request, true)?;
+        let send = self.post_responses(&body, EVENT_STREAM).send();
+        let cancel_for_wait = cancel.clone();
+        let response = tokio::select! {
+            biased;
+            () = cancel_for_wait.cancelled() => return Err(SteveError::Cancelled),
+            response = tokio::time::timeout(self.timeout, send) => {
+                match response {
+                    Ok(result) => result.map_err(|err| map_http_error(err, self.timeout))?,
+                    Err(_) => return Err(SteveError::Timeout {
+                        timeout_ms: duration_millis(self.timeout),
+                    }),
+                }
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(SteveError::UpstreamStatus {
+                status: status.as_u16(),
+            });
+        }
+        if !is_event_stream(response.headers()) {
+            let message = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing")
+                .to_string();
+            return Err(SteveError::UnexpectedContentType { message });
+        }
+
+        let timeout = self.timeout;
+        Ok(response
+            .bytes_stream()
+            .map(move |result| result.map_err(|err| map_http_error(err, timeout))))
+    }
+
+    fn post_responses(&self, body: &Value, accept: &'static str) -> reqwest::RequestBuilder {
+        self.http
+            .post(responses_url(&self.base_url))
+            .header(reqwest::header::ACCEPT, accept)
+            .json(body)
+    }
 }
 
-const EVENT_STREAM: &str = "text/event-stream";
 type UpstreamByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 /// Unbuffered OpenAI SSE body. Dropping it aborts the upstream response.
@@ -252,12 +334,20 @@ fn prepare_stream_body(request: &impl Serialize) -> Result<Value, SteveError> {
     Ok(body)
 }
 
-fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
-    headers
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case(EVENT_STREAM))
+fn prepare_responses_body(request: &impl Serialize, streaming: bool) -> Result<Value, SteveError> {
+    let mut body = serde_json::to_value(request).map_err(|err| SteveError::Config {
+        message: format!("Responses request is not valid JSON: {err}"),
+    })?;
+    if !streaming && body.get("stream").and_then(Value::as_bool) == Some(true) {
+        return Err(SteveError::StreamingNotSupported);
+    }
+    if streaming {
+        let object = body.as_object_mut().ok_or_else(|| SteveError::Config {
+            message: "Responses request must be a JSON object".into(),
+        })?;
+        object.insert("stream".to_string(), Value::Bool(true));
+    }
+    Ok(body)
 }
 
 fn normalize_base_url(raw: String) -> Result<String, SteveError> {
@@ -294,6 +384,23 @@ fn chat_completions_url(base_url: &str) -> String {
     }
 }
 
+fn responses_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/responses")
+    } else {
+        format!("{base}/v1/responses")
+    }
+}
+
+fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(EVENT_STREAM))
+}
+
 fn map_http_error(err: reqwest::Error, timeout: Duration) -> SteveError {
     if err.is_timeout() {
         SteveError::Timeout {
@@ -316,12 +423,18 @@ fn duration_millis(timeout: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::chat_completions_url;
+    use super::{chat_completions_url, responses_url};
     use crate::net::bind_listener;
     use crate::proxy::stream::{pump_upstream, CancelToken, ReplayForbidden, ReplayGate};
     use crate::proxy::{OpenAiUpstream, SteveError};
     use crate::test_upstream;
-    use axum::{body::Body, http::StatusCode, routing::post, Router};
+    use axum::{
+        body::Body,
+        http::{header, HeaderValue, StatusCode},
+        response::IntoResponse,
+        routing::post,
+        Router,
+    };
     use bytes::Bytes;
     use http_body_util::BodyExt;
     use serde_json::{json, Value};
@@ -409,6 +522,191 @@ mod tests {
             assert_eq!(collect_stream(stream).await, expected_chat_sse());
         }
 
+        server.abort();
+    }
+
+    #[test]
+    fn base_url_joins_responses_path() {
+        assert_eq!(
+            responses_url("http://127.0.0.1:18080"),
+            "http://127.0.0.1:18080/v1/responses"
+        );
+        assert_eq!(
+            responses_url("http://127.0.0.1:18080/v1"),
+            "http://127.0.0.1:18080/v1/responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_json_and_sse_round_trip_against_test_upstream() {
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, test_upstream::router())
+                .await
+                .expect("serve test upstream");
+        });
+
+        for base_url in [format!("http://{addr}"), format!("http://{addr}/v1")] {
+            let client =
+                OpenAiUpstream::new(base_url.as_str(), Duration::from_secs(2)).expect("client");
+            let body = client
+                .create_response(&json!({"model": "responses-fixture", "input": "hi"}))
+                .await
+                .unwrap_or_else(|err| panic!("JSON response {base_url}: {err}"));
+            assert_eq!(body["object"], "response");
+            assert_eq!(body["model"], "responses-fixture");
+
+            let mut stream = client
+                .create_response_stream(
+                    &json!({"model": "responses-fixture", "input": "hi"}),
+                    CancelToken::new(),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("SSE response {base_url}: {err}"));
+            let mut bytes = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(chunk) = stream.next().await {
+                    bytes.extend_from_slice(&chunk.expect("SSE bytes"));
+                }
+            })
+            .await
+            .expect("SSE body completes");
+            let body = String::from_utf8(bytes).expect("SSE utf-8");
+            assert!(body.contains("event: response.created"));
+            assert!(body.contains("event: response.output_text.delta"));
+            assert!(body.contains("responses-fixture"));
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_stream_body_continues_after_header_timeout() {
+        let (addr, server) = spawn(Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tokio::spawn(async move {
+                    tx.send(Ok::<_, std::io::Error>(Bytes::from_static(b"first")))
+                        .await
+                        .expect("send first chunk");
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    tx.send(Ok(Bytes::from_static(b"last")))
+                        .await
+                        .expect("send final chunk");
+                });
+
+                let mut response =
+                    Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
+                        .into_response();
+                response.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                );
+                response
+            }),
+        ))
+        .await;
+        let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_millis(100))
+            .expect("client");
+        let mut stream = client
+            .create_response_stream(&json!({"model": "m"}), CancelToken::new())
+            .await
+            .expect("headers arrive before timeout");
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("first chunk arrives")
+                .expect("first chunk exists")
+                .expect("first chunk succeeds"),
+            Bytes::from_static(b"first")
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .expect("delayed final chunk arrives")
+                .expect("final chunk exists")
+                .expect("final chunk succeeds"),
+            Bytes::from_static(b"last")
+        );
+        assert!(stream.next().await.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_stream_rejects_status_and_content_type() {
+        let (addr, server) =
+            spawn(Router::new().route("/v1/responses", post(|| async { StatusCode::BAD_GATEWAY })))
+                .await;
+        let client =
+            OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(1)).expect("client");
+        assert!(matches!(
+            client
+                .create_response_stream(&json!({"model": "m"}), CancelToken::new())
+                .await,
+            Err(SteveError::UpstreamStatus { status: 502 })
+        ));
+        server.abort();
+
+        let (addr, server) = spawn(Router::new().route(
+            "/v1/responses",
+            post(|| async { (StatusCode::OK, [("content-type", "application/json")], "{}") }),
+        ))
+        .await;
+        let client =
+            OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(1)).expect("client");
+        assert!(matches!(
+            client
+                .create_response_stream(&json!({"model": "m"}), CancelToken::new())
+                .await,
+            Err(SteveError::UnexpectedContentType { .. })
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_stream_header_wait_times_out_and_cancels() {
+        let (addr, server) = spawn(Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                StatusCode::OK
+            }),
+        ))
+        .await;
+        let client = OpenAiUpstream::new(format!("http://{addr}"), Duration::from_millis(100))
+            .expect("client");
+        assert!(matches!(
+            client
+                .create_response_stream(&json!({"model": "m"}), CancelToken::new())
+                .await,
+            Err(SteveError::Timeout { timeout_ms: 100 })
+        ));
+        server.abort();
+
+        let (addr, server) = spawn(Router::new().route(
+            "/v1/responses",
+            post(|| async { std::future::pending::<StatusCode>().await }),
+        ))
+        .await;
+        let client =
+            OpenAiUpstream::new(format!("http://{addr}"), Duration::from_secs(2)).expect("client");
+        let cancel = CancelToken::new();
+        let cancel_after = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            cancel_after.cancel();
+        });
+        assert!(matches!(
+            client
+                .create_response_stream(&json!({"model": "m"}), cancel)
+                .await,
+            Err(SteveError::Cancelled)
+        ));
         server.abort();
     }
 
@@ -779,30 +1077,8 @@ mod tests {
         });
         (addr, handle)
     }
-
     async fn collect_stream(mut stream: super::OpenAiEventStream) -> String {
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
             body.extend_from_slice(&chunk.unwrap());
         }
-        String::from_utf8(body).unwrap()
-    }
-
-    fn expected_chat_sse() -> String {
-        let mut body = String::new();
-        for (index, content) in ["steve-test-", "response"].iter().enumerate() {
-            let mut delta = json!({"content": content});
-            if index == 0 {
-                delta["role"] = json!("assistant");
-            }
-            let finish_reason = if index == 1 {
-                json!("stop")
-            } else {
-                Value::Null
-            };
-            body.push_str(&format!("data: {}\n\n", json!({"id":"chatcmpl-steve-test","object":"chat.completion.chunk","created":0,"model":"steve-test-model","choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]})));
-        }
-        body.push_str("data: [DONE]\n\n");
-        body
-    }
-}
