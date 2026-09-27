@@ -58,9 +58,11 @@ acceptance test separately. Existing contributors using `core.hooksPath=.githook
 pick up the revised hook after pulling this change. `make hooks` enables these
 repository hooks for a new checkout.
 
-The current CI workflow still runs the legacy broad gate on push and PR. The
-testing rollout package changes those triggers and adds the missing E2E/mutation
-commands; those CI and harness changes are not claimed as implemented here.
+The current CI workflow runs its broad gates on pull requests and pushes to
+`main`, so feature-branch PR updates receive hosted checks once. Feature branches
+without a PR do not receive hosted CI; run `make check` locally. See [the
+testing policy](docs/testing.md) for acceptance, E2E, mutation evidence, and
+rollout gates.
 
 Other existing commands are listed by `make help`. Future commands in work
 packages are gated by their named producer package.
