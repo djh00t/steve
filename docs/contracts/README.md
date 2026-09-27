@@ -44,8 +44,8 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | [STV-M7-02 (#292)](https://github.com/djh00t/steve/issues/292) | Common management-client errors | `docs/decisions/STV-M7-02-management-client.md` | BLOCKED by STV-M7-01, STV-M2-14, STV-M2-17 |
 | [STV-M7-29 (#379)](https://github.com/djh00t/steve/issues/379) | Scriptable CLI command and API coverage | `docs/decisions/STV-M7-29-cli-contract.md` | BLOCKED by listed API/domain producers and STV-M7-03 |
 | [STV-M8-01 (#335)](https://github.com/djh00t/steve/issues/335) | macOS UI and UI automation platform | `docs/decisions/STV-M8-01-macos-ui-test-platform.md` | READY: proposal only |
-| [STV-M8-02 (#336)](https://github.com/djh00t/steve/issues/336) | Native install/update distribution channel | `docs/decisions/STV-M8-02-macos-distribution.md` | READY: proposal only |
-| [STV-M8-03 (#337)](https://github.com/djh00t/steve/issues/337) | Deployment discovery and safe-action policy | `docs/decisions/STV-M8-03-deployment-discovery.md` | READY: proposal only |
+| [STV-M8-02 (#336)](https://github.com/djh00t/steve/issues/336) | Native install/update distribution channel | [Distribution proposal](../decisions/STV-M8-02-macos-distribution.md) | PROPOSED: David/Cos acceptance pending; signed release and coordinator qualification required |
+| [STV-M8-03 (#337)](https://github.com/djh00t/steve/issues/337) | Deployment discovery and safe-action policy | [Discovery proposal](../decisions/STV-M8-03-deployment-discovery.md) | PROPOSED: David/Cos acceptance pending; probes are read-only, native identity comes from #341 |
 | [STV-M8-04 (#338)](https://github.com/djh00t/steve/issues/338) | Remote forwarding security | `docs/decisions/STV-M8-04-remote-forward.md` | BLOCKED by STV-M2-14 and STV-M2-17 |
 | [STV-M8-05 (#339)](https://github.com/djh00t/steve/issues/339) | macOS credential-storage boundary | `docs/decisions/STV-M8-05-credential-storage.md` | BLOCKED by STV-M2-14 |
 
