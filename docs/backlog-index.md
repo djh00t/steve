@@ -10,7 +10,7 @@ Use the [delivery phases and workstreams](delivery-plan.md), [contract registry]
 
 The original 385-item inventory was a planning snapshot, not 385 dispatchable junior tasks. The second review at base `a55309d` examined every row for size, executable prerequisites, contract/schema completeness and shared ownership. Each linked area parent records the per-package corrections. Split/combine recommendations preserve existing IDs until the relevant contract producer can publish concrete replacements and update all dependency links.
 
-Of the original 22 READY rows, 21 prepare decisions or qualification proposals; only the process smoke package is implementation work, delivered for review in PR #457. No unresolved money, security, routing or platform choice is approved by a READY label. Integration acceptance gates verify composed results and are not ten-minute feature implementations. The counts below remain the original review snapshot; consult current issues before dispatch.
+Of the original 22 READY rows, 21 prepare decisions or qualification proposals; only the process smoke package is implementation work, accepted on main via PR #457. No unresolved money, security, routing or platform choice is approved by a READY label. Integration acceptance gates verify composed results and are not ten-minute feature implementations. The counts below remain the original review snapshot; consult current issues before dispatch.
 
 The immediate test split adds [STV-TST-11 (#458)](https://github.com/djh00t/steve/issues/458) for held object-store writes and [STV-TST-12 (#459)](https://github.com/djh00t/steve/issues/459) for Messages disconnect proof. STV-TST-02 now owns the provider fixture; STV-TST-04 owns Responses only; Chat stays in #33. After adding those two test slices and retiring four duplicate registration-only packages, the active inventory is 383 packages; the original summary below remains a 385-row audit snapshot.
 
@@ -53,7 +53,7 @@ Start with the real-process harness and independent contract decisions. Complete
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-TST-01](https://github.com/djh00t/steve/issues/72) | Add a real Steve process smoke harness | DELIVERED (PR #457) | None |
+| [STV-TST-01](https://github.com/djh00t/steve/issues/72) | Add a real Steve process smoke harness | ACCEPTED (PR #457) | None |
 | [STV-TST-02](https://github.com/djh00t/steve/issues/73) | Add a deterministic held-tail provider fixture | BLOCKED | #72 |
 | [STV-TST-03](https://github.com/djh00t/steve/issues/74) | Qualify targeted Rust mutation testing | BLOCKED | #72, #73 |
 | [STV-TST-04](https://github.com/djh00t/steve/issues/75) | Prove Responses disconnect cancels upstream without replay | BLOCKED | #72, #73 |
