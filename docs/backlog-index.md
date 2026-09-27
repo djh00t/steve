@@ -8,11 +8,11 @@ Use the [delivery phases and workstreams](delivery-plan.md), [contract registry]
 
 ## Second-pass decomposition review
 
-The 385 rows below are a planning inventory, not 385 dispatchable junior tasks. The second review at base `a55309d` examined every row for size, executable prerequisites, contract/schema completeness and shared ownership. Each linked area parent records the per-package corrections. Split/combine recommendations preserve existing IDs until the relevant contract producer can publish concrete replacements and update all dependency links.
+The original 385-item inventory was a planning snapshot, not 385 dispatchable junior tasks. The second review at base `a55309d` examined every row for size, executable prerequisites, contract/schema completeness and shared ownership. Each linked area parent records the per-package corrections. Split/combine recommendations preserve existing IDs until the relevant contract producer can publish concrete replacements and update all dependency links.
 
 Of the original 22 READY rows, 21 prepare decisions or qualification proposals; only the process smoke package is implementation work, delivered for review in PR #457. No unresolved money, security, routing or platform choice is approved by a READY label. Integration acceptance gates verify composed results and are not ten-minute feature implementations. The counts below remain the original review snapshot; consult current issues before dispatch.
 
-The immediate test split adds [STV-TST-11 (#458)](https://github.com/djh00t/steve/issues/458) for held object-store writes and [STV-TST-12 (#459)](https://github.com/djh00t/steve/issues/459) for Messages disconnect proof. STV-TST-02 now owns the provider fixture; STV-TST-04 owns Responses only; Chat stays in #33. The current inventory is 387 packages; the original summary below remains a 385-row audit snapshot.
+The immediate test split adds [STV-TST-11 (#458)](https://github.com/djh00t/steve/issues/458) for held object-store writes and [STV-TST-12 (#459)](https://github.com/djh00t/steve/issues/459) for Messages disconnect proof. STV-TST-02 now owns the provider fixture; STV-TST-04 owns Responses only; Chat stays in #33. After adding those two test slices and retiring four duplicate registration-only packages, the active inventory is 383 packages; the original summary below remains a 385-row audit snapshot.
 
 The next implementation wave must use exact accepted contract revisions and runnable predecessor commands. Register each endpoint with its implementation so its HTTP acceptance can run immediately; serialize shared router, schema, configuration, fixture and CI files. Apply the same rule to clients: qualify an executable target and one working connection before adding views.
 
@@ -411,10 +411,6 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M7-27](https://github.com/djh00t/steve/issues/374) | Edit storage and observability settings | BLOCKED | #292, #293, #369, #370, #297 |
 | [STV-M7-28](https://github.com/djh00t/steve/issues/375) | Compose M7 configure/report acceptance | BLOCKED | #329, #332, #358, #371, #363, #72, #293 |
 | [STV-M7-29](https://github.com/djh00t/steve/issues/379) | Freeze scriptable CLI command and API coverage | BLOCKED | #292, #99, #100, #106, #151, #156, #242, #280, #281, #283, #284, #286, #102, #293 |
-| [STV-API-31](https://github.com/djh00t/steve/issues/452) | Register model and account-health management routes | BLOCKED | #124, #125, #131, #312, #361, #295, #72 |
-| [STV-API-32](https://github.com/djh00t/steve/issues/453) | Register storage and retention management routes | BLOCKED | #452, #151, #156, #330, #369, #364, #72 |
-| [STV-API-33](https://github.com/djh00t/steve/issues/454) | Register pricing and FX management routes | BLOCKED | #453, #310, #366, #367, #72 |
-| [STV-API-34](https://github.com/djh00t/steve/issues/455) | Register observability settings and error routes | BLOCKED | #454, #299, #262, #331, #370, #317, #72 |
 
 ### M8
 
@@ -495,3 +491,14 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-V1-39](https://github.com/djh00t/steve/issues/449) | Discover OTEL Collector and Grafana Alloy examples | DEFERRED | #271 |
 | [STV-V1-40](https://github.com/djh00t/steve/issues/450) | Discover metrics/logs/traces backend examples | DEFERRED | #271 |
 | [STV-V1-41](https://github.com/djh00t/steve/issues/451) | Discover SLO and alert requirements | DEFERRED | #271 |
+
+## Retired registration-only packages
+
+These packages are superseded, not delivered features. Route registration now belongs to each endpoint implementation below, including its real-daemon HTTP acceptance. Each endpoint exclusively owns its registration edit in `src/server.rs::management_router`; these shared-file edits are serialized. The API-31 → API-32 → API-33 → API-34 dependency chain is removed; endpoint prerequisites remain their contracts, stores, authentication and test producers. No active consumer depends on a retired package.
+
+| Retired package | Endpoint packages absorbing route registration |
+| --- | --- |
+| [STV-API-31 (#452)](https://github.com/djh00t/steve/issues/452) | [STV-M2-06 (#124)](https://github.com/djh00t/steve/issues/124), [STV-M2-08 (#125)](https://github.com/djh00t/steve/issues/125), [STV-M2-41 (#131)](https://github.com/djh00t/steve/issues/131), [STV-API-04 (#312)](https://github.com/djh00t/steve/issues/312), [STV-API-05 (#361)](https://github.com/djh00t/steve/issues/361), [STV-API-07 (#295)](https://github.com/djh00t/steve/issues/295) |
+| [STV-API-32 (#453)](https://github.com/djh00t/steve/issues/453) | [STV-M3-09 (#151)](https://github.com/djh00t/steve/issues/151), [STV-M3-31 (#156)](https://github.com/djh00t/steve/issues/156), [STV-API-11 (#330)](https://github.com/djh00t/steve/issues/330), [STV-API-12 (#369)](https://github.com/djh00t/steve/issues/369), [STV-API-13 (#364)](https://github.com/djh00t/steve/issues/364) |
+| [STV-API-33 (#454)](https://github.com/djh00t/steve/issues/454) | [STV-API-17 (#310)](https://github.com/djh00t/steve/issues/310), [STV-API-18 (#366)](https://github.com/djh00t/steve/issues/366), [STV-API-19 (#367)](https://github.com/djh00t/steve/issues/367) |
+| [STV-API-34 (#455)](https://github.com/djh00t/steve/issues/455) | [STV-M5-39 (#262)](https://github.com/djh00t/steve/issues/262), [STV-API-23 (#331)](https://github.com/djh00t/steve/issues/331), [STV-API-24 (#370)](https://github.com/djh00t/steve/issues/370), [STV-API-26 (#317)](https://github.com/djh00t/steve/issues/317) |
