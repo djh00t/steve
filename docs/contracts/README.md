@@ -8,6 +8,7 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | [STV-M0-09 (#90)](https://github.com/djh00t/steve/issues/90) | Independent admission budgets | [Admission proposal](stv-m0-09.md) | Proposed until [#466](https://github.com/djh00t/steve/pull/466) merges; then accepted at its merge SHA; consumers need re-sized briefs |
 | [STV-M1-04 (#94)](https://github.com/djh00t/steve/issues/94) | Chat accounting event identity, payload and emission cardinality | `docs/m1-acceptance.md` (contract note only) | BLOCKED by STV-M0-01 (#84) |
 | [STV-M2-01 (#99)](https://github.com/djh00t/steve/issues/99) | Local identity and client authentication | `docs/contracts/stv-m2-01.md` | READY: proposal only |
+| [STV-M2-60 (#500)](https://github.com/djh00t/steve/issues/500) | Principal IDs, relationships and legacy attribution | [Principal proposal](stv-m2-60.md) | PROPOSED: David/Cos exact-revision acceptance and executable contract evidence pending; #99 and runtime consumers remain gated |
 | [STV-M2-02 (#100)](https://github.com/djh00t/steve/issues/100) | Provider accounts, credentials, access and bindings | `docs/contracts/stv-m2-02.md` | BLOCKED by STV-M2-01 |
 | [STV-M2-03 (#101)](https://github.com/djh00t/steve/issues/101) | Account-pool policy, routing and affinity | `docs/contracts/stv-m2-03.md` | BLOCKED by STV-M2-02 |
 | [STV-M2-14 (#106)](https://github.com/djh00t/steve/issues/106) | Listener exposure and management authentication | `docs/contracts/stv-m2-14.md` | READY: proposal only |
