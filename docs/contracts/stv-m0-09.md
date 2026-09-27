@@ -1,6 +1,6 @@
 # STV-M0-09: independent admission budgets
 
-**PROPOSED, unaccepted.** David is the accepting authority; merging this contract records acceptance of this revision. Runtime consumers remain blocked until then. Verified base: `2f8df419af390ef8cee57f9a0bab144872782b11`, including the provider fixture and protocol disconnect tests from #463–465.
+**Acceptance:** proposed while [PR #466](https://github.com/djh00t/steve/pull/466) is open; accepted at that PR's merge commit once David authorizes its merge into `main`. David is the accepting authority. Consumers must record that merge SHA as the accepted artifact revision; they remain blocked until the merge and their brief updates. Later contract revisions require their own acceptance. Verified base: `2f8df419af390ef8cee57f9a0bab144872782b11`, including the provider fixture and protocol disconnect tests from #463–465.
 
 ## Evidence and proposed decision
 
