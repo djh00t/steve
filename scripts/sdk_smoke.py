@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the Anthropic Python SDK against Steve and its local fixture."""
+"""Exercise official Python SDKs against Steve and its local fixture."""
 
 import argparse
 import importlib.metadata
@@ -11,7 +11,8 @@ import sys
 import tempfile
 import time
 
-SDK_VERSION = "1.2.0"
+ANTHROPIC_SDK_VERSION = "1.2.0"
+OPENAI_SDK_VERSION = "3.6.0"
 READY_TIMEOUT_SECONDS = 15
 
 
@@ -66,21 +67,119 @@ def stop(child):
         child.wait()
 
 
+def check_sdk(provider):
+    package, version = {
+        "anthropic": ("anthropic", ANTHROPIC_SDK_VERSION),
+        "openai": ("openai", OPENAI_SDK_VERSION),
+    }[provider]
+    try:
+        __import__(package)
+    except ImportError as error:
+        raise RuntimeError(
+            f"{provider} SDK dependencies are missing; install tests/requirements-sdk.txt ({error})"
+        ) from error
+    installed_version = importlib.metadata.version(package)
+    if installed_version != version:
+        raise RuntimeError(f"{package}=={version} is required, found {installed_version}")
+
+
+def anthropic_smoke(inference_addr, server_log, fixture_log):
+    import anthropic
+
+    try:
+        with anthropic.DefaultHttpxClient(trust_env=False, timeout=10) as http_client:
+            client = anthropic.Anthropic(
+                api_key="dummy-local-test-key",
+                base_url=f"http://{inference_addr}",
+                max_retries=0,
+                timeout=10,
+                http_client=http_client,
+            )
+            with client.messages.stream(
+                model="steve-test-model",
+                max_tokens=16,
+                messages=[{"role": "user", "content": "hi"}],
+            ) as stream:
+                streamed_text = "".join(stream.text_stream)
+                final_message = stream.get_final_message()
+            assert streamed_text == "steve-test-response", streamed_text
+            assert final_message.stop_reason == "end_turn", final_message.stop_reason
+            final_text = [block.text for block in final_message.content if block.type == "text"]
+            assert final_text == ["steve-test-response"], final_message.content
+            client.close()
+    except Exception as error:
+        raise RuntimeError(
+            f"Anthropic SDK smoke failed: {error}\n"
+            f"Steve logs:\n{log_tail(server_log)}\n"
+            f"Fixture logs:\n{log_tail(fixture_log)}"
+        ) from error
+
+
+def openai_smoke(inference_addr, server_log, fixture_log):
+    from openai import DefaultHttpxClient, OpenAI
+
+    try:
+        with DefaultHttpxClient(trust_env=False, timeout=10) as http_client:
+            client = OpenAI(
+                api_key="dummy-local-test-key",
+                base_url=f"http://{inference_addr}/v1",
+                max_retries=0,
+                timeout=10,
+                http_client=http_client,
+            )
+            with client.chat.completions.stream(
+                model="steve-test-model",
+                max_tokens=16,
+                messages=[{"role": "user", "content": "hi"}],
+            ) as stream:
+                streamed_text = "".join(
+                    event.delta for event in stream if event.type == "content.delta"
+                )
+                completion = stream.get_final_completion()
+            assert streamed_text == "steve-test-response", streamed_text
+            assert completion.choices[0].finish_reason == "stop", completion.choices
+            assert completion.choices[0].message.content == "steve-test-response"
+
+            with client.responses.stream(
+                model="steve-test-model",
+                max_output_tokens=16,
+                input="hi",
+            ) as stream:
+                streamed_text = "".join(
+                    event.delta
+                    for event in stream
+                    if event.type == "response.output_text.delta"
+                )
+                response = stream.get_final_response()
+            assert streamed_text == "steve-test-response", streamed_text
+            assert response.status == "completed", response.status
+            assert response.output_text == "steve-test-response", response.output_text
+            client.close()
+    except Exception as error:
+        raise RuntimeError(
+            f"OpenAI SDK smoke failed: {error}\n"
+            f"Steve logs:\n{log_tail(server_log)}\n"
+            f"Fixture logs:\n{log_tail(fixture_log)}"
+        ) from error
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/debug/steve"))
+    parser.add_argument(
+        "--provider", choices=("anthropic", "openai", "all"), default="anthropic"
+    )
     args = parser.parse_args()
     binary = args.binary.resolve()
     if not binary.is_file():
         parser.error(f"Steve binary not found: {binary} (build it with cargo build first)")
 
+    providers = ("anthropic", "openai") if args.provider == "all" else (args.provider,)
     try:
-        import anthropic
-    except ImportError as error:
-        parser.error(f"SDK dependencies are missing; install tests/requirements-sdk.txt ({error})")
-    installed_version = importlib.metadata.version("anthropic")
-    if installed_version != SDK_VERSION:
-        parser.error(f"anthropic=={SDK_VERSION} is required, found {installed_version}")
+        for provider in providers:
+            check_sdk(provider)
+    except RuntimeError as error:
+        parser.error(str(error))
 
     env = clean_environment()
     for key in set(os.environ) - env.keys():
@@ -111,6 +210,7 @@ def main():
                         "[server]",
                         'inference_bind = "127.0.0.1:0"',
                         'management_bind = "127.0.0.1:0"',
+                        f'openai_upstream_url = "http://{fixture_addr}"',
                         f'anthropic_upstream_url = "http://{fixture_addr}"',
                         "",
                         "[database]",
@@ -141,41 +241,17 @@ def main():
                 )
             inference_addr = ready_address(server_child, server_log, "listeners_ready", "inference")
 
-            try:
-                with anthropic.DefaultHttpxClient(trust_env=False, timeout=10) as http_client:
-                    client = anthropic.Anthropic(
-                        api_key="dummy-local-test-key",
-                        base_url=f"http://{inference_addr}",
-                        max_retries=0,
-                        timeout=10,
-                        http_client=http_client,
-                    )
-                    with client.messages.stream(
-                        model="steve-test-model",
-                        max_tokens=16,
-                        messages=[{"role": "user", "content": "hi"}],
-                    ) as stream:
-                        streamed_text = "".join(stream.text_stream)
-                        final_message = stream.get_final_message()
-                    assert streamed_text == "steve-test-response", streamed_text
-                    assert final_message.stop_reason == "end_turn", final_message.stop_reason
-                    final_text = [
-                        block.text for block in final_message.content if block.type == "text"
-                    ]
-                    assert final_text == ["steve-test-response"], final_message.content
-                    client.close()
-            except Exception as error:
-                raise RuntimeError(
-                    f"Anthropic SDK smoke failed: {error}\n"
-                    f"Steve logs:\n{log_tail(server_log)}\n"
-                    f"Fixture logs:\n{log_tail(fixture_log)}"
-                ) from error
+            for provider in providers:
+                if provider == "anthropic":
+                    anthropic_smoke(inference_addr, server_log, fixture_log)
+                else:
+                    openai_smoke(inference_addr, server_log, fixture_log)
         finally:
             try:
                 stop(server_child)
             finally:
                 stop(fixture_child)
-    print("Anthropic SDK smoke passed")
+    print(f"{', '.join(provider.title() for provider in providers)} SDK smoke passed")
 
 
 if __name__ == "__main__":

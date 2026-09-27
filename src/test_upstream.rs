@@ -174,14 +174,18 @@ fn response_json(model: &str) -> Value {
     json!({
         "id": RESPONSE_ID,
         "object": "response",
+        "created_at": 0,
         "status": "completed",
         "model": model,
         "output": [{
+            "id": "msg_response_fixture",
             "type": "message",
+            "status": "completed",
             "role": "assistant",
             "content": [{
                 "type": "output_text",
-                "text": RESPONSE_TEXT
+                "text": RESPONSE_TEXT,
+                "annotations": []
             }]
         }],
         "usage": {
@@ -200,35 +204,42 @@ fn responses_stream(model: &str) -> Response {
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
 
-    let mut body = String::new();
-    body.push_str(&sse_event(
-        "response.created",
-        &json!({
-            "type": "response.created",
-            "response": {
-                "id": RESPONSE_ID,
-                "object": "response",
-                "status": "in_progress",
-                "model": model
-            }
-        }),
-    ));
+    let completed = response_json(model);
+    let mut created = completed.clone();
+    created["status"] = json!("in_progress");
+    created["output"] = json!([]);
+    created["usage"] = Value::Null;
+    let item = completed["output"][0].clone();
+    let part = item["content"][0].clone();
+    let item_id = item["id"].clone();
+    let mut events = vec![
+        json!({"type": "response.created", "response": created}),
+        json!({"type": "response.output_item.added", "output_index": 0,
+            "item": {"id": item_id, "type": "message", "role": "assistant",
+                "status": "in_progress", "content": []}}),
+        json!({"type": "response.content_part.added", "item_id": item_id,
+            "output_index": 0, "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}}),
+    ];
     for chunk in RESPONSE_TEXT_CHUNKS {
-        body.push_str(&sse_event(
-            "response.output_text.delta",
-            &json!({
-                "type": "response.output_text.delta",
-                "delta": chunk
-            }),
-        ));
+        events.push(
+            json!({"type": "response.output_text.delta", "item_id": item_id,
+            "output_index": 0, "content_index": 0, "delta": chunk, "logprobs": []}),
+        );
     }
-    body.push_str(&sse_event(
-        "response.completed",
-        &json!({
-            "type": "response.completed",
-            "response": response_json(model)
-        }),
-    ));
+    events.extend([
+        json!({"type": "response.output_text.done", "item_id": item_id,
+            "output_index": 0, "content_index": 0, "text": RESPONSE_TEXT, "logprobs": []}),
+        json!({"type": "response.content_part.done", "item_id": item_id,
+            "output_index": 0, "content_index": 0, "part": part}),
+        json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+        json!({"type": "response.completed", "response": completed}),
+    ]);
+    let mut body = String::new();
+    for (sequence, mut event) in events.into_iter().enumerate() {
+        event["sequence_number"] = json!(sequence);
+        body.push_str(&sse_event(event["type"].as_str().unwrap(), &event));
+    }
     (headers, body).into_response()
 }
 
@@ -536,8 +547,13 @@ mod tests {
             event_types,
             [
                 "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
                 "response.output_text.delta",
                 "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
                 "response.completed"
             ]
         );
