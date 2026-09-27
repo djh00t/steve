@@ -1076,7 +1076,9 @@ mod tests {
             axum::serve(listener, app).await.expect("serve");
         });
         (addr, handle)
-    }    async fn collect_stream(mut stream: super::OpenAiEventStream) -> String {
+    }
+
+    async fn collect_stream(mut stream: super::OpenAiEventStream) -> String {
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
             body.extend_from_slice(&chunk.unwrap());
