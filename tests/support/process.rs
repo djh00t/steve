@@ -2,7 +2,7 @@ use std::{
     fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     time::Duration,
 };
 use tempfile::TempDir;
@@ -28,11 +28,19 @@ impl SteveProcess {
         openai_upstream_url: Option<&str>,
         anthropic_upstream_url: Option<&str>,
     ) -> io::Result<Self> {
+        Self::start_with_drain_timeout(openai_upstream_url, anthropic_upstream_url, 60)
+    }
+
+    pub fn start_with_drain_timeout(
+        openai_upstream_url: Option<&str>,
+        anthropic_upstream_url: Option<&str>,
+        drain_timeout_seconds: u64,
+    ) -> io::Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path();
         let db_path = root.join("steve.db");
-        let mut server_config = String::from(
-            "[server]\ninference_bind = \"127.0.0.1:0\"\nmanagement_bind = \"127.0.0.1:0\"\n",
+        let mut server_config = format!(
+            "[server]\ninference_bind = \"127.0.0.1:0\"\nmanagement_bind = \"127.0.0.1:0\"\ndrain_timeout_seconds = {drain_timeout_seconds}\n"
         );
         if let Some(url) = openai_upstream_url {
             server_config.push_str(&format!(
@@ -107,6 +115,44 @@ impl SteveProcess {
             if Instant::now() >= deadline {
                 return Err(format!(
                     "timed out waiting for listeners_ready; logs:\n{}",
+                    self.diagnostic_logs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(dead_code)]
+    pub fn send_sigterm(&mut self) -> io::Result<()> {
+        if let Some(status) = self.child.try_wait()? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Steve process already exited with {status}"),
+            ));
+        }
+
+        let pid = self.child.id().to_string();
+        let status = Command::new("kill").args(["-TERM", &pid]).status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "kill -TERM {pid} failed with {status}"
+            )))
+        }
+    }
+
+    #[allow(dead_code)]
+    pub async fn wait_for_exit(&mut self, timeout: Duration) -> Result<ExitStatus, String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().map_err(|err| err.to_string())? {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for Steve to exit after {timeout:?}; logs:\n{}",
                     self.diagnostic_logs()
                 ));
             }
