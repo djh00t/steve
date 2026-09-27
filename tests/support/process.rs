@@ -24,6 +24,10 @@ impl SteveProcess {
         Self::start_with_upstream_urls(None, None)
     }
 
+    pub fn start_with_database_url(database_url: &str) -> io::Result<Self> {
+        Self::start_with_options(None, None, 60, None, None, Some(database_url))
+    }
+
     pub fn start_with_upstream_urls(
         openai_upstream_url: Option<&str>,
         anthropic_upstream_url: Option<&str>,
@@ -42,12 +46,13 @@ impl SteveProcess {
             drain_timeout_seconds,
             None,
             None,
+            None,
         )
     }
 
     #[allow(dead_code)]
     pub fn start_with_object_store(endpoint: &str, history_capacity: usize) -> io::Result<Self> {
-        Self::start_with_options(None, None, 60, Some(endpoint), Some(history_capacity))
+        Self::start_with_options(None, None, 60, Some(endpoint), Some(history_capacity), None)
     }
 
     fn start_with_options(
@@ -56,6 +61,7 @@ impl SteveProcess {
         drain_timeout_seconds: u64,
         object_store_endpoint: Option<&str>,
         history_capacity: Option<usize>,
+        database_url: Option<&str>,
     ) -> io::Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path();
@@ -89,11 +95,14 @@ impl SteveProcess {
         let history = history_capacity
             .map(|capacity| format!("history = {capacity}\n"))
             .unwrap_or_default();
+        let database_url = database_url
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("sqlite://{}?mode=rwc", db_path.display()));
         let config = format!(
             "{server_config}\n[database]\nurl = {}\n\
              {object_storage}\n[queues]\naccounting_journal = {}\n{history}\
              [logging]\nlevel = \"info\"\njson = true\n",
-            toml::Value::String(format!("sqlite://{}?mode=rwc", db_path.display())),
+            toml::Value::String(database_url),
             toml::Value::String(root.join("accounting-overflow.jsonl").display().to_string()),
         );
         let config_path = root.join("config.toml");

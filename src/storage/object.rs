@@ -71,11 +71,15 @@ impl ObjectStorage {
 mod tests {
     use super::*;
     use crate::config::ObjectStorageConfig;
+    use std::time::Duration;
 
     #[tokio::test]
-    async fn filesystem_backend_round_trips_bytes() {
+    async fn object_store_backend_contract() {
+        let key = format!("contract/{}.bin", uuid::Uuid::now_v7());
+        let bytes = Bytes::from_static(b"\0steve object store contract\xff\n");
+
         let dir = tempfile::tempdir().expect("tempdir");
-        let cfg = ObjectStorageConfig {
+        let filesystem = ObjectStorage::from_config(&ObjectStorageConfig {
             kind: "fs".into(),
             root: dir.path().to_string_lossy().into_owned(),
             bucket: None,
@@ -83,19 +87,46 @@ mod tests {
             region: None,
             access_key_id: None,
             secret_access_key: None,
-        };
+        })
+        .await
+        .expect("create filesystem store");
+        run_object_store_contract(filesystem, &key, bytes.clone()).await;
 
-        let store = ObjectStorage::from_config(&cfg)
+        if let Ok(endpoint) = std::env::var("STEVE_TEST_S3_ENDPOINT") {
+            let s3 = ObjectStorage::from_config(&ObjectStorageConfig {
+                kind: "s3".into(),
+                root: "/".into(),
+                bucket: Some("steve".into()),
+                endpoint: Some(endpoint),
+                region: Some("us-east-1".into()),
+                access_key_id: Some("test".into()),
+                secret_access_key: Some("test".into()),
+            })
             .await
-            .expect("create store");
-        store
-            .put("sessions/test.json", Bytes::from_static(br#"{"ok":true}"#))
-            .await
-            .expect("write");
+            .expect("create S3 store");
+            run_object_store_contract(s3, &key, bytes).await;
+        }
+    }
 
-        let got = store.get("sessions/test.json").await.expect("read");
-        assert_eq!(got.as_ref(), br#"{"ok":true}"#);
+    async fn run_object_store_contract(store: ObjectStorage, key: &str, bytes: Bytes) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            store.put(key, bytes.clone()).await.expect("write object");
 
-        store.delete("sessions/test.json").await.expect("delete");
+            let got = store.get(key).await;
+            let deleted = store.delete(key).await;
+            let missing = store.get(key).await;
+
+            deleted.expect("delete object");
+            assert_eq!(got.expect("read object").as_ref(), bytes.as_ref());
+            let error = missing.expect_err("read after delete must fail");
+            assert!(
+                error
+                    .downcast_ref::<opendal::Error>()
+                    .is_some_and(|error| error.kind() == opendal::ErrorKind::NotFound),
+                "read after delete returned {error:?}, expected OpenDAL NotFound"
+            );
+        })
+        .await
+        .expect("object store contract timed out");
     }
 }

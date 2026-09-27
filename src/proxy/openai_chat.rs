@@ -3,16 +3,28 @@
 //! `POST /v1/chat/completions` becomes a logical [`Request`](crate::proxy::Request)
 //! and a pending [`RequestAttempt`](crate::proxy::RequestAttempt). Invalid bodies
 //! are HTTP 400 in the Steve error model. Non-stream requests use the configured
-//! OpenAI-compatible upstream; streaming remains HTTP 501.
+//! OpenAI-compatible upstream, including raw streaming SSE forwarding.
 
 use super::{
+    stream::{pump_upstream, CancelToken, ReplayGate, SSE_CONTENT_TYPE},
     AttemptId, AttemptStatus, OpenAiUpstream, Request, RequestAttempt, RequestId,
     SteveError as UpstreamError,
 };
-use axum::http::StatusCode;
+use axum::{
+    body::{Body, BodyDataStream},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{
+    pin::Pin,
+    sync::{Arc, Mutex},
+    task::{Context, Poll},
+};
+use tokio_stream::Stream;
 use uuid::Uuid;
 
 const UNASSIGNED: &str = "unassigned";
@@ -83,6 +95,8 @@ pub(crate) enum ChatCompletionReplyBody {
     Error(SteveErrorResponse),
     Stub(ChatCompletionStub),
     Success(Value),
+    #[serde(skip)]
+    Stream(Body),
 }
 
 pub(crate) struct ChatCompletionReply {
@@ -90,6 +104,17 @@ pub(crate) struct ChatCompletionReply {
     pub(crate) body: ChatCompletionReplyBody,
     pub(crate) request: Option<Request>,
     pub(crate) attempts: Vec<RequestAttempt>,
+}
+
+impl IntoResponse for ChatCompletionReply {
+    fn into_response(self) -> Response {
+        match self.body {
+            ChatCompletionReplyBody::Stream(body) => {
+                (self.status, [("content-type", SSE_CONTENT_TYPE)], body).into_response()
+            }
+            body => (self.status, Json(body)).into_response(),
+        }
+    }
 }
 
 pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
@@ -128,17 +153,59 @@ pub(crate) async fn handle_chat_completions_with_upstream(
         }
     };
     record_handoff(&handoff);
+    handoff.attempt.provider = "openai".into();
+    let request: Value = serde_json::from_slice(body).expect("validated JSON");
     if handoff.stream {
-        return ChatCompletionReply {
-            status: StatusCode::NOT_IMPLEMENTED,
-            body: ChatCompletionReplyBody::Stub(ChatCompletionStub::from(&handoff)),
-            request: Some(handoff.request),
-            attempts: vec![handoff.attempt],
+        let attempt = Arc::new(Mutex::new(handoff.attempt));
+        let cancel = CancelToken::new();
+        let gate = ReplayGate::new();
+        let mut pending = PendingAttempt {
+            attempt: attempt.clone(),
+            cancel: cancel.clone(),
+            armed: true,
+        };
+        return match upstream
+            .chat_completion_stream(&request, cancel.clone())
+            .await
+        {
+            Ok(stream) => {
+                let body = pump_upstream(&gate, cancel, stream).expect("fresh replay gate");
+                pending.armed = false;
+                ChatCompletionReply {
+                    status: StatusCode::OK,
+                    body: ChatCompletionReplyBody::Stream(Body::from_stream(AttemptBody {
+                        inner: body.into_data_stream(),
+                        attempt: attempt.clone(),
+                    })),
+                    request: Some(handoff.request),
+                    attempts: vec![attempt.lock().expect("attempt lock").clone()],
+                }
+            }
+            Err(error) => {
+                pending.armed = false;
+                finish_attempt(&attempt, AttemptStatus::UpstreamError);
+                let status = if matches!(error, UpstreamError::Timeout { .. }) {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                ChatCompletionReply {
+                    status,
+                    body: ChatCompletionReplyBody::Error(SteveErrorResponse {
+                        error: SteveError {
+                            message: error.to_string(),
+                            kind: "api_error",
+                            code: "upstream_error",
+                            param: None,
+                        },
+                    }),
+                    request: Some(handoff.request),
+                    attempts: vec![attempt.lock().expect("attempt lock").clone()],
+                }
+            }
         };
     }
 
-    handoff.attempt.provider = "openai".into();
-    let request: Value = serde_json::from_slice(body).expect("validated JSON");
     let mut attempts = Vec::new();
     let result = loop {
         let result = upstream.chat_completion(&request).await;
@@ -193,6 +260,65 @@ pub(crate) async fn handle_chat_completions_with_upstream(
         body: response,
         request: Some(handoff.request),
         attempts,
+    }
+}
+
+fn finish_attempt(attempt: &Arc<Mutex<RequestAttempt>>, status: AttemptStatus) {
+    let mut attempt = attempt.lock().expect("attempt lock");
+    if attempt.finished_at.is_some() {
+        return;
+    }
+    attempt.status = status;
+    attempt.finished_at = Some(Utc::now());
+    tracing::info!(
+        request_id = %attempt.request_id.0,
+        attempt_id = %attempt.id.0,
+        status = ?attempt.status,
+        finished_at = ?attempt.finished_at,
+        "chat completions upstream attempt finished"
+    );
+}
+
+struct PendingAttempt {
+    attempt: Arc<Mutex<RequestAttempt>>,
+    cancel: CancelToken,
+    armed: bool,
+}
+
+impl Drop for PendingAttempt {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel.cancel();
+            finish_attempt(&self.attempt, AttemptStatus::Cancelled);
+        }
+    }
+}
+
+struct AttemptBody {
+    inner: BodyDataStream,
+    attempt: Arc<Mutex<RequestAttempt>>,
+}
+
+impl Stream for AttemptBody {
+    type Item = Result<bytes::Bytes, axum::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_next(cx);
+        match &result {
+            Poll::Ready(None) => finish_attempt(&this.attempt, AttemptStatus::Success),
+            Poll::Ready(Some(Err(_))) => {
+                finish_attempt(&this.attempt, AttemptStatus::UpstreamError)
+            }
+            _ => {}
+        }
+        result
+    }
+}
+
+impl Drop for AttemptBody {
+    fn drop(&mut self) {
+        finish_attempt(&self.attempt, AttemptStatus::Cancelled);
     }
 }
 
@@ -440,6 +566,25 @@ mod tests {
         ] {
             assert!(!is_retryable(&error));
         }
+    }
+
+    #[test]
+    fn dropping_stream_body_cancels_and_finishes_shared_attempt() {
+        let handoff = parse_chat_completions(
+            br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .expect("valid streaming request");
+        let attempt = Arc::new(Mutex::new(handoff.attempt));
+        let body = AttemptBody {
+            inner: Body::empty().into_data_stream(),
+            attempt: Arc::clone(&attempt),
+        };
+
+        drop(body);
+
+        let attempt = attempt.lock().expect("attempt lock");
+        assert_eq!(attempt.status, AttemptStatus::Cancelled);
+        assert!(attempt.finished_at.is_some());
     }
 
     fn error_body(reply: ChatCompletionReply) -> SteveErrorResponse {

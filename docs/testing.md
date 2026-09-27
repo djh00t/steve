@@ -32,6 +32,27 @@ Each fixture owns ephemeral listeners and temporary data. Readiness uses a bound
 
 Use SQLite/filesystem for the fast default scenario. Repeat representative persistence scenarios against PostgreSQL and an S3-compatible fixture to verify supported backends, without multiplying every scenario across every storage combination. Official SDK smoke tests separately qualify SDK compatibility; raw HTTP tests alone must not be labelled SDK proof. Live-provider qualification is opt-in and reported separately from deterministic CI evidence.
 
+Run the real-process database serve parity contract with SQLite using `cargo test --test e2e --all-features database_backend_contract`. To include PostgreSQL, set `STEVE_TEST_POSTGRES_URL` to a reachable test database URL for the same command; the test runs SQLite first, then PostgreSQL, and fails if the configured PostgreSQL database cannot be used. CI sets this variable to its provisioned PostgreSQL service URL. `cargo run -- doctor` checks database connectivity only and does not prove serve or persistence parity.
+
+Run the object-store parity contract with `cargo test --bin steve --all-features object_store_backend_contract -- --nocapture`. It writes the same generated key and binary payload to a temporary filesystem store and, when `STEVE_TEST_S3_ENDPOINT` is set, to the `steve` S3 bucket using the local fixture credentials. Each backend must return identical bytes, delete the object, and report OpenDAL `NotFound` on a subsequent read. A configured but unreachable S3 endpoint fails the test.
+
+For a local Moto fixture, install `moto[server]==5.2.3` and `pyOpenSSL==26.4.0`, then start `S3_IGNORE_SUBDOMAIN_BUCKETNAME=true python -m moto.server -H 127.0.0.1 -p 5000`. Create the test bucket with:
+
+```sh
+python - <<'PY'
+import boto3
+s3 = boto3.client(
+    "s3",
+    endpoint_url="http://127.0.0.1:5000",
+    aws_access_key_id="test",
+    aws_secret_access_key="test",
+    region_name="us-east-1",
+)
+s3.create_bucket(Bucket="steve")
+PY
+STEVE_TEST_S3_ENDPOINT=http://127.0.0.1:5000 cargo test --bin steve --all-features object_store_backend_contract -- --nocapture
+```
+
 ## Shared scenario families
 
 | Scenario | What it proves | Representative fault to detect |
@@ -81,7 +102,9 @@ No unresolved non-equivalent survivor may undermine the package's stated accepta
 
 ## Commands and gates
 
-Currently available: `make check` checks formatting, clippy and compilation; `make test` runs the current Cargo tests. The pre-commit and pre-push hooks both run `make check`; contributors also run the affected acceptance scenario. Current CI still runs the legacy broad gate on push and PR. The backlog includes the workflow change needed to align CI with the following target:
+Currently available: `make check` checks formatting, clippy and compilation; `make test` runs the current Cargo tests. The pre-commit and pre-push hooks both run `make check`; contributors also run the affected acceptance scenario. CI runs its existing broad gates for all pull requests and pushes to `main`; feature-branch pushes without an open PR do not run hosted CI. Its PR-only `mutation` job runs the qualified streaming mutations and buffering fault when a relevant source, test, fixture, Cargo manifest/lockfile, qualification tool, patch or workflow path changes; see [mutation qualification](mutation-qualification.md) for commands and evidence requirements. The broader target remains:
+
+To qualify the official Anthropic and OpenAI Python SDKs against the local deterministic fixture, install the pinned SDKs in a virtual environment, build Steve, then run `python scripts/sdk_smoke.py` with that environment's Python. The default `--provider anthropic` preserves the published command; use `--provider openai` for OpenAI or `--provider all` for both. For example: `python3 -m venv target/sdk-venv && target/sdk-venv/bin/python -m pip install -r tests/requirements-sdk.txt && cargo build && target/sdk-venv/bin/python scripts/sdk_smoke.py --provider all`. The harness uses temporary SQLite/filesystem state and a dummy local API key; it does not contact a live provider. Anthropic 1.2.0 and OpenAI 3.6.0 were approved by Dependency Advisor under the conservative Python policy (720-hour minimum release age). It exercises the official SDK streaming helpers and their accumulated final results for Chat Completions, Responses, and Messages. The fixtures follow the [official Messages event sequence](https://platform.claude.com/docs/en/build-with-claude/streaming) and [Responses streaming events](https://developers.openai.com/api/docs/guides/streaming-responses). The `official-sdk` check runs the same combined command on main pushes and pull requests, prints both installed SDK versions, and bounds the smoke step to two minutes. Its result is separate from the Rust/raw HTTP checks.
 
 - During development: run the smallest meaningful failing/passing scenario and changed-scope `make check`.
 - Before committing/pushing: `make check` plus the affected acceptance scenario. Do not run local `make quality-gates` or `make check-full`; broad quality/release gates belong to post-merge `main` CI.
