@@ -18,7 +18,63 @@ Smallest shared seam: add one crate-private provider URL validation helper in `s
 
 ## Dependencies and fixture encoding
 
-Dependency Advisor evidence in `reqwest-dependency-advisor.json` records exact recommended `0.12.28` (Rust `standard`, 336-hour age, fetched `2026-09-27T08:58:16.836796Z`). `tokio-rustls-dependency-advisor.json` records exact recommended `0.26.5` on the same policy (fetched `2026-09-27T09:07:43.749097Z`). Use only as a dev dependency: `tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring", "tls12"] }`. No rcgen, pemfile, or new test framework.
+The following Dependency Advisor reports were observed on 2026-09-27. They are dated evidence, not permanent approval; refresh them before implementation if they have expired.
+
+<details>
+<summary>reqwest Dependency Advisor report</summary>
+
+```json
+{
+  "advisory_sources": [],
+  "candidates_considered": 126,
+  "ecosystem": "rust",
+  "minimum_release_age_hours": 336,
+  "package": "reqwest",
+  "policy": "standard",
+  "provenance": {
+    "cache_status": "hit",
+    "expires_at": "2026-09-28T08:58:16.836796Z",
+    "fetched_at": "2026-09-27T08:58:16.836796Z",
+    "metadata_url": "https://crates.io/api/v1/crates/reqwest",
+    "source": "crates.io"
+  },
+  "reason": "Selected newest candidate that satisfies policy checks.",
+  "recommended_version": "0.12.28",
+  "source": "crates.io",
+  "status": "recommended"
+}
+```
+
+</details>
+
+<details>
+<summary>tokio-rustls Dependency Advisor report</summary>
+
+```json
+{
+  "advisory_sources": [],
+  "candidates_considered": 79,
+  "ecosystem": "rust",
+  "minimum_release_age_hours": 336,
+  "package": "tokio-rustls",
+  "policy": "standard",
+  "provenance": {
+    "cache_status": "miss",
+    "expires_at": "2026-09-28T09:07:43.749097Z",
+    "fetched_at": "2026-09-27T09:07:43.749097Z",
+    "metadata_url": "https://crates.io/api/v1/crates/tokio-rustls",
+    "source": "crates.io"
+  },
+  "reason": "Selected newest candidate that satisfies policy checks.",
+  "recommended_version": "0.26.5",
+  "source": "crates.io",
+  "status": "recommended"
+}
+```
+
+</details>
+
+Use the recommended exact versions in the handoffs: reqwest `=0.12.28` and dev-only `tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring", "tls12"] }`. No rcgen, pemfile, or new test framework.
 
 The formats serve different APIs: `upstream_ca_bundle` is PEM because the reqwest contract reads PEM certificate bundles. The local TLS server uses checked-in DER leaf-certificate and private-key files with tokio-rustls. Keep a PEM CA bundle for reqwest trust; if the TLS fixture needs the CA in Rustls form, provide the CA certificate as DER too. Never call DER server certificates “PEM CAs” or store private keys in the CA bundle. The fixture leaf must contain an IP SAN for `127.0.0.1`; its key is test-only.
 
