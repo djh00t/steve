@@ -1,7 +1,7 @@
 use crate::{
     config::{Config, ModelConfig},
     deferred::DeferredQueues,
-    lifecycle::{Lifecycle, Phase},
+    lifecycle::{InflightGuard, Lifecycle, Phase},
     models::{self, ModelList},
     net::{bind_listener, is_dual_stack_address},
     proxy::{anthropic_messages, openai_chat, openai_responses, AnthropicUpstream, OpenAiUpstream},
@@ -9,6 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use axum::{
+    body::{Body, HttpBody},
     extract::{FromRef, Request, State},
     http::StatusCode,
     middleware::{self, Next},
@@ -17,17 +18,24 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use http_body::{Frame, SizeHint};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    task::{Context as TaskContext, Poll},
     time::Duration,
 };
-use tokio::{signal, sync::watch};
+use tokio::{
+    signal,
+    sync::{watch, Semaphore},
+};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -52,6 +60,7 @@ struct AppState {
     models: Arc<[ModelConfig]>,
     openai_upstream: Option<OpenAiUpstream>,
     anthropic_upstream: Option<AnthropicUpstream>,
+    provider_probe: ProviderProbeState,
 }
 
 #[derive(Clone)]
@@ -60,6 +69,36 @@ struct Catalogue(Arc<[ModelConfig]>);
 impl FromRef<Arc<AppState>> for Catalogue {
     fn from_ref(state: &Arc<AppState>) -> Self {
         Self(Arc::clone(&state.models))
+    }
+}
+
+#[derive(Clone)]
+struct ProviderProbeState {
+    client: reqwest::Client,
+    probe_gate: Arc<Semaphore>,
+    openai_url: Option<String>,
+    anthropic_url: Option<String>,
+}
+
+impl ProviderProbeState {
+    fn new(
+        openai_url: Option<String>,
+        anthropic_url: Option<String>,
+    ) -> std::result::Result<Self, reqwest::Error> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            probe_gate: Arc::new(Semaphore::new(1)),
+            openai_url,
+            anthropic_url,
+        })
+    }
+}
+
+impl FromRef<Arc<AppState>> for ProviderProbeState {
+    fn from_ref(state: &Arc<AppState>) -> Self {
+        state.provider_probe.clone()
     }
 }
 
@@ -140,6 +179,11 @@ pub async fn run(
         .as_ref()
         .map(|url| AnthropicUpstream::new(url, Duration::from_secs(30)))
         .transpose()?;
+    let provider_probe = ProviderProbeState::new(
+        cfg.server.openai_upstream_url.clone(),
+        cfg.server.anthropic_upstream_url.clone(),
+    )
+    .context("building provider health client")?;
     let state = Arc::new(AppState {
         lifecycle: lifecycle.clone(),
         deferred,
@@ -154,6 +198,7 @@ pub async fn run(
         models: catalogue,
         openai_upstream,
         anthropic_upstream,
+        provider_probe,
     });
 
     let inference_app = inference_router(state.clone());
@@ -177,35 +222,65 @@ pub async fn run(
     let timeout = Duration::from_secs(cfg.server.drain_timeout_seconds);
     let signal_tx = shutdown_tx.clone();
 
-    let signal_task = tokio::spawn(async move {
-        let reason = shutdown_signal().await;
-        shutdown_lifecycle.drain(reason);
-
-        let result = tokio::time::timeout(timeout, shutdown_lifecycle.wait_for_zero()).await;
-        if result.is_err() {
-            tracing::warn!(
-                event = "drain_timeout",
-                timeout_seconds = timeout.as_secs(),
-                inflight = shutdown_lifecycle.inflight(),
-                "drain deadline reached"
-            );
-        }
-
-        let _ = signal_tx.send(true);
-    });
-
     let inference = axum::serve(inference_listener, inference_app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
     let management = axum::serve(management_listener, management_app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx));
 
-    let result = tokio::try_join!(inference, management);
+    let result = serve_until_drained(
+        async { tokio::try_join!(inference, management).map(|_| ()) },
+        shutdown_signal(),
+        shutdown_lifecycle,
+        timeout,
+        signal_tx,
+    )
+    .await;
     let _ = shutdown_tx.send(true);
-    signal_task.abort();
 
     lifecycle.stopped("listeners_exited");
     result?;
     Ok(())
+}
+
+async fn serve_until_drained<S, F>(
+    serving: S,
+    signal: F,
+    lifecycle: Lifecycle,
+    timeout: Duration,
+    shutdown_tx: watch::Sender<bool>,
+) -> std::io::Result<()>
+where
+    S: Future<Output = std::io::Result<()>>,
+    F: Future<Output = &'static str>,
+{
+    let drain = async {
+        lifecycle.drain(signal.await);
+        let timed_out = tokio::time::timeout(timeout, lifecycle.wait_for_zero())
+            .await
+            .is_err();
+        if timed_out {
+            tracing::warn!(
+                event = "drain_timeout",
+                timeout_seconds = timeout.as_secs(),
+                inflight = lifecycle.inflight(),
+                "drain deadline reached"
+            );
+        }
+        let _ = shutdown_tx.send(true);
+        timed_out
+    };
+
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => result,
+        timed_out = drain => {
+            if timed_out {
+                Ok(())
+            } else {
+                serving.await
+            }
+        }
+    }
 }
 
 fn inference_router(state: Arc<AppState>) -> Router {
@@ -232,12 +307,70 @@ fn management_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/system/version", get(version))
         .route("/api/v1/system/status", get(status))
         .route("/api/v1/system/drain", post(drain))
+        .route("/api/v1/providers/health", get(provider_health))
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
             RequestClass::Management(state.counters.clone()),
             track_requests,
         ))
         .with_state(state)
+}
+
+async fn probe_provider(
+    client: reqwest::Client,
+    url: Option<String>,
+    path: &'static str,
+) -> &'static str {
+    let Some(url) = url else {
+        return "unconfigured";
+    };
+
+    let base = url.trim().trim_end_matches('/');
+    let url = if base.ends_with("/v1") {
+        format!("{base}{path}")
+    } else {
+        format!("{base}/v1{path}")
+    };
+    match tokio::time::timeout(Duration::from_millis(500), client.get(url).send()).await {
+        Ok(Ok(response))
+            if response.status().as_u16() < 500 && response.status().as_u16() != 404 =>
+        {
+            "healthy"
+        }
+        _ => "unhealthy",
+    }
+}
+
+async fn provider_health(State(probe): State<ProviderProbeState>) -> Response {
+    let Ok(_permit) = probe.probe_gate.clone().try_acquire_owned() else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"status": "busy"})),
+        )
+            .into_response();
+    };
+    let (openai, anthropic) = tokio::join!(
+        probe_provider(probe.client.clone(), probe.openai_url, "/chat/completions"),
+        probe_provider(probe.client, probe.anthropic_url, "/messages"),
+    );
+    let healthy = openai != "unhealthy" && anthropic != "unhealthy";
+    let status = if healthy {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(json!({
+            "status": if healthy { "healthy" } else { "unhealthy" },
+            "providers": {
+                "openai": {"status": openai},
+                "anthropic": {"status": anthropic},
+            }
+        })),
+    )
+        .into_response()
 }
 
 async fn list_models(State(Catalogue(catalogue)): State<Catalogue>) -> Json<ModelList> {
@@ -301,7 +434,7 @@ async fn drain(State(state): State<Arc<AppState>>) -> Json<Value> {
 }
 
 async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
-    let Some(_guard) = state.lifecycle.enter() else {
+    let Some(guard) = state.lifecycle.enter() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "draining"})),
@@ -314,22 +447,20 @@ async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Res
     } else {
         anthropic_messages::handle_messages(&body)
     };
-    if let Some(attempt) = &reply.attempt {
-        if attempt.finished_at.is_some() {
-            tracing::info!(
-                request_id = %attempt.request_id.0,
-                attempt_id = %attempt.id.0,
-                status = ?attempt.status,
-                finished_at = ?attempt.finished_at,
-                "messages upstream attempt finished"
-            );
-        }
+    let streaming = matches!(
+        &reply.body,
+        anthropic_messages::MessagesReplyBody::Stream(_)
+    );
+    let response = reply.into_response();
+    if streaming {
+        hold_inflight_until_body_end(response, guard)
+    } else {
+        response
     }
-    (reply.status, Json(reply.body)).into_response()
 }
 
 async fn responses(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
-    let Some(_guard) = state.lifecycle.enter() else {
+    let Some(guard) = state.lifecycle.enter() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "draining"})),
@@ -337,8 +468,63 @@ async fn responses(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Re
             .into_response();
     };
 
-    let reply = openai_responses::handle_responses(&body);
-    (reply.status, Json(reply.body)).into_response()
+    let reply = if let Some(upstream) = &state.openai_upstream {
+        openai_responses::handle_responses_with_upstream(&body, upstream).await
+    } else {
+        openai_responses::handle_responses(&body)
+    };
+    let streaming = matches!(&reply.body, openai_responses::ResponsesReplyBody::Stream(_));
+    let response = reply.into_response();
+    if streaming {
+        hold_inflight_until_body_end(response, guard)
+    } else {
+        response
+    }
+}
+
+fn hold_inflight_until_body_end(response: Response, guard: InflightGuard) -> Response {
+    hold_guard_until_body_end(response, guard)
+}
+
+fn hold_guard_until_body_end<G: Send + Unpin + 'static>(response: Response, guard: G) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(GuardedBody {
+            inner: body,
+            guard: Some(guard),
+        }),
+    )
+}
+
+struct GuardedBody<G> {
+    inner: Body,
+    guard: Option<G>,
+}
+
+impl<G: Unpin> HttpBody for GuardedBody<G> {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_frame(cx);
+        if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
+            this.guard.take();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
@@ -355,11 +541,16 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
     } else {
         openai_chat::handle_chat_completions(&body)
     };
-    if let Some(attempt) = &reply.attempt {
+    let attempt_count = reply
+        .request
+        .as_ref()
+        .map_or(0, |request| request.attempts.len());
+    for attempt in &reply.attempts {
         if attempt.finished_at.is_some() {
             tracing::info!(
                 request_id = %attempt.request_id.0,
                 attempt_id = %attempt.id.0,
+                attempt_count,
                 status = ?attempt.status,
                 finished_at = ?attempt.finished_at,
                 "chat completions upstream attempt finished"
@@ -396,17 +587,40 @@ async fn track_requests(
     request: Request,
     next: Next,
 ) -> Response {
-    let (counter, class_name) = match &class {
-        RequestClass::Inference(counters) => (&counters.inference, "inference"),
-        RequestClass::Management(counters) => (&counters.management, "management"),
-    };
-
-    counter.fetch_add(1, Ordering::Relaxed);
+    let guard = RequestCounterGuard::new(class);
     let response = next.run(request).await;
-    counter.fetch_sub(1, Ordering::Relaxed);
+    hold_guard_until_body_end(response, guard)
+}
 
-    tracing::trace!(request_class = class_name, "request completed");
-    response
+struct RequestCounterGuard(RequestClass);
+
+impl RequestCounterGuard {
+    fn new(class: RequestClass) -> Self {
+        class.counter().fetch_add(1, Ordering::Relaxed);
+        Self(class)
+    }
+}
+
+impl RequestClass {
+    fn counter(&self) -> &AtomicU64 {
+        match self {
+            Self::Inference(counters) => &counters.inference,
+            Self::Management(counters) => &counters.management,
+        }
+    }
+}
+
+impl Drop for RequestCounterGuard {
+    fn drop(&mut self) {
+        self.0.counter().fetch_sub(1, Ordering::Relaxed);
+        tracing::trace!(
+            request_class = match self.0 {
+                RequestClass::Inference(_) => "inference",
+                RequestClass::Management(_) => "management",
+            },
+            "request completed"
+        );
+    }
 }
 
 async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
@@ -448,9 +662,335 @@ pub(crate) async fn shutdown_signal() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{body::Body, http::Request};
+    use crate::test_upstream;
+    use axum::{body::HttpBody, http::Request};
     use http_body_util::BodyExt;
+    use std::future::IntoFuture;
+    use tokio_stream::{Stream, StreamExt};
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn drain_deadline_cancels_stuck_serving_future() {
+        let lifecycle = Lifecycle::new();
+        lifecycle.ready("test");
+        let _guard = lifecycle.enter().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (serve_tx, serve_rx) = tokio::sync::oneshot::channel::<()>();
+        let serving = async move {
+            let _ = serve_rx.await;
+            Ok(())
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            serve_until_drained(
+                serving,
+                async { "test" },
+                lifecycle.clone(),
+                Duration::from_millis(10),
+                shutdown_tx,
+            ),
+        )
+        .await
+        .expect("drain deadline must end the serving wait")
+        .unwrap();
+
+        assert_eq!(lifecycle.phase(), Phase::Draining);
+        assert!(*shutdown_rx.borrow());
+        assert!(serve_tx.is_closed());
+    }
+
+    fn tracked_stream_router(
+        counters: Arc<RequestCounters>,
+        rx: tokio::sync::mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>,
+    ) -> Router {
+        let rx = Arc::new(std::sync::Mutex::new(Some(rx)));
+        Router::new()
+            .route(
+                "/",
+                get(move || {
+                    let rx = rx.clone();
+                    async move {
+                        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(
+                            rx.lock().unwrap().take().unwrap(),
+                        ))
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                RequestClass::Inference(counters),
+                track_requests,
+            ))
+    }
+
+    #[tokio::test]
+    async fn request_counter_stays_active_until_stream_eof() {
+        let counters = Arc::new(RequestCounters::default());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let response = tracked_stream_router(counters.clone(), rx)
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+
+        tx.send(Ok(bytes::Bytes::from_static(b"data: done\n\n")))
+            .await
+            .unwrap();
+        drop(tx);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            bytes::Bytes::from_static(b"data: done\n\n")
+        );
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn request_counter_decrements_when_stream_body_is_dropped() {
+        let counters = Arc::new(RequestCounters::default());
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let response = tracked_stream_router(counters.clone(), rx)
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+        drop(response);
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn tracked_response_preserves_size_hint_and_trailers() {
+        let counters = Arc::new(RequestCounters::default());
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    Body::new(Body::from("ok").with_trailers(async {
+                        let mut trailers = axum::http::HeaderMap::new();
+                        trailers.insert("x-final-status", "complete".parse().unwrap());
+                        Some(Ok(trailers))
+                    }))
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                RequestClass::Inference(counters.clone()),
+                track_requests,
+            ));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+
+        assert_eq!(body.size_hint().exact(), Some(2));
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            bytes::Bytes::from_static(b"ok")
+        );
+        assert_eq!(
+            body.frame()
+                .await
+                .unwrap()
+                .unwrap()
+                .into_trailers()
+                .unwrap()["x-final-status"],
+            "complete"
+        );
+        assert!(body.frame().await.is_none());
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn request_counter_decrements_when_handler_is_cancelled() {
+        let counters = Arc::new(RequestCounters::default());
+        let app = Router::new()
+            .route("/", get(|| async { std::future::pending::<()>().await }))
+            .layer(middleware::from_fn_with_state(
+                RequestClass::Inference(counters.clone()),
+                track_requests,
+            ));
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+    }
+
+    struct PendingSse {
+        first: Option<bytes::Bytes>,
+        dropped: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Stream for PendingSse {
+        type Item = Result<bytes::Bytes, std::io::Error>;
+
+        fn poll_next(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+            let this = self.get_mut();
+            match this.first.take() {
+                Some(first) => Poll::Ready(Some(Ok(first))),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl Drop for PendingSse {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    async fn messages_test_state(upstream_url: String) -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.database.url = "sqlite::memory:".into();
+        cfg.object_storage.root = dir.path().join("objects").to_string_lossy().into_owned();
+        cfg.queues.accounting_journal = dir
+            .path()
+            .join("accounting.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let db = Database::connect(&cfg.database).await.unwrap();
+        db.migrate().await.unwrap();
+        let objects = ObjectStorage::from_config(&cfg.object_storage)
+            .await
+            .unwrap();
+        let deferred = DeferredQueues::start(&cfg, db.background(), objects.clone())
+            .await
+            .unwrap();
+        let lifecycle = Lifecycle::new();
+        lifecycle.ready("test");
+        let counters = Arc::new(RequestCounters::default());
+        let state = Arc::new(AppState {
+            lifecycle,
+            deferred,
+            _db: db,
+            _objects: objects,
+            counters,
+            instance_id: "test".into(),
+            generation: "test".into(),
+            started_at: "test".into(),
+            inference_bind: "127.0.0.1:0".into(),
+            management_bind: "127.0.0.1:0".into(),
+            models: models::resolve_catalogue(&[]).into(),
+            openai_upstream: None,
+            anthropic_upstream: Some(
+                AnthropicUpstream::new(upstream_url, Duration::from_secs(2)).unwrap(),
+            ),
+        });
+        (state, dir)
+    }
+
+    #[tokio::test]
+    async fn messages_route_disconnect_cancels_upstream_and_releases_guards() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let dropped_tx = Arc::new(std::sync::Mutex::new(Some(dropped_tx)));
+        let listener = bind_listener("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/messages",
+                    post(move || {
+                        let dropped = dropped_tx.lock().unwrap().take().unwrap();
+                        async move {
+                            (
+                                [("content-type", "text/event-stream")],
+                                Body::from_stream(PendingSse {
+                                    first: Some(bytes::Bytes::from_static(
+                                        b"event: message_start\ndata: {}\n\n",
+                                    )),
+                                    dropped: Some(dropped),
+                                }),
+                            )
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let (state, _dir) = messages_test_state(format!("http://{addr}")).await;
+        let counters = state.counters.clone();
+        let lifecycle = state.lifecycle.clone();
+        let response = inference_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"m","max_tokens":1,"messages":[{"role":"user"}],"stream":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 1);
+        assert_eq!(lifecycle.inflight(), 1);
+        let mut body = response.into_body();
+        assert_eq!(
+            body.frame().await.unwrap().unwrap().into_data().unwrap(),
+            bytes::Bytes::from_static(b"event: message_start\ndata: {}\n\n")
+        );
+
+        drop(body);
+
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("client disconnect did not abort upstream")
+            .unwrap();
+        assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
+        assert_eq!(lifecycle.inflight(), 0);
+        upstream_server.abort();
+        let _ = upstream_server.await;
+    }
+
+    #[tokio::test]
+    async fn streaming_response_keeps_drain_waiting_until_body_ends() {
+        let lifecycle = Lifecycle::new();
+        lifecycle.ready("test");
+        let guard = lifecycle.enter().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
+        let response = (
+            StatusCode::OK,
+            [("content-type", "text/event-stream")],
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+        )
+            .into_response();
+        let response = hold_inflight_until_body_end(response, guard);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(lifecycle.inflight(), 1);
+
+        lifecycle.drain("test");
+        let waiter = tokio::spawn({
+            let lifecycle = lifecycle.clone();
+            async move { lifecycle.wait_for_zero().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tx.send(Ok(bytes::Bytes::from_static(b"data: done\n\n")))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"data: done\n\n")
+        );
+        assert!(body.next().await.is_none());
+        waiter.await.unwrap();
+        assert_eq!(lifecycle.inflight(), 0);
+    }
 
     fn models_router(catalogue: Arc<[ModelConfig]>) -> Router {
         Router::new()
@@ -519,5 +1059,233 @@ mod tests {
         assert_eq!(data[0]["id"], "steve-test-model");
         assert_eq!(data[0]["object"], "model");
         assert_eq!(data[0]["owned_by"], "steve");
+    }
+
+    fn provider_router(state: ProviderProbeState) -> Router {
+        Router::new()
+            .route("/api/v1/providers/health", get(provider_health))
+            .route("/health/live", get(|| async { "live" }))
+            .with_state(state)
+    }
+
+    async fn get_provider_health(state: ProviderProbeState) -> (StatusCode, Value) {
+        let response = provider_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/providers/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).expect("json"))
+    }
+
+    async fn hanging_probe() -> &'static str {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        "late"
+    }
+
+    #[tokio::test]
+    async fn provider_health_reports_reachable_closed_and_unconfigured() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/chat/completions",
+                    get(|| async { (StatusCode::METHOD_NOT_ALLOWED, "") }),
+                ),
+            )
+            .into_future(),
+        );
+        let closed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_listener.local_addr().unwrap();
+        let closed_task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = closed_listener.accept().await else {
+                    break;
+                };
+                drop(socket);
+            }
+        });
+        let (status, body) = get_provider_health(
+            ProviderProbeState::new(
+                Some(format!("http://{addr}")),
+                Some(format!("http://{closed_addr}")),
+            )
+            .unwrap(),
+        )
+        .await;
+        server.abort();
+        closed_task.abort();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["providers"]["openai"]["status"], "healthy");
+        assert_eq!(body["providers"]["anthropic"]["status"], "unhealthy");
+        assert!(!body["providers"]["openai"]
+            .as_object()
+            .unwrap()
+            .contains_key("url"));
+    }
+
+    #[tokio::test]
+    async fn provider_health_reports_fixture_and_unconfigured_as_healthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(axum::serve(listener, test_upstream::router()).into_future());
+        let (status, body) = get_provider_health(
+            ProviderProbeState::new(Some(format!("  http://{addr}///  ")), None).unwrap(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["providers"]["openai"]["status"], "healthy");
+        assert_eq!(body["providers"]["anthropic"]["status"], "unconfigured");
+
+        let (status, body) = get_provider_health(
+            ProviderProbeState::new(Some(format!(" http://{addr}/v1/ ")), None).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "healthy");
+        assert_eq!(body["providers"]["openai"]["status"], "healthy");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_health_rejects_missing_and_server_error_provider_routes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/v1/chat/completions",
+                        get(|| async { StatusCode::NOT_FOUND }),
+                    )
+                    .route(
+                        "/v1/messages",
+                        get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+                    ),
+            )
+            .into_future(),
+        );
+        let (status, body) = get_provider_health(
+            ProviderProbeState::new(
+                Some(format!("http://{addr}")),
+                Some(format!("http://{addr}")),
+            )
+            .unwrap(),
+        )
+        .await;
+        server.abort();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "unhealthy");
+        assert_eq!(body["providers"]["openai"]["status"], "unhealthy");
+        assert_eq!(body["providers"]["anthropic"]["status"], "unhealthy");
+    }
+
+    #[tokio::test]
+    async fn provider_health_times_out_without_blocking_other_management_routes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = provider_router(
+            ProviderProbeState::new(
+                Some(format!("http://{addr}")),
+                Some(format!("http://{addr}")),
+            )
+            .unwrap(),
+        );
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                router
+                    .clone()
+                    .route("/v1/chat/completions", get(hanging_probe))
+                    .route("/v1/messages", get(hanging_probe)),
+            )
+            .into_future(),
+        );
+        let client = reqwest::Client::new();
+        let probe = tokio::spawn(
+            client
+                .get(format!("http://{addr}/api/v1/providers/health"))
+                .send(),
+        );
+        let live = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.get(format!("http://{addr}/health/live")).send(),
+        )
+        .await
+        .expect("management route must remain responsive")
+        .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+        let response = tokio::time::timeout(Duration::from_secs(1), probe)
+            .await
+            .expect("probe must finish within one second")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_health_returns_busy_while_another_probe_is_running() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", get(hanging_probe))
+                    .route("/v1/messages", get(hanging_probe)),
+            )
+            .into_future(),
+        );
+        let state = ProviderProbeState::new(
+            Some(format!("http://{addr}")),
+            Some(format!("http://{addr}")),
+        )
+        .unwrap();
+        let gate = state.probe_gate.clone();
+        let router = provider_router(state);
+        let first = tokio::spawn(
+            router.clone().oneshot(
+                Request::builder()
+                    .uri("/api/v1/providers/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        );
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while gate.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first probe must acquire the gate");
+        let second = tokio::time::timeout(
+            Duration::from_millis(100),
+            router.oneshot(
+                Request::builder()
+                    .uri("/api/v1/providers/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("busy response must not queue")
+        .unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        first.abort();
+        server.abort();
     }
 }
