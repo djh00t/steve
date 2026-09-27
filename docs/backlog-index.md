@@ -459,6 +459,8 @@ Start with the real-process harness and independent contract decisions. Complete
 
 ### M8
 
+Legacy V1 issues #422–#424 are listed here as M8 requirements inputs; their IDs and parent #71 remain unchanged.
+
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
 | [STV-M8-01](https://github.com/djh00t/steve/issues/335) | Freeze macOS UI and UI automation platform | READY | None |
@@ -474,9 +476,12 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M8-10](https://github.com/djh00t/steve/issues/346) | Detect supported local container runtimes | BLOCKED | #337, #340 |
 | [STV-M8-11](https://github.com/djh00t/steve/issues/348) | Present onboarding choices | BLOCKED | #342, #343, #344, #345, #346, #340 |
 | [STV-M8-12](https://github.com/djh00t/steve/issues/347) | Connect to a remote Steve deployment | BLOCKED | #339, #343, #106, #109, #340 |
-| [STV-M8-13](https://github.com/djh00t/steve/issues/341) | Decompose native installation | BLOCKED | #336, #337, #293 |
+| [STV-V1-12](https://github.com/djh00t/steve/issues/422) | Discover native supervisor/coordinator requirements | READY | #1, #89 |
+| [STV-V1-13](https://github.com/djh00t/steve/issues/423) | Discover signed release and versioned installation requirements | BLOCKED | #336 |
+| [STV-V1-14](https://github.com/djh00t/steve/issues/424) | Discover upgrade cutover and rollback requirements | BLOCKED | #1, #89, #422, #423 |
+| [STV-M8-13](https://github.com/djh00t/steve/issues/341) | Decompose native installation | BLOCKED | #336, #337, #293, #423 |
 | [STV-M8-14](https://github.com/djh00t/steve/issues/349) | Start native Steve from the controller | BLOCKED | #337, #89, #340 |
-| [STV-M8-15](https://github.com/djh00t/steve/issues/350) | Decompose native update | BLOCKED | #336, #337, #89, #293 |
+| [STV-M8-15](https://github.com/djh00t/steve/issues/350) | Decompose native update | BLOCKED | #336, #337, #89, #293, #422, #423, #424, #341 |
 | [STV-M8-16](https://github.com/djh00t/steve/issues/351) | Decompose local container setup | BLOCKED | #337, #1, #89, #293 |
 | [STV-M8-17](https://github.com/djh00t/steve/issues/352) | Connect optional loopback forwarding | BLOCKED | #338, #339, #106, #109, #340 |
 | [STV-M8-18](https://github.com/djh00t/steve/issues/353) | Show provider health and usage | BLOCKED | #335, #347, #125, #131, #295, #242, #340 |
@@ -506,9 +511,6 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-V1-09](https://github.com/djh00t/steve/issues/419) | Discover budget and spend-limit requirements | DEFERRED | #247, #291 |
 | [STV-V1-10](https://github.com/djh00t/steve/issues/420) | Discover cost-centre and project-tag requirements | DEFERRED | #163, #247 |
 | [STV-V1-11](https://github.com/djh00t/steve/issues/421) | Discover audit administration requirements | DEFERRED | #148, #163 |
-| [STV-V1-12](https://github.com/djh00t/steve/issues/422) | Discover native supervisor/coordinator requirements | DEFERRED | #1, #359, #372, #373 |
-| [STV-V1-13](https://github.com/djh00t/steve/issues/423) | Discover signed release and versioned installation requirements | DEFERRED | #359, #372, #373 |
-| [STV-V1-14](https://github.com/djh00t/steve/issues/424) | Discover upgrade cutover and rollback requirements | DEFERRED | #1, #359, #372, #373 |
 | [STV-V1-15](https://github.com/djh00t/steve/issues/426) | Discover manual, scheduled and automatic upgrade policy | DEFERRED | #359, #372, #373, #423 |
 | [STV-V1-16](https://github.com/djh00t/steve/issues/428) | Discover expand/contract database migration requirements | DEFERRED | #1, #359, #372, #373, #424 |
 | [STV-V1-17](https://github.com/djh00t/steve/issues/425) | Discover stateless gateway replica requirements | DEFERRED | #1, #148, #163, #359, #372, #373 |
