@@ -177,7 +177,7 @@ jobs:
           mutation_tools="$RUNNER_TEMP/steve-mutation-tools"
           cargo install cargo-mutants --version 27.1.0 --locked --root "$mutation_tools" --jobs 2
           echo "$mutation_tools/bin" >> "$GITHUB_PATH"
-          version=$("$mutation_tools/bin/cargo-mutants" --version)
+          version=$(PATH="$mutation_tools/bin:$PATH" cargo mutants --version)
           echo "cargo-mutants version: $version"
           test "$version" = "cargo-mutants 27.1.0"
       - name: List cancellation mutant
