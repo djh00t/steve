@@ -1,0 +1,25 @@
+# STV-M4-03A (#532): Usage knownness and pricing-mode semantics
+
+**Status:** Proposal only; David/Cos acceptance pending. Live #532 is decision-only, READY for proposal; it assigns `docs/contracts/stv-m4-03a.md`. Live #169 needs distinct mode tags and unknown never as zero. [Spec §10](../specs/2026-09-26-steve-gateway.md#10-pricing-and-currencies) names all five modes and requires preserving authoritative source/list price and currency. Main inspected: `4472ca59896465fcf27b0d1df1d5218552d80efd`; no shared production pricing type was found under `src`. No schema or runtime behavior is claimed.
+
+**Proposed decision table**
+
+| Tag | Computed monetary result | Evidence / invariant |
+|---|---|---|
+| `metered` | Known only when valid required usage, matching price/unit and required FX are present; otherwise unknown. | Missing usage is unknown; explicit valid zero usage with known price is known zero. A computed zero remains metered. |
+| `subscription` | Not determined by this proposal; #542 owns the accepted calculation. Unknown when its required evidence is missing. | Preserve mode and separately recorded authoritative amount/evidence. |
+| `quota` | Not determined by this proposal; #543 owns the accepted calculation. Unknown when its required evidence is missing. | Preserve mode and separately recorded authoritative amount/evidence. |
+| `free` | Known zero only with explicit authoritative free-mode pricing evidence. | Never infer free from missing price, omitted usage, or a numeric zero alone. |
+| `unknown` | Unknown estimate; never zero. | Preserve any independently recorded authoritative amount/source currency; unknown estimate must not erase it. |
+
+Usage evidence is per dimension: absent or null is unknown/missing, explicit valid zero is known zero, and a value failing the accepted unit/type/range rules is invalid rather than zero. Invalid evidence makes the affected calculation unknown with an invalid-input diagnostic; valid sibling dimensions and permitted source provenance remain available. Never recover a missing subdimension from a total without its separately accepted mapping rule. Configuration/API writers reject malformed values and unrecognized mode tags; the explicit `unknown` tag is a valid mode, not a catch-all for typos. #298 owns exact error envelopes and persistence fields.
+
+Knownness is per field: retain an authoritative reported amount when present even when computed estimate is unknown. Keep reported actual amount and computed estimate distinct; a rollup must use one for a charge, never add the observed amount and estimate together. Source/list unit prices are pricing evidence, not incurred charge amounts, and never enter spend sums directly. #298 and rollup owners must qualify source selection, attribution and completeness before publishing totals; this proposal does not select an unimplemented rollup precedence rule. Without every required metered input (valid quantity, unit-matched immutable price, and conversion evidence if required), computed estimate is unknown.
+
+**Examples:** (1) Metered cache-read omitted; an authoritative reported charge is USD 0.03. Preserve that amount, mark cache-read unknown and do not fabricate a computed estimate. (2) Metered quantity explicitly 0 with known price computes known zero and stays metered; if an actual amount is also reported, retain it separately and do not sum the two. (3) Unknown mode with a recorded EUR source/list amount retains that amount; its computed cost estimate remains unknown, and the row is not reclassified as free.
+
+**Additional boundary examples:** explicit free-mode evidence permits known zero without token-count evidence; an omitted price does not. An invalid negative token count cannot produce a computed metered charge or invalidate unrelated valid usage dimensions; an unrecognized mode tag is rejected. A known zero computed under metered pricing never changes its mode to free.
+
+**Consumer handoff:** #533–#543 require acceptance of this exact common policy through their listed prerequisite chain. #169 and the other #166 implementation consumers retain all current dependencies. Each must qualify accepted types, missing/zero/invalid rules, actual source seams, fixtures and executable commands before re-sizing implementation to 5–10 minutes. Keep #166 and #65 open. No stored rows are rewritten or backfilled; any later storage migration must preserve existing evidence and must not manufacture unknown data as zero.
+
+**Boundary:** #542 owns subscription allowance/overage; #543 owns quota consumption. #533–539 own usage units; #164 arithmetic; #298 schemas/API. This decision changes none of them. Review evidence is the table and examples against live #169, live #532, and spec §10; runtime tests are N/A. No policy is accepted until David/Cos approve this exact proposal.
