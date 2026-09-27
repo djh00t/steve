@@ -71,18 +71,17 @@ event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{
 
     upstream.release_tail();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !received.contains("event: response.completed\n") {
-            let chunk = response
-                .next()
-                .await
-                .expect("stream ended before response.completed")
-                .expect("read terminal SSE bytes");
+        while let Some(chunk) = response.next().await {
+            let chunk = chunk.expect("read terminal SSE bytes");
             received.push_str(&String::from_utf8_lossy(&chunk));
         }
     })
     .await
     .expect("terminal SSE events were not forwarded");
-    assert!(received.contains("event: response.output_text.delta\n"));
+    assert_eq!(
+        received.as_bytes(),
+        [first.as_slice(), tail.as_slice()].concat()
+    );
     assert!(upstream.tail_was_sent());
     drop(response);
     upstream
