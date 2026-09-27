@@ -17,7 +17,7 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | [STV-M2-02 (#100)](https://github.com/djh00t/steve/issues/100) | Provider accounts, credentials, access and bindings | `docs/contracts/stv-m2-02.md` | BLOCKED by STV-M2-01 |
 | [STV-M2-03 (#101)](https://github.com/djh00t/steve/issues/101) | Account-pool policy, routing and affinity | `docs/contracts/stv-m2-03.md` | BLOCKED by STV-M2-02 |
 | [STV-M2-14 (#106)](https://github.com/djh00t/steve/issues/106) | Listener exposure and management authentication | `docs/contracts/stv-m2-14.md` | READY: proposal only |
-| [STV-M2-46 (#110)](https://github.com/djh00t/steve/issues/110) | Security audit event | `docs/contracts/stv-m2-46.md` | READY: proposal only |
+| [STV-M2-46 (#110)](https://github.com/djh00t/steve/issues/110) | Security audit event | [Work packages](stv-m2-46.md), [Envelope proposal](stv-m2-46-envelope.md), [Inventory proposal](stv-m2-46-inventory.md) | PROPOSED: joint #513/#514 revision acceptance, identity bindings and executable contract fixtures pending; #515 blocked on accepted #483/#484/#485; #123 remains blocked |
 | [STV-M3-40 (#102)](https://github.com/djh00t/steve/issues/102) | Migration versioning and backend parity | [Migration proposal](stv-m3-40.md) | PROPOSED: David/Cos acceptance pending; #103/#104 remain blocked |
 | [STV-M3-01 (#116)](https://github.com/djh00t/steve/issues/116) | Session association and conversation IDs | `docs/contracts/stv-m3-01.md` | BLOCKED by STV-M2-01 |
 | [STV-M3-02 (#121)](https://github.com/djh00t/steve/issues/121) | Content capture, metadata-only mode and retention | `docs/contracts/stv-m3-02.md` | BLOCKED by STV-M3-01 |
