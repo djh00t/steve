@@ -22,7 +22,7 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | [STV-M3-01 (#116)](https://github.com/djh00t/steve/issues/116) | Session association and conversation IDs | `docs/contracts/stv-m3-01.md` | BLOCKED by STV-M2-01 |
 | [STV-M3-02 (#121)](https://github.com/djh00t/steve/issues/121) | Content capture, metadata-only mode and retention | `docs/contracts/stv-m3-02.md` | BLOCKED by STV-M3-01 |
 | [STV-M4-01 (#164)](https://github.com/djh00t/steve/issues/164) | Money precision and rounding | [Money proposal](stv-m4-01.md) | PROPOSED: David/Cos acceptance and executable qualification pending |
-| [STV-M4-02 (#165)](https://github.com/djh00t/steve/issues/165) | FX source and stale-rate policy | `docs/contracts/stv-m4-02.md` | READY: proposal only |
+| [STV-M4-02 (#165)](https://github.com/djh00t/steve/issues/165) | FX source and stale-rate policy | [FX policy proposal](stv-m4-02.md) | PROPOSED: David/Cos acceptance and executable qualification pending |
 | [STV-M4-03 (#166)](https://github.com/djh00t/steve/issues/166) | Usage-price units and tier semantics | `docs/contracts/stv-m4-03.md` | READY: proposal only |
 | [STV-M4-33 (#238)](https://github.com/djh00t/steve/issues/238) | Display-currency preference | `docs/contracts/stv-m4-33.md` | BLOCKED by STV-M4-01, STV-M4-02 |
 | [STV-M5-01 (#174)](https://github.com/djh00t/steve/issues/174) | Latency stages and percentiles | [Latency proposal](stv-m5-01.md) | PROPOSED: Decisions A/B await David/Cos acceptance and executable qualification |
