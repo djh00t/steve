@@ -339,7 +339,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M5-13](https://github.com/djh00t/steve/issues/205) | Add PostgreSQL error-event table | BLOCKED | #176, #34, #72 |
 | [STV-M5-27](https://github.com/djh00t/steve/issues/206) | Export structured OTEL logs | BLOCKED | #176, #177, #180, #185, #72 |
 | [STV-M5-19](https://github.com/djh00t/steve/issues/210) | Normalize provider 5xx errors | BLOCKED | #176, #34 |
-| [STV-M5-25](https://github.com/djh00t/steve/issues/214) | Summarize provider reliability | BLOCKED | #175, #180, #210, #72 |
+| [STV-M5-25](https://github.com/djh00t/steve/issues/214) | Summarize provider reliability | BLOCKED | #175, #180, #210, #203, #204, #257, #268, #269, #72 |
 | [STV-M5-14](https://github.com/djh00t/steve/issues/245) | Measure authentication stage | BLOCKED | #174, #179, #118, #145, #146, #147, #72 |
 | [STV-M5-22](https://github.com/djh00t/steve/issues/246) | Query provider latency percentiles | BLOCKED | #178, #182, #72 |
 | [STV-M5-23](https://github.com/djh00t/steve/issues/248) | Query account latency percentiles | BLOCKED | #178, #182, #72 |
