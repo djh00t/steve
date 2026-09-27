@@ -361,51 +361,6 @@ async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Res
     }
 }
 
-fn hold_inflight_until_body_end(response: Response, guard: InflightGuard) -> Response {
-    hold_guard_until_body_end(response, guard)
-}
-
-fn hold_guard_until_body_end<G: Send + Unpin + 'static>(response: Response, guard: G) -> Response {
-    let (parts, body) = response.into_parts();
-    Response::from_parts(
-        parts,
-        Body::new(GuardedBody {
-            inner: body,
-            guard: Some(guard),
-        }),
-    )
-}
-
-struct GuardedBody<G> {
-    inner: Body,
-    guard: Option<G>,
-}
-
-impl<G: Unpin> HttpBody for GuardedBody<G> {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        let result = Pin::new(&mut this.inner).poll_frame(cx);
-        if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
-            this.guard.take();
-        }
-        result
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
 async fn responses(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
     let Some(guard) = state.lifecycle.enter() else {
         return (
@@ -611,7 +566,7 @@ mod tests {
     use super::*;
     use axum::{body::HttpBody, http::Request};
     use http_body_util::BodyExt;
-    use tokio_stream::StreamExt;
+    use tokio_stream::{Stream, StreamExt};
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -765,45 +720,6 @@ mod tests {
         assert_eq!(counters.inference.load(Ordering::Relaxed), 0);
     }
 
-    #[tokio::test]
-    async fn streaming_response_keeps_drain_waiting_until_body_ends() {
-        let lifecycle = Lifecycle::new();
-        lifecycle.ready("test");
-        let guard = lifecycle.enter().unwrap();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(1);
-        let response = (
-            StatusCode::OK,
-            [("content-type", "text/event-stream")],
-            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
-        )
-            .into_response();
-        let response = hold_inflight_until_body_end(response, guard);
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()["content-type"], "text/event-stream");
-        assert_eq!(lifecycle.inflight(), 1);
-
-        lifecycle.drain("test");
-        let waiter = tokio::spawn({
-            let lifecycle = lifecycle.clone();
-            async move { lifecycle.wait_for_zero().await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-
-        tx.send(Ok(bytes::Bytes::from_static(b"data: done\n\n")))
-            .await
-            .unwrap();
-        drop(tx);
-        let mut body = response.into_body().into_data_stream();
-        assert_eq!(
-            body.next().await.unwrap().unwrap(),
-            bytes::Bytes::from_static(b"data: done\n\n")
-        );
-        assert!(body.next().await.is_none());
-        waiter.await.unwrap();
-        assert_eq!(lifecycle.inflight(), 0);
-    }
-
     struct PendingSse {
         first: Option<bytes::Bytes>,
         dropped: Option<tokio::sync::oneshot::Sender<()>>,
@@ -950,6 +866,8 @@ mod tests {
         )
             .into_response();
         let response = hold_inflight_until_body_end(response, guard);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
         assert_eq!(lifecycle.inflight(), 1);
 
         lifecycle.drain("test");
@@ -971,23 +889,6 @@ mod tests {
         );
         assert!(body.next().await.is_none());
         waiter.await.unwrap();
-        assert_eq!(lifecycle.inflight(), 0);
-    }
-
-    #[test]
-    fn dropping_streaming_response_releases_inflight_guard() {
-        let lifecycle = Lifecycle::new();
-        lifecycle.ready("test");
-        let guard = lifecycle.enter().unwrap();
-        let response = hold_inflight_until_body_end(
-            Body::from_stream(tokio_stream::pending::<Result<bytes::Bytes, std::io::Error>>())
-                .into_response(),
-            guard,
-        );
-        assert_eq!(lifecycle.inflight(), 1);
-
-        drop(response);
-
         assert_eq!(lifecycle.inflight(), 0);
     }
 
