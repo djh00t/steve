@@ -22,6 +22,18 @@ Replacing one implementation leaf with three and adding the fixture produced 386
 
 The next implementation wave must use exact accepted contract revisions and runnable predecessor commands. Register each endpoint with its implementation so its HTTP acceptance can run immediately; serialize shared router, schema, configuration, fixture and CI files. Apply the same rule to clients: qualify an executable target and one working connection before adding views.
 
+## Accounting contract decomposition
+
+The settled policy remains **preserve forwarding; fail visibly and stop later inference**. [#84](https://github.com/djh00t/steve/issues/84) is now a coordination parent, not a ten-minute implementation leaf. Its remaining proposals own disjoint artifacts:
+
+| Package | Output | Readiness |
+| --- | --- | --- |
+| [STV-M0-16 #483](https://github.com/djh00t/steve/issues/483) | Incident/admission state, exact HTTP/status fields and incident lifetime | READY to propose |
+| [STV-M0-17 #484](https://github.com/djh00t/steve/issues/484) | Journal ownership, replacement overlap and recovery boundaries | READY to propose in parallel |
+| [STV-M0-18 #485](https://github.com/djh00t/steve/issues/485) | Drain/replay acknowledgements and completion evidence | BLOCKED on accepted #483/#484 artifacts |
+
+Replacing one leaf with three brings the current inventory to **390 active leaves**, including the buffering runner #480. Coordination parents #84 and #91 are excluded. This does not reopen the accepted M0 foundation or approve any proposed persistence mechanism. David/Cos accepts exact contract revisions through review and merge; #85/#86/#87/#94 remain blocked until their interfaces and small implementation briefs are updated. No event ID can reconstruct a discarded payload, and a journal enqueue is not a durable write.
+
 ## Readiness summary
 
 | Area | READY | BLOCKED | DEFERRED | Total |
@@ -78,7 +90,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | --- | --- | --- | --- |
 | [STV-M0-05](https://github.com/djh00t/steve/issues/80) | Prove SQLite and PostgreSQL serve parity | BLOCKED | #72 |
 | [STV-M0-06](https://github.com/djh00t/steve/issues/81) | Prove filesystem and S3 object-store parity | BLOCKED | #72 |
-| [STV-M0-01](https://github.com/djh00t/steve/issues/84) | Resolve authoritative accounting overflow semantics | READY | None |
+| [STV-M0-01](https://github.com/djh00t/steve/issues/84) | Coordinate accounting failure contracts | COORDINATION | #483, #484, #485 |
 | [STV-M0-02](https://github.com/djh00t/steve/issues/85) | Preserve journal framing and report corrupt tails | BLOCKED | #84, #72 |
 | [STV-M0-03](https://github.com/djh00t/steve/issues/86) | Retry accounting reconciliation without startup loss | BLOCKED | #84, #72 |
 | [STV-M0-04](https://github.com/djh00t/steve/issues/87) | Prove idempotent journal replay after partial DB success | BLOCKED | #84, #72 |
