@@ -882,6 +882,7 @@ mod tests {
             anthropic_upstream: Some(
                 AnthropicUpstream::new(upstream_url, Duration::from_secs(2)).unwrap(),
             ),
+            provider_probe: ProviderProbeState::new(None, None).unwrap(),
         });
         (state, dir)
     }
