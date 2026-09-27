@@ -390,3 +390,130 @@ async fn chat_completions_stream_forwards_first_event_before_tail() {
     .await
     .expect("Chat Completions stream scenario exceeded 30 seconds");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_disconnect_no_replay() {
+    use upstream::Tail;
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        run_chat_disconnect_case(Tail::Bytes(b"unreleased tail".as_slice().into()), true).await;
+        run_chat_disconnect_case(Tail::Error("failure after first output".into()), false).await;
+    })
+    .await
+    .expect("Chat Completions disconnect scenario exceeded 30 seconds");
+}
+
+#[cfg(unix)]
+async fn run_chat_disconnect_case(tail: upstream::Tail, disconnect: bool) {
+    use tokio_stream::StreamExt;
+    use upstream::ControlledUpstream;
+
+    let first = b"data: {\"id\":\"chatcmpl_fixture\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}]}\n\n";
+    let mut upstream = ControlledUpstream::start("/v1/chat/completions", first.as_slice(), tail)
+        .await
+        .expect("start controlled upstream");
+    let upstream_url = upstream.url();
+    let mut steve = SteveProcess::start_with_upstream_urls(Some(&upstream_url), None)
+        .expect("start Steve process with OpenAI upstream");
+    let listeners = steve
+        .wait_ready(Duration::from_secs(15))
+        .await
+        .expect("Steve listeners become ready");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .expect("build HTTP client");
+    let request = json!({
+        "model": "steve-test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true
+    });
+    let response = client
+        .post(format!(
+            "http://{}/v1/chat/completions",
+            listeners.inference
+        ))
+        .json(&request)
+        .send()
+        .await
+        .expect("request Chat Completions stream");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut response = response.bytes_stream();
+
+    let captured: Value = upstream
+        .wait_for_request(Duration::from_secs(5))
+        .await
+        .expect("upstream request timeout");
+    assert_eq!(captured, request);
+
+    let mut received = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !received.ends_with(b"\n\n") {
+            let chunk = response
+                .next()
+                .await
+                .expect("stream ended before the first SSE event")
+                .expect("read first SSE event");
+            received.extend_from_slice(&chunk);
+        }
+    })
+    .await
+    .expect("first SSE event was not forwarded");
+    assert_eq!(received, first, "observe output before disconnect or fault");
+    assert!(!upstream.tail_was_sent(), "hold tail until first output");
+
+    if disconnect {
+        drop(response);
+        upstream
+            .wait_for_body_drop(Duration::from_secs(5))
+            .await
+            .expect("upstream response body was not dropped after client disconnect");
+        assert!(
+            !upstream.tail_was_sent(),
+            "unreleased tail must be cancelled"
+        );
+    } else {
+        upstream.release_tail();
+        let error = tokio::time::timeout(Duration::from_secs(5), response.next())
+            .await
+            .expect("post-output upstream failure was not observed")
+            .expect("stream ended without surfacing upstream failure");
+        assert!(
+            error.is_err(),
+            "post-output upstream failure must reach client"
+        );
+    }
+
+    let management = format!("http://{}", listeners.management);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status: Value = client
+                .get(format!("{management}/api/v1/system/status"))
+                .send()
+                .await
+                .expect("request system status after stream end")
+                .error_for_status()
+                .expect("system status response")
+                .json()
+                .await
+                .expect("parse system status");
+            if status["inflight"] == 0 && status["active_inference_requests"] == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("stream end did not release request guards");
+
+    assert_eq!(upstream.request_count(), 1, "stream must never replay");
+    assert!(
+        upstream
+            .wait_for_requests(1, Duration::from_millis(100))
+            .await
+            .is_err(),
+        "no sentinel second request may reach upstream"
+    );
+}

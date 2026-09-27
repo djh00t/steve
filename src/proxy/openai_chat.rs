@@ -568,6 +568,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dropping_stream_body_cancels_and_finishes_shared_attempt() {
+        let handoff = parse_chat_completions(
+            br#"{"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+        )
+        .expect("valid streaming request");
+        let attempt = Arc::new(Mutex::new(handoff.attempt));
+        let body = AttemptBody {
+            inner: Body::empty().into_data_stream(),
+            attempt: Arc::clone(&attempt),
+        };
+
+        drop(body);
+
+        let attempt = attempt.lock().expect("attempt lock");
+        assert_eq!(attempt.status, AttemptStatus::Cancelled);
+        assert!(attempt.finished_at.is_some());
+    }
+
     fn error_body(reply: ChatCompletionReply) -> SteveErrorResponse {
         match reply.body {
             ChatCompletionReplyBody::Error(error) => error,
