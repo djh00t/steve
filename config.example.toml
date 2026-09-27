@@ -3,7 +3,7 @@
 inference_bind = "[::]:11435"
 management_bind = "[::]:8790"
 drain_timeout_seconds = 60
-# Set to the OpenAI-compatible upstream origin to enable non-stream chat forwarding.
+# Local unauthenticated test_upstream fixture for non-stream chat and Responses JSON/SSE.
 # openai_upstream_url = "http://127.0.0.1:18080"
 # Local unauthenticated test_upstream fixture only; provider credentials are later work.
 # anthropic_upstream_url = "http://127.0.0.1:18080"
