@@ -12,7 +12,13 @@ The original 385-item inventory was a planning snapshot, not 385 dispatchable ju
 
 Of the original 22 READY rows, 21 prepare decisions or qualification proposals; only the process smoke package is implementation work, accepted on main via PR #457. No unresolved money, security, routing or platform choice is approved by a READY label. Integration acceptance gates verify composed results and are not ten-minute feature implementations. The counts below remain the original review snapshot; consult current issues before dispatch.
 
-The immediate test split adds [STV-TST-11 (#458)](https://github.com/djh00t/steve/issues/458) for held object-store writes and [STV-TST-12 (#459)](https://github.com/djh00t/steve/issues/459) for Messages disconnect proof. STV-TST-02 now owns the provider fixture; STV-TST-04 owns Responses only; Chat stays in #33. After adding those two test slices and retiring four duplicate registration-only packages, the active inventory is 383 packages; the original summary below remains a 385-row audit snapshot.
+The immediate test split adds [STV-TST-11 (#458)](https://github.com/djh00t/steve/issues/458) for held object-store writes and [STV-TST-12 (#459)](https://github.com/djh00t/steve/issues/459) for Messages disconnect proof. STV-TST-02 now owns the provider fixture; STV-TST-04 owns Responses only; Chat stays in #33. After adding those two test slices and retiring four duplicate registration-only packages, that review produced 383 active packages; the original summary below remains a 385-row audit snapshot.
+
+## Accepted admission decomposition
+
+The admission contract landed in [#466](https://github.com/djh00t/steve/pull/466) at `63f9cce3d1e754350a1fbb87ee620210520ffa1d`. Its former broad implementation package [#91](https://github.com/djh00t/steve/issues/91) is now a coordination parent for [inference #468](https://github.com/djh00t/steve/issues/468), [management #469](https://github.com/djh00t/steve/issues/469), and [status #470](https://github.com/djh00t/steve/issues/470). These three share `src/server.rs` and execute in that order. The [multi-stream fixture #471](https://github.com/djh00t/steve/issues/471) owns separate test files and can run in parallel. [#92](https://github.com/djh00t/steve/issues/92) remains the composed real-daemon gate after all four leaves land.
+
+Replacing one implementation leaf with three and adding the fixture yields **386 active leaf packages**. Coordination parent #91 is not counted as a leaf. The original readiness-count table remains historical; issue bodies hold current ownership and readiness. This decomposition leaves the accepted M0 foundation unchanged.
 
 The next implementation wave must use exact accepted contract revisions and runnable predecessor commands. Register each endpoint with its implementation so its HTTP acceptance can run immediately; serialize shared router, schema, configuration, fixture and CI files. Apply the same rule to clients: qualify an executable target and one working connection before adding views.
 
@@ -79,8 +85,8 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M0-07](https://github.com/djh00t/steve/issues/88) | Prove noncritical queue pressure leaves management responsive | BLOCKED | #72, #458 |
 | [STV-M0-08](https://github.com/djh00t/steve/issues/89) | Prove live-but-unready drain with an active stream | BLOCKED | #72, #73 |
 | [STV-M0-09](https://github.com/djh00t/steve/issues/90) | Define independent admission-budget contract | READY | None |
-| [STV-M0-10](https://github.com/djh00t/steve/issues/91) | Enforce separate listener admission budgets | BLOCKED | #90 |
-| [STV-M0-11](https://github.com/djh00t/steve/issues/92) | Prove listener budgets with a real process | BLOCKED | #91, #72, #73 |
+| [STV-M0-10](https://github.com/djh00t/steve/issues/91) | Coordinate listener admission implementation | COORDINATION | #468, #469, #470 |
+| [STV-M0-11](https://github.com/djh00t/steve/issues/92) | Prove listener budgets with a real process | BLOCKED | #91, #72, #73, #471 |
 | [STV-M0-12](https://github.com/djh00t/steve/issues/93) | Bound, circuit-break and observe history-worker failures | BLOCKED | #458 |
 
 ### M1
