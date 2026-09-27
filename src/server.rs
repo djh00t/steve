@@ -145,7 +145,7 @@ pub async fn run(
         .parse()
         .context("parsing management bind address")?;
 
-    if inference_addr == management_addr {
+    if inference_addr == management_addr && inference_addr.port() != 0 {
         anyhow::bail!("inference and management listeners must use different addresses");
     }
 
