@@ -85,6 +85,11 @@ jobs:
           STEVE_OBJECT_ROOT: /tmp/steve-objects
         run: cargo run -- doctor
 
+      - name: PostgreSQL database serve parity
+        env:
+          STEVE_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/steve
+        run: cargo test --test e2e --all-features database_backend_contract
+
       - name: Start S3-compatible test server
         run: |
           # Distro pyOpenSSL still references cryptography's GEN_EMAIL symbol.
@@ -122,6 +127,11 @@ jobs:
           )
           s3.create_bucket(Bucket="steve")
           PY
+
+      - name: Object store backend parity
+        env:
+          STEVE_TEST_S3_ENDPOINT: http://127.0.0.1:5000
+        run: cargo test --bin steve --all-features object_store_backend_contract -- --nocapture
 
       - name: S3-compatible doctor
         env:
