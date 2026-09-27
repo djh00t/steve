@@ -17,7 +17,8 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | [STV-M3-02 (#121)](https://github.com/djh00t/steve/issues/121) | Content capture, metadata-only mode and retention | `docs/contracts/stv-m3-02.md` | BLOCKED by STV-M3-01 |
 | [STV-M4-01 (#164)](https://github.com/djh00t/steve/issues/164) | Money precision and rounding | `docs/contracts/stv-m4-01.md` | READY: proposal only |
 | [STV-M4-02 (#165)](https://github.com/djh00t/steve/issues/165) | FX source and stale-rate policy | `docs/contracts/stv-m4-02.md` | READY: proposal only |
-| [STV-M4-03 (#166)](https://github.com/djh00t/steve/issues/166) | Usage-price units and tier semantics | `docs/contracts/stv-m4-03.md` | READY: proposal only |
+| [STV-M4-03 (#166)](https://github.com/djh00t/steve/issues/166) | Usage-price units and tier semantics | `docs/contracts/stv-m4-03.md` (future coordination index) | Coordination only: child decisions #532–#543 remain pending |
+| [STV-M4-03A (#532)](https://github.com/djh00t/steve/issues/532) | Usage knownness and pricing modes | [Knownness proposal](stv-m4-03a.md) | PROPOSED: David/Cos acceptance and consumer qualification pending |
 | [STV-M4-33 (#238)](https://github.com/djh00t/steve/issues/238) | Display-currency preference | `docs/contracts/stv-m4-33.md` | BLOCKED by STV-M4-01, STV-M4-02 |
 | [STV-M5-01 (#174)](https://github.com/djh00t/steve/issues/174) | Latency stages and percentiles | `docs/contracts/stv-m5-01.md` | READY: proposal only |
 | [STV-M5-02 (#175)](https://github.com/djh00t/steve/issues/175) | EWMA and reliability rules | `docs/contracts/stv-m5-02.md` | READY: proposal only |
