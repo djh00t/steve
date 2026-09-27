@@ -213,7 +213,8 @@ fn responses_stream(model: &str) -> Response {
     let part = item["content"][0].clone();
     let item_id = item["id"].clone();
     let mut events = vec![
-        json!({"type": "response.created", "response": created}),
+        json!({"type": "response.created", "response": created.clone()}),
+        json!({"type": "response.in_progress", "response": created}),
         json!({"type": "response.output_item.added", "output_index": 0,
             "item": {"id": item_id, "type": "message", "role": "assistant",
                 "status": "in_progress", "content": []}}),
@@ -547,6 +548,7 @@ mod tests {
             event_types,
             [
                 "response.created",
+                "response.in_progress",
                 "response.output_item.added",
                 "response.content_part.added",
                 "response.output_text.delta",

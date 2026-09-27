@@ -145,12 +145,29 @@ def openai_smoke(inference_addr, server_log, fixture_log):
                 max_output_tokens=16,
                 input="hi",
             ) as stream:
-                streamed_text = "".join(
-                    event.delta
-                    for event in stream
-                    if event.type == "response.output_text.delta"
-                )
+                streamed_text = ""
+                lifecycle = []
+                in_progress = None
+                for event in stream:
+                    if event.type.startswith("response.") and event.type != "response.output_text.delta":
+                        lifecycle.append(event.type)
+                    if event.type == "response.in_progress":
+                        in_progress = event.response
+                    elif event.type == "response.output_text.delta":
+                        streamed_text += event.delta
                 response = stream.get_final_response()
+            assert lifecycle == [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ], lifecycle
+            assert in_progress.status == "in_progress", in_progress
+            assert in_progress.id == response.id, (in_progress.id, response.id)
             assert streamed_text == "steve-test-response", streamed_text
             assert response.status == "completed", response.status
             assert response.output_text == "steve-test-response", response.output_text
