@@ -4,14 +4,24 @@ Snapshot: 2026-09-27; source base `6630577677f40e4ba6a491074f0c91a57d7ddd6e`.
 
 Review tracking: [#60](https://github.com/djh00t/steve/issues/60). GitHub issues contain the complete briefs. This index records the review snapshot; read the linked issue and current merge state before dispatch.
 
-Use the [readiness rules](work-packages.md) and [testing policy](testing.md). Estimates are 5–10 active minutes after prerequisites land. BLOCKED leaves require their contract owner to supply exact approved details before dispatch; deferred discovery is not an implementation-ready feature.
+Use the [delivery phases and workstreams](delivery-plan.md), [contract registry](contracts/README.md), [readiness rules](work-packages.md) and [testing policy](testing.md). Estimates are 5–10 active minutes after prerequisites land. BLOCKED leaves require their contract owner to supply exact approved details before dispatch; deferred discovery is not an implementation-ready feature.
+
+## Second-pass decomposition review
+
+The 385 rows below are a planning inventory, not 385 dispatchable junior tasks. The second review at base `a55309d` examined every row for size, executable prerequisites, contract/schema completeness and shared ownership. Each linked area parent records the per-package corrections. Split/combine recommendations preserve existing IDs until the relevant contract producer can publish concrete replacements and update all dependency links.
+
+Of the original 22 READY rows, 21 prepare decisions or qualification proposals; only the process smoke package is implementation work, delivered for review in PR #457. No unresolved money, security, routing or platform choice is approved by a READY label. Integration acceptance gates verify composed results and are not ten-minute feature implementations. The counts below remain the original review snapshot; consult current issues before dispatch.
+
+The immediate test split adds [STV-TST-11 (#458)](https://github.com/djh00t/steve/issues/458) for held object-store writes and [STV-TST-12 (#459)](https://github.com/djh00t/steve/issues/459) for Messages disconnect proof. STV-TST-02 now owns the provider fixture; STV-TST-04 owns Responses only; Chat stays in #33. The current inventory is 387 packages; the original summary below remains a 385-row audit snapshot.
+
+The next implementation wave must use exact accepted contract revisions and runnable predecessor commands. Register each endpoint with its implementation so its HTTP acceptance can run immediately; serialize shared router, schema, configuration, fixture and CI files. Apply the same rule to clients: qualify an executable target and one working connection before adding views.
 
 ## Readiness summary
 
 | Area | READY | BLOCKED | DEFERRED | Total |
 | --- | ---: | ---: | ---: | ---: |
 | [Testing](https://github.com/djh00t/steve/issues/61) | 1 | 9 | 0 | 10 |
-| [M0](https://github.com/djh00t/steve/issues/62) | 2 | 10 | 0 | 12 |
+| [Post-M0 reliability](https://github.com/djh00t/steve/issues/62) | 2 | 10 | 0 | 12 |
 | [M1](https://github.com/djh00t/steve/issues/37) | 0 | 6 | 0 | 6 |
 | [M2](https://github.com/djh00t/steve/issues/63) | 3 | 42 | 0 | 45 |
 | [M3](https://github.com/djh00t/steve/issues/64) | 1 | 30 | 0 | 31 |
@@ -30,7 +40,7 @@ Start with the real-process harness and independent contract decisions. Complete
 
 ## Scope reconciliation
 
-- M0 follow-ups cover journal recovery, backend parity, admission budgets, drain and background failure evidence; they do not reopen the accepted foundation.
+- **M0 foundation remains accepted (PR #1, 100%).** Post-M0 reliability follow-ups cover journal recovery, backend parity, admission budgets, drain and background failure evidence; they do not reopen the accepted foundation.
 - M1 includes missing composed real-process and official SDK proof, cancellation and deferred accounting. Closed implementation history remains closed.
 - M2–M6 cover identity, history, money, telemetry and routing, including one composed request tying identity/account/snapshot/session/charge provenance together.
 - M7/M8 include management API and runnable client producers before interface consumers. Install/update workflows needing platform decisions are explicit decomposition gates.
@@ -43,18 +53,20 @@ Start with the real-process harness and independent contract decisions. Complete
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-TST-01](https://github.com/djh00t/steve/issues/72) | Add a real Steve process smoke harness | READY | None |
-| [STV-TST-02](https://github.com/djh00t/steve/issues/73) | Add deterministic provider and object-store fault fixtures | BLOCKED | #72 |
+| [STV-TST-01](https://github.com/djh00t/steve/issues/72) | Add a real Steve process smoke harness | DELIVERED (PR #457) | None |
+| [STV-TST-02](https://github.com/djh00t/steve/issues/73) | Add a deterministic held-tail provider fixture | BLOCKED | #72 |
 | [STV-TST-03](https://github.com/djh00t/steve/issues/74) | Qualify targeted Rust mutation testing | BLOCKED | #72, #73 |
-| [STV-TST-04](https://github.com/djh00t/steve/issues/75) | Prove daemon-level streaming disconnect and no replay | BLOCKED | #72, #73, #33, #39 |
-| [STV-TST-05](https://github.com/djh00t/steve/issues/76) | Prove official OpenAI SDK streaming compatibility | BLOCKED | #72, #75 |
-| [STV-TST-06](https://github.com/djh00t/steve/issues/77) | Prove official Anthropic SDK streaming compatibility | BLOCKED | #72, #75 |
+| [STV-TST-04](https://github.com/djh00t/steve/issues/75) | Prove Responses disconnect cancels upstream without replay | BLOCKED | #72, #73 |
+| [STV-TST-05](https://github.com/djh00t/steve/issues/76) | Prove official OpenAI SDK streaming compatibility | BLOCKED | #72, #75, #33 |
+| [STV-TST-06](https://github.com/djh00t/steve/issues/77) | Prove official Anthropic SDK streaming compatibility | BLOCKED | #72, #459 |
 | [STV-TST-07](https://github.com/djh00t/steve/issues/78) | Wire process smoke into PR and main CI | BLOCKED | #72 |
 | [STV-TST-08](https://github.com/djh00t/steve/issues/79) | Wire targeted mutations into PR CI | BLOCKED | #74, #78 |
 | [STV-TST-09](https://github.com/djh00t/steve/issues/82) | Replace doctor-only backend checks with parity E2E on main | BLOCKED | #80, #81, #78 |
 | [STV-TST-10](https://github.com/djh00t/steve/issues/83) | Run official SDK smoke in CI | BLOCKED | #76, #77 |
+| [STV-TST-11](https://github.com/djh00t/steve/issues/458) | Add a held S3 PutObject fixture | BLOCKED | #72, #73 |
+| [STV-TST-12](https://github.com/djh00t/steve/issues/459) | Prove Messages disconnect cancels upstream without replay | BLOCKED | #72, #73 |
 
-### M0
+### Post-M0 reliability
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
@@ -64,12 +76,12 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M0-02](https://github.com/djh00t/steve/issues/85) | Preserve journal framing and report corrupt tails | BLOCKED | #84, #72 |
 | [STV-M0-03](https://github.com/djh00t/steve/issues/86) | Retry accounting reconciliation without startup loss | BLOCKED | #84, #72 |
 | [STV-M0-04](https://github.com/djh00t/steve/issues/87) | Prove idempotent journal replay after partial DB success | BLOCKED | #84, #72 |
-| [STV-M0-07](https://github.com/djh00t/steve/issues/88) | Prove noncritical queue pressure leaves management responsive | BLOCKED | #72, #73 |
+| [STV-M0-07](https://github.com/djh00t/steve/issues/88) | Prove noncritical queue pressure leaves management responsive | BLOCKED | #72, #458 |
 | [STV-M0-08](https://github.com/djh00t/steve/issues/89) | Prove live-but-unready drain with an active stream | BLOCKED | #72, #73 |
 | [STV-M0-09](https://github.com/djh00t/steve/issues/90) | Define independent admission-budget contract | READY | None |
 | [STV-M0-10](https://github.com/djh00t/steve/issues/91) | Enforce separate listener admission budgets | BLOCKED | #90 |
 | [STV-M0-11](https://github.com/djh00t/steve/issues/92) | Prove listener budgets with a real process | BLOCKED | #91, #72, #73 |
-| [STV-M0-12](https://github.com/djh00t/steve/issues/93) | Bound, circuit-break and observe history-worker failures | BLOCKED | #73 |
+| [STV-M0-12](https://github.com/djh00t/steve/issues/93) | Bound, circuit-break and observe history-worker failures | BLOCKED | #458 |
 
 ### M1
 
@@ -80,7 +92,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M1-05](https://github.com/djh00t/steve/issues/95) | Enqueue completed nonstream Chat attempts | BLOCKED | #94 |
 | [STV-M1-06](https://github.com/djh00t/steve/issues/96) | Enqueue streamed Chat attempts at terminal state | BLOCKED | #94, #33 |
 | [STV-M1-07](https://github.com/djh00t/steve/issues/97) | Prove saturated Chat accounting does not delay SSE | BLOCKED | #96, #73, #84 |
-| [STV-M1-08](https://github.com/djh00t/steve/issues/98) | Run and document the composed M1 acceptance | BLOCKED | #75, #33, #94, #95, #96, #97, #76, #77, #78, #79, #82, #83 |
+| [STV-M1-08](https://github.com/djh00t/steve/issues/98) | Run and document the composed M1 acceptance | BLOCKED | #75, #33, #94, #95, #96, #97, #76, #77, #78, #79, #82, #83, #459 |
 
 ### M2
 
@@ -363,7 +375,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M6-41](https://github.com/djh00t/steve/issues/286) | Write ordered routing rule through management API | BLOCKED | #189, #207, #187, #273, #72 |
 | [STV-M6-21](https://github.com/djh00t/steve/issues/287) | Stop failover after stream commitment | BLOCKED | #193, #39, #41, #42, #73 |
 | [STV-M6-ACCEPT-01](https://github.com/djh00t/steve/issues/291) | Verify composed routing acceptance | BLOCKED | #186, #187, #188, #189, #190, #191, #192, #193, #194, #207, #208, #211, #209, #215, #217, #212, #213, #220, #216, #221, #287, #223, #226, #227, #270, #282, #285, #288, #279, #72, #73, #272, #280, #281, #283, #284, #286, #273 |
-| [STV-MVP-ACCEPT-01](https://github.com/djh00t/steve/issues/294) | Verify authenticated request evidence chain | BLOCKED | #148, #163, #247, #291, #72, #73 |
+| [STV-MVP-ACCEPT-01](https://github.com/djh00t/steve/issues/294) | Verify authenticated request evidence chain | BLOCKED | #148, #163, #247, #291, #72, #73, #459 |
 
 ### M7
 
