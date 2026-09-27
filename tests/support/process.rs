@@ -36,6 +36,27 @@ impl SteveProcess {
         anthropic_upstream_url: Option<&str>,
         drain_timeout_seconds: u64,
     ) -> io::Result<Self> {
+        Self::start_with_options(
+            openai_upstream_url,
+            anthropic_upstream_url,
+            drain_timeout_seconds,
+            None,
+            None,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn start_with_object_store(endpoint: &str, history_capacity: usize) -> io::Result<Self> {
+        Self::start_with_options(None, None, 60, Some(endpoint), Some(history_capacity))
+    }
+
+    fn start_with_options(
+        openai_upstream_url: Option<&str>,
+        anthropic_upstream_url: Option<&str>,
+        drain_timeout_seconds: u64,
+        object_store_endpoint: Option<&str>,
+        history_capacity: Option<usize>,
+    ) -> io::Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path();
         let db_path = root.join("steve.db");
@@ -54,13 +75,25 @@ impl SteveProcess {
                 toml::Value::String(url.into())
             ));
         }
+        let object_storage = if let Some(endpoint) = object_store_endpoint {
+            format!(
+                "[object_storage]\nkind = \"s3\"\nbucket = \"steve\"\nendpoint = {}\nroot = \"/\"\nregion = \"us-east-1\"\naccess_key_id = \"dummycreds\"\nsecret_access_key = \"dummycreds\"\n",
+                toml::Value::String(endpoint.into()),
+            )
+        } else {
+            format!(
+                "[object_storage]\nkind = \"fs\"\nroot = {}\n",
+                toml::Value::String(root.join("objects").display().to_string()),
+            )
+        };
+        let history = history_capacity
+            .map(|capacity| format!("history = {capacity}\n"))
+            .unwrap_or_default();
         let config = format!(
             "{server_config}\n[database]\nurl = {}\n\
-             [object_storage]\nkind = \"fs\"\nroot = {}\n\
-             [queues]\naccounting_journal = {}\n\
+             {object_storage}\n[queues]\naccounting_journal = {}\n{history}\
              [logging]\nlevel = \"info\"\njson = true\n",
             toml::Value::String(format!("sqlite://{}?mode=rwc", db_path.display())),
-            toml::Value::String(root.join("objects").display().to_string()),
             toml::Value::String(root.join("accounting-overflow.jsonl").display().to_string()),
         );
         let config_path = root.join("config.toml");
