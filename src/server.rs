@@ -1059,7 +1059,9 @@ mod tests {
         assert_eq!(data[0]["id"], "steve-test-model");
         assert_eq!(data[0]["object"], "model");
         assert_eq!(data[0]["owned_by"], "steve");
-    }    fn provider_router(state: ProviderProbeState) -> Router {
+    }
+
+    fn provider_router(state: ProviderProbeState) -> Router {
         Router::new()
             .route("/api/v1/providers/health", get(provider_health))
             .route("/health/live", get(|| async { "live" }))
