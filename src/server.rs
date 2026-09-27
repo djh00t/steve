@@ -47,6 +47,7 @@ struct RequestCounters {
 
 struct AdmissionBudget {
     semaphore: Arc<Semaphore>,
+    limit: u32,
     rejected_total: AtomicU64,
 }
 
@@ -54,7 +55,16 @@ impl AdmissionBudget {
     fn new(limit: u32) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(limit as usize)),
+            limit,
             rejected_total: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> AdmissionCounters {
+        AdmissionCounters {
+            limit: self.limit,
+            active: self.limit - self.semaphore.available_permits() as u32,
+            rejected_total: self.rejected_total.load(Ordering::Relaxed),
         }
     }
 
@@ -137,6 +147,20 @@ struct Health {
     status: &'static str,
     phase: Phase,
     inflight: u64,
+    admission: Admission,
+}
+
+#[derive(Serialize)]
+struct Admission {
+    inference: AdmissionCounters,
+    management: AdmissionCounters,
+}
+
+#[derive(Serialize)]
+struct AdmissionCounters {
+    limit: u32,
+    active: u32,
+    rejected_total: u64,
 }
 
 #[derive(Serialize)]
@@ -422,6 +446,7 @@ async fn live(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         status: "ok",
         phase: state.lifecycle.phase(),
         inflight: state.lifecycle.inflight(),
+        admission: admission(&state),
     })
 }
 
@@ -434,6 +459,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         },
         phase: state.lifecycle.phase(),
         inflight: state.lifecycle.inflight(),
+        admission: admission(&state),
     };
 
     if state.lifecycle.is_ready() {
@@ -462,10 +488,18 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
         "inflight": state.lifecycle.inflight(),
         "active_inference_requests": state.counters.inference.load(Ordering::Relaxed),
         "active_management_requests": state.counters.management.load(Ordering::Relaxed),
+        "admission": admission(&state),
         "inference_bind": state.inference_bind,
         "management_bind": state.management_bind,
         "queues": state.deferred.snapshot(),
     }))
+}
+
+fn admission(state: &AppState) -> Admission {
+    Admission {
+        inference: state.inference_admission.snapshot(),
+        management: state.management_admission.snapshot(),
+    }
 }
 
 async fn drain(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -987,7 +1021,48 @@ mod tests {
     async fn inference_admission_holds_permit_until_body_end() {
         let (state, _dir) = messages_test_state("http://127.0.0.1:1".into()).await;
         let lifecycle = state.lifecycle.clone();
-        let app = inference_router(state);
+        let app = inference_router(state.clone());
+        let management = management_router(state.clone());
+        let idle_status = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let idle_status: Value =
+            serde_json::from_slice(&idle_status.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(idle_status["admission"]["inference"]["limit"], 32);
+        assert_eq!(idle_status["admission"]["inference"]["active"], 0);
+        assert_eq!(idle_status["admission"]["inference"]["rejected_total"], 0);
+        assert_eq!(idle_status["admission"]["management"]["limit"], 4);
+        assert_eq!(idle_status["admission"]["management"]["active"], 1);
+        assert_eq!(idle_status["admission"]["management"]["rejected_total"], 0);
+        for router in [&app, &management] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health/live")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let health: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(health["admission"]["inference"]["limit"], 32);
+            assert_eq!(health["admission"]["inference"]["active"], 0);
+            assert_eq!(health["admission"]["inference"]["rejected_total"], 0);
+            assert_eq!(health["admission"]["management"]["limit"], 4);
+            assert_eq!(health["admission"]["management"]["active"], 0);
+            assert_eq!(health["admission"]["management"]["rejected_total"], 0);
+        }
         let request = || {
             Request::builder()
                 .uri("/v1/models")
@@ -1011,6 +1086,115 @@ mod tests {
             bytes::Bytes::from_static(
                 br#"{"error":{"type":"overloaded","code":"admission_limit","message":"inference capacity exhausted"}}"#
             )
+        );
+        assert_eq!(
+            state
+                .inference_admission
+                .rejected_total
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let mut management_held = Vec::new();
+        for _ in 0..4 {
+            management_held.push(
+                management
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/api/v1/system/status")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let management_rejected = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            management_rejected.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            state
+                .management_admission
+                .rejected_total
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        for router in [&app, &management] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health/ready")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let health: Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(health["admission"]["inference"]["limit"], 32);
+            assert_eq!(health["admission"]["inference"]["active"], 32);
+            assert_eq!(health["admission"]["inference"]["rejected_total"], 1);
+            assert_eq!(health["admission"]["management"]["limit"], 4);
+            assert_eq!(health["admission"]["management"]["active"], 4);
+            assert_eq!(health["admission"]["management"]["rejected_total"], 1);
+        }
+        let held_status = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(held_status.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(management_held);
+
+        let held_status = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let held_status: Value =
+            serde_json::from_slice(&held_status.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(held_status["admission"]["inference"]["active"], 32);
+        assert_eq!(held_status["admission"]["inference"]["rejected_total"], 1);
+        assert_eq!(held_status["admission"]["management"]["active"], 1);
+        assert_eq!(held_status["admission"]["management"]["rejected_total"], 2);
+
+        state
+            .inference_admission
+            .rejected_total
+            .store(u64::MAX, Ordering::Relaxed);
+        let _saturated_rejection = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(
+            state
+                .inference_admission
+                .rejected_total
+                .load(Ordering::Relaxed),
+            u64::MAX
         );
 
         for path in ["/health/live", "/health/ready"] {
