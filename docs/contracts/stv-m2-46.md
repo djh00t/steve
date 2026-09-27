@@ -16,6 +16,8 @@ Spec sections 5, 14 and 17 require attribution, security/configuration audit eve
 
 The integrated contract must cover identity/client-key, provider credential, account binding/grant, pool and history-policy changes, and explicitly handle static configuration with no runtime actor. Every operation needs redacted actor/target/outcome and attribution, event ordering, acknowledgement and failure rules. A management state change's success when audit persistence fails is a separate decision from preserving an in-flight inference request; do not infer one from the other.
 
+The inventory must cover all planned configuration mutations, including model capabilities (#361), object-storage settings (#369), pricing versions/FX rates (#366/#367), observability settings (#370), and routing profiles/rules (#281/#286), as well as identity, credentials, grants, pools and history/retention policy. Cross-check `docs/backlog-index.md` mutation producers so the examples do not become an exhaustive whitelist that drops other configuration/security changes. Each family needs actor/target/outcome, ordering, redaction and failure semantics before its implementation consumer is ready.
+
 ## Acceptance and consumer handoff
 
 David or Cos must explicitly accept exact child revisions. Proposal publication, merge and CI do not establish policy acceptance. The integrator reconciles all three artifacts against their accepted identity and accounting dependencies before closing #110. Parent #63 stays open for its remaining work.
