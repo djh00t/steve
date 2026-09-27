@@ -59,28 +59,33 @@ chunks and delays sending them until the read loop ends. It is deliberately
 wrong code, used only in a disposable copy. Its qualification covers delayed
 first output, not its other termination behavior.
 
-For example, from a clean committed candidate with a generated Cargo.lock:
+Run the bounded Unix runner from the repository root after `make check` has
+resolved dependencies. Give it an evidence directory outside the checkout:
 
 ```sh
-mutation_dir=$(mktemp -d)
-trap 'rm -rf "$mutation_dir"' EXIT
-git archive HEAD | tar -x -C "$mutation_dir"
-cp Cargo.lock "$mutation_dir/Cargo.lock"
-(
-  cd "$mutation_dir" || exit 1
-  git apply --check tests/mutations/buffer-until-eof.patch &&
-    git apply tests/mutations/buffer-until-eof.patch &&
-    CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR="$mutation_dir/target" \
-    cargo test --offline --test e2e_provider_fixture -- --nocapture
-)
+evidence_dir=$(mktemp -d)
+python3 scripts/qualify_buffering.py --output "$evidence_dir"
 ```
 
-The final test is expected to fail at the first-frame assertion; inspect its
-output rather than treating any nonzero exit as caught. The qualification used
-a Python `TemporaryDirectory` copy of tracked files plus the generated lockfile,
-with a 600-second subprocess bound, and removed source/build directories after
-execution. The shell example shows the same patch operation; it does not add a
-new supported automation runner. #79 owns bounded CI orchestration.
+The runner copies current source files to a temporary directory, excluding
+Git metadata, `target`, caches, and output while preserving `Cargo.lock` when
+present. It uses an isolated target directory, two Cargo build jobs, offline
+Cargo, no color, and a 600-second bound for each command. Each command runs in
+its own Unix process group; remaining children are stopped after command exit
+or timeout. Temporary source and target data are removed on success or failure.
+
+It first checks that the reviewed patch matches the disposable source, then
+runs the exact `provider_fixture_controls` baseline and requires a successful
+exit with exactly one selected test. It applies the patch, rebuilds the Steve
+executable, and runs that same test. A qualification succeeds only when exactly
+one test is selected, Cargo exits 101, the named test and test result are
+reported as failed, and the log contains `response.created was not forwarded`.
+Build errors, baseline failures, patch mismatches, timeouts, bind failures, and
+other test failures remain errors.
+`result.json` records the source HEAD, dirty-tree flag, stage exit codes and
+selection counts; `baseline.log`, `fault.log`, and patch/build logs are retained.
+A dirty source tree is recorded as such and does not represent an exact-head
+claim. #79 owns CI orchestration and invokes this command on Ubuntu.
 
 ## Observed evidence and limits
 
