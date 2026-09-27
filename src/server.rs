@@ -87,6 +87,7 @@ struct AppState {
     management_bind: String,
     models: Arc<[ModelConfig]>,
     inference_admission: Arc<AdmissionBudget>,
+    management_admission: Arc<AdmissionBudget>,
     openai_upstream: Option<OpenAiUpstream>,
     anthropic_upstream: Option<AnthropicUpstream>,
     provider_probe: ProviderProbeState,
@@ -226,6 +227,7 @@ pub async fn run(
         management_bind: cfg.server.management_bind.clone(),
         models: catalogue,
         inference_admission: Arc::new(AdmissionBudget::new(32)),
+        management_admission: Arc::new(AdmissionBudget::new(4)),
         openai_upstream,
         anthropic_upstream,
         provider_probe,
@@ -343,6 +345,10 @@ fn management_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/system/drain", post(drain))
         .route("/api/v1/providers/health", get(provider_health))
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admit_management,
+        ))
         .layer(middleware::from_fn_with_state(
             RequestClass::Management(state.counters.clone()),
             track_requests,
@@ -653,6 +659,33 @@ async fn admit_inference(
     hold_guard_until_body_end(next.run(request).await, permit)
 }
 
+async fn admit_management(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let exempt = request.method() == axum::http::Method::GET
+        && matches!(request.uri().path(), "/health/live" | "/health/ready");
+    if exempt {
+        return next.run(request).await;
+    }
+
+    let Some(permit) = state.management_admission.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [
+                ("content-type", "application/json"),
+                ("cache-control", "no-store"),
+                ("retry-after", "1"),
+            ],
+            r#"{"error":{"type":"overloaded","code":"admission_limit","message":"management capacity exhausted"}}"#,
+        )
+            .into_response();
+    };
+
+    hold_guard_until_body_end(next.run(request).await, permit)
+}
+
 struct RequestCounterGuard(RequestClass);
 
 impl RequestCounterGuard {
@@ -940,6 +973,7 @@ mod tests {
             management_bind: "127.0.0.1:0".into(),
             models: models::resolve_catalogue(&[]).into(),
             inference_admission: Arc::new(AdmissionBudget::new(32)),
+            management_admission: Arc::new(AdmissionBudget::new(4)),
             openai_upstream: None,
             anthropic_upstream: Some(
                 AnthropicUpstream::new(upstream_url, Duration::from_secs(2)).unwrap(),
@@ -1012,6 +1046,118 @@ mod tests {
             bytes::Bytes::from_static(br#"{"error":"draining"}"#)
         );
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn management_admission_is_independent_and_exempts_health() {
+        let (state, _dir) = messages_test_state("http://127.0.0.1:1".into()).await;
+        let lifecycle = state.lifecycle.clone();
+        let management = management_router(state.clone());
+        let inference = inference_router(state.clone());
+        let management_request = || {
+            Request::builder()
+                .uri("/api/v1/system/status")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let response = management
+                .clone()
+                .oneshot(management_request())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            held.push(response);
+        }
+
+        let overloaded = management
+            .clone()
+            .oneshot(management_request())
+            .await
+            .unwrap();
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()["content-type"], "application/json");
+        assert_eq!(overloaded.headers()["cache-control"], "no-store");
+        assert_eq!(overloaded.headers()["retry-after"], "1");
+        assert_eq!(
+            overloaded.into_body().collect().await.unwrap().to_bytes(),
+            bytes::Bytes::from_static(
+                br#"{"error":{"type":"overloaded","code":"admission_limit","message":"management capacity exhausted"}}"#
+            )
+        );
+
+        let inference_response = inference
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inference_response.status(), StatusCode::OK);
+        inference_response.into_body().collect().await.unwrap();
+
+        for path in ["/health/live", "/health/ready"] {
+            let response = management
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().collect().await.unwrap();
+        }
+
+        drop(held.pop());
+        let resumed = management
+            .clone()
+            .oneshot(management_request())
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), StatusCode::OK);
+        held.push(resumed);
+
+        lifecycle.drain("test");
+        let draining = management
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(draining.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            draining.into_body().collect().await.unwrap().to_bytes(),
+            bytes::Bytes::from_static(
+                br#"{"error":{"type":"overloaded","code":"admission_limit","message":"management capacity exhausted"}}"#
+            )
+        );
+        drop(held);
+
+        let _probe = state
+            .provider_probe
+            .probe_gate
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
+        let busy_probe = management
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/providers/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(busy_probe.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            busy_probe.into_body().collect().await.unwrap().to_bytes(),
+            bytes::Bytes::from_static(br#"{"status":"busy"}"#)
+        );
     }
 
     #[tokio::test]
