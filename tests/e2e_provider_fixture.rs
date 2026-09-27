@@ -125,11 +125,16 @@ async fn controlled_upstream_holds_32_response_bodies() {
                     .error_for_status()
                     .expect("fixture response status")
                     .bytes_stream();
-                let first_chunk = response
-                    .next()
-                    .await
-                    .expect("response ended before first chunk")
-                    .expect("read first response chunk");
+                let mut first_chunk = Vec::with_capacity(first.len());
+                while first_chunk.len() < first.len() {
+                    let chunk = response
+                        .next()
+                        .await
+                        .expect("response ended before all first bytes")
+                        .expect("read first response bytes");
+                    first_chunk.extend_from_slice(&chunk);
+                }
+                assert_eq!(first_chunk, first);
                 (index, first_chunk, response)
             });
         }
