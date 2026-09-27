@@ -21,12 +21,33 @@ pub struct Listeners {
 
 impl SteveProcess {
     pub fn start() -> io::Result<Self> {
+        Self::start_with_upstream_urls(None, None)
+    }
+
+    pub fn start_with_upstream_urls(
+        openai_upstream_url: Option<&str>,
+        anthropic_upstream_url: Option<&str>,
+    ) -> io::Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path();
         let db_path = root.join("steve.db");
+        let mut server_config = String::from(
+            "[server]\ninference_bind = \"127.0.0.1:0\"\nmanagement_bind = \"127.0.0.1:0\"\n",
+        );
+        if let Some(url) = openai_upstream_url {
+            server_config.push_str(&format!(
+                "openai_upstream_url = {}\n",
+                toml::Value::String(url.into())
+            ));
+        }
+        if let Some(url) = anthropic_upstream_url {
+            server_config.push_str(&format!(
+                "anthropic_upstream_url = {}\n",
+                toml::Value::String(url.into())
+            ));
+        }
         let config = format!(
-            "[server]\ninference_bind = \"127.0.0.1:0\"\nmanagement_bind = \"127.0.0.1:0\"\n\
-             [database]\nurl = {}\n\
+            "{server_config}\n[database]\nurl = {}\n\
              [object_storage]\nkind = \"fs\"\nroot = {}\n\
              [queues]\naccounting_journal = {}\n\
              [logging]\nlevel = \"info\"\njson = true\n",
