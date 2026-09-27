@@ -1,0 +1,45 @@
+--- a/src/proxy/stream.rs
++++ b/src/proxy/stream.rs
+@@ -169,6 +169,7 @@
+ 
+     tokio::spawn(async move {
+         let mut upstream = std::pin::pin!(upstream);
++        let mut buffered = Vec::new();
+         loop {
+             tokio::select! {
+                 biased;
+@@ -181,16 +182,7 @@
+                 }
+                 item = poll_fn(|cx| upstream.as_mut().poll_next(cx)) => {
+                     match item {
+-                        Some(Ok(chunk)) => {
+-                            let nonempty = !chunk.is_empty();
+-                            if tx.send(Ok(chunk)).await.is_err() {
+-                                task_cancel.cancel();
+-                                break;
+-                            }
+-                            if nonempty {
+-                                task_gate.mark_output_begun();
+-                            }
+-                        }
++                        Some(Ok(chunk)) => buffered.push(chunk),
+                         Some(Err(err)) => {
+                             let _ = tx.send(Err(std::io::Error::other(err))).await;
+                             break;
+@@ -198,6 +190,16 @@
+                         None => break,
+                     }
+                 }
++            }
++        }
++        for chunk in buffered {
++            let nonempty = !chunk.is_empty();
++            if tx.send(Ok(chunk)).await.is_err() {
++                task_cancel.cancel();
++                break;
++            }
++            if nonempty {
++                task_gate.mark_output_begun();
+             }
+         }
+     });
