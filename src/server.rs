@@ -602,7 +602,7 @@ impl<G: Unpin> HttpBody for GuardedBody<G> {
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
-    let Some(_guard) = state.lifecycle.enter() else {
+    let Some(guard) = state.lifecycle.enter() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "draining"})),
@@ -615,6 +615,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
     } else {
         openai_chat::handle_chat_completions(&body)
     };
+    let streaming = matches!(&reply.body, openai_chat::ChatCompletionReplyBody::Stream(_));
     let attempt_count = reply
         .request
         .as_ref()
@@ -631,7 +632,12 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
             );
         }
     }
-    (reply.status, Json(reply.body)).into_response()
+    let response = reply.into_response();
+    if streaming {
+        hold_inflight_until_body_end(response, guard)
+    } else {
+        response
+    }
 }
 
 async fn echo(

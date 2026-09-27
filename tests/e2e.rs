@@ -269,3 +269,124 @@ async fn drain_active_stream() {
     .await
     .expect("active stream drain scenario exceeded 30 seconds");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_completions_stream_forwards_first_event_before_tail() {
+    use tokio_stream::StreamExt;
+    use upstream::{ControlledUpstream, Tail};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let first = b"data: {\"id\":\"chatcmpl_fixture\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}] }\n\n";
+        let tail = b"data: {\"id\":\"chatcmpl_fixture\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\ndata: [DONE]\n\n";
+        let mut upstream = ControlledUpstream::start(
+            "/v1/chat/completions",
+            first.as_slice(),
+            Tail::Bytes(tail.as_slice().into()),
+        )
+        .await
+        .expect("start controlled upstream");
+        let upstream_url = upstream.url();
+        let mut steve = SteveProcess::start_with_upstream_urls(Some(&upstream_url), None)
+            .expect("start Steve process with OpenAI upstream");
+        let listeners = steve
+            .wait_ready(Duration::from_secs(15))
+            .await
+            .expect("Steve listeners become ready");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .expect("build HTTP client");
+        let request = json!({
+            "model": "steve-test-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true,
+            "temperature": 0.25,
+            "metadata": {"trace": "preserve-me"}
+        });
+        let response = client
+            .post(format!("http://{}/v1/chat/completions", listeners.inference))
+            .json(&request)
+            .send()
+            .await
+            .expect("request Chat Completions stream");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/event-stream"
+        );
+        let mut response = response.bytes_stream();
+
+        let captured: Value = upstream
+            .wait_for_request(Duration::from_secs(5))
+            .await
+            .expect("upstream request timeout");
+        assert_eq!(captured, request, "forward the complete request unchanged");
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !received.ends_with(b"\n\n") {
+                let chunk = response
+                    .next()
+                    .await
+                    .expect("stream ended before the first SSE event")
+                    .expect("read first SSE event");
+                received.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("first SSE event was not forwarded");
+        assert_eq!(received, first);
+        assert!(!upstream.tail_was_sent());
+
+        let management = format!("http://{}", listeners.management);
+        let status: Value = client
+            .get(format!("{management}/api/v1/system/status"))
+            .send()
+            .await
+            .expect("request system status while stream is held")
+            .error_for_status()
+            .expect("system status response")
+            .json()
+            .await
+            .expect("parse system status");
+        assert_eq!(status["inflight"], 1, "held stream keeps its lifecycle guard");
+        assert_eq!(
+            status["active_inference_requests"], 1,
+            "held stream keeps its request counter"
+        );
+
+        upstream.release_tail();
+        while let Some(chunk) = response.next().await {
+            received.extend_from_slice(&chunk.expect("read remaining Chat Completions stream"));
+        }
+        let mut expected = first.to_vec();
+        expected.extend_from_slice(tail);
+        assert_eq!(received, expected);
+        assert!(upstream.tail_was_sent());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status: Value = client
+                    .get(format!("{management}/api/v1/system/status"))
+                    .send()
+                    .await
+                    .expect("request system status after stream EOF")
+                    .error_for_status()
+                    .expect("system status response")
+                    .json()
+                    .await
+                    .expect("parse system status");
+                if status["inflight"] == 0 && status["active_inference_requests"] == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("stream completion did not release request guards");
+    })
+    .await
+    .expect("Chat Completions stream scenario exceeded 30 seconds");
+}
