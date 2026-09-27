@@ -71,8 +71,9 @@ The runner copies current source files to a temporary directory, excluding
 Git metadata, `target`, caches, and output while preserving `Cargo.lock` when
 present. It uses an isolated target directory, two Cargo build jobs, offline
 Cargo, no color, and a 600-second bound for each command. Each command runs in
-its own Unix process group; remaining children are stopped after command exit
-or timeout. Temporary source and target data are removed on success or failure.
+its own Unix process group; the group is stopped after command exit, timeout, or
+SIGTERM, and the leader is reaped before temporary source and target data are
+removed.
 
 It first checks that the reviewed patch matches the disposable source, then
 runs the exact `provider_fixture_controls` baseline and requires a successful
@@ -85,7 +86,10 @@ other test failures remain errors.
 `result.json` records the source HEAD, dirty-tree flag, stage exit codes and
 selection counts; `baseline.log`, `fault.log`, and patch/build logs are retained.
 A dirty source tree is recorded as such and does not represent an exact-head
-claim. #79 owns CI orchestration and invokes this command on Ubuntu.
+claim. Run `python3 scripts/test_qualify_buffering.py` to verify SIGTERM cleanup
+with a child process. It checks that the error result and logs remain while
+processes and temporary source/target data are removed. #79 owns CI
+orchestration and invokes the qualification command on Ubuntu.
 
 ## Observed evidence and limits
 

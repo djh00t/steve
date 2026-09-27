@@ -12,8 +12,9 @@ import signal
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
+from types import FrameType
+
 TIMEOUT_SECONDS = 600
 TEST_NAME = "provider_fixture_controls"
 ASSERTION = "response.created was not forwarded"
@@ -24,23 +25,13 @@ class QualificationError(RuntimeError):
     """Describe a qualification stage that did not meet its contract."""
 
 
-def _stop_process_group(
-    process: subprocess.Popen[bytes], grace_seconds: float = 2.0
-) -> None:
-    """Stop any children left in a command's process group."""
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
+def _handle_termination(_signum: int, _frame: FrameType | None) -> None:
+    """Turn SIGTERM into an exception so command and temporary cleanup runs."""
+    raise QualificationError("received SIGTERM")
 
-    deadline = time.monotonic() + grace_seconds
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.05)
 
+def _stop_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Kill the command and any children left in its process group."""
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -66,8 +57,6 @@ def _run(
                 return_code = process.wait(timeout=TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                _stop_process_group(process)
-                return_code = process.wait()
         finally:
             _stop_process_group(process)
             process.wait()
@@ -265,6 +254,7 @@ def qualify(output_dir: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """Parse the command line and run qualification."""
+    signal.signal(signal.SIGTERM, _handle_termination)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--output",
