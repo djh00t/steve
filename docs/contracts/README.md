@@ -29,7 +29,9 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | [STV-M5-01 (#174)](https://github.com/djh00t/steve/issues/174) | Latency stages and percentiles | [Latency proposal](stv-m5-01.md) | PROPOSED: Decisions A/B await David/Cos acceptance and executable qualification |
 | [STV-M5-02 (#175)](https://github.com/djh00t/steve/issues/175) | EWMA and reliability rules | [EWMA/reliability proposal](stv-m5-02.md) | PROPOSED: Decisions A/B await David/Cos acceptance and executable qualification |
 | [STV-M5-03 (#176)](https://github.com/djh00t/steve/issues/176) | Normalized error taxonomy | [ErrorEvent proposal](stv-m5-03.md) | PROPOSED: David/Cos acceptance pending |
-| [STV-M5-04 (#177)](https://github.com/djh00t/steve/issues/177) | OpenTelemetry MVP boundary | `docs/contracts/stv-m5-04.md` | READY: proposal only |
+| [STV-M5-04 (#177)](https://github.com/djh00t/steve/issues/177) | OpenTelemetry MVP boundary coordination | `docs/contracts/stv-m5-04.md` | Coordination only; #545/#546/#547 own separate decisions; remains open |
+| [STV-M5-04A (#545)](https://github.com/djh00t/steve/issues/545) | OTLP signals and static configuration | [Signal proposal](stv-m5-04a.md) | PROPOSED: David/Cos acceptance pending; consumers remain blocked |
+| [STV-M5-04C (#547)](https://github.com/djh00t/steve/issues/547) | OTLP offline and loss semantics | [Loss proposal](stv-m5-04c.md) | PROPOSED: David/Cos acceptance pending; consumers remain blocked |
 | [STV-M6-01 (#186)](https://github.com/djh00t/steve/issues/186) | Deterministic routing score | `docs/contracts/stv-m6-01.md` | READY: proposal only |
 | [STV-M6-02 (#187)](https://github.com/djh00t/steve/issues/187) | Fixed/rule routing precedence | `docs/contracts/stv-m6-02.md` | READY: proposal only |
 | [STV-M6-26 (#270)](https://github.com/djh00t/steve/issues/270) | Immutable routing snapshot | `docs/contracts/stv-m6-26.md` | BLOCKED by STV-M4-04, STV-M5-01, STV-M2-09/07/41, STV-M6-02 |
