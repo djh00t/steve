@@ -2,8 +2,9 @@
 
 STV-TST-03 (#74), qualified 2026-09-27 against source commit
 `2f8df419af390ef8cee57f9a0bab144872782b11` on macOS. This qualifies the
-runner and named faults; CI wiring is #79. It is not a repository-wide mutation
-score or an accounting-durability qualification.
+runner and named faults. The PR-only `mutation` job in `.github/workflows/ci.yml`
+runs these targeted qualifications when changed paths can affect them. It is
+not a repository-wide mutation score or an accounting-durability qualification.
 
 ## Pinned tool and bounds
 
@@ -29,6 +30,10 @@ each, run an unmodified baseline, allow one mutant worker/two build tasks, and
 bound each build to 600 seconds and each test command to 30 seconds. A process
 bound expiring is **timeout**, not caught. A test's explicit five-second body
 assertion failing is caught only when the log proves the intended fault.
+PR CI first uses `--list --json` with the same source file and function filter,
+then verifies each `outcomes.json` and its referenced logs. Only the named
+mutant caught by the named assertion qualifies; a timeout, unviable mutant,
+empty selection, or other failure fails the job.
 
 ```sh
 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=2 cargo mutants --no-config \
@@ -86,10 +91,34 @@ other test failures remain errors.
 `result.json` records the source HEAD, dirty-tree flag, stage exit codes and
 selection counts; `baseline.log`, `fault.log`, and patch/build logs are retained.
 A dirty source tree is recorded as such and does not represent an exact-head
-claim. Run `python3 scripts/test_qualify_buffering.py` to verify SIGTERM cleanup
-with a child process. It checks that the error result and logs remain while
-processes and temporary source/target data are removed. #79 owns CI
-orchestration and invokes the qualification command on Ubuntu.
+claim. In CI, `make check` creates an untracked root `Cargo.lock`; the workflow
+uses a temporary Git exclude for only that generated path during source-state
+measurement and keeps the lock in the disposable source copy. No tracked source
+changes are excluded. Run `python3 -B scripts/test_qualify_buffering.py` to
+verify SIGTERM cleanup with a child process. It checks that the error result
+and logs remain while processes and temporary source/target data are removed.
+
+## PR mutation job
+
+The Ubuntu job runs only for pull requests. It checks out and logs the actual PR
+head SHA, compares base and head with `git diff --name-only --no-renames`, and
+runs only when a qualified source, test, fixture, Cargo manifest/lockfile,
+mutation patch/runner/verifier, or this workflow changed. The no-renames diff
+reports both old and new paths for a rename and includes head additions. The
+existing broad CI jobs remain in effect. The targeted job runs `make check`,
+the buffering runner's SIGTERM cleanup check, both generated mutants, and the
+reviewed buffering patch qualification. Mutation builds use cargo-mutants'
+disposable targets; inherited `CARGO_TARGET_DIR` is unset so they cannot reuse
+the candidate executable. Buffering result SHA and clean-source state are
+checked against the event head. The verifier prints compact outcome counts and
+assertion-bearing log lines with that same SHA, including when evidence is
+missing or malformed.
+
+Run its standard-library checks with:
+
+```sh
+python3 -B -m unittest discover -s scripts -p test_check_mutation_outcomes.py
+```
 
 ## Observed evidence and limits
 

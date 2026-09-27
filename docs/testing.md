@@ -81,7 +81,7 @@ No unresolved non-equivalent survivor may undermine the package's stated accepta
 
 ## Commands and gates
 
-Currently available: `make check` checks formatting, clippy and compilation; `make test` runs the current Cargo tests. The pre-commit and pre-push hooks both run `make check`; contributors also run the affected acceptance scenario. Current CI still runs the legacy broad gate on push and PR. The backlog includes the workflow change needed to align CI with the following target:
+Currently available: `make check` checks formatting, clippy and compilation; `make test` runs the current Cargo tests. The pre-commit and pre-push hooks both run `make check`; contributors also run the affected acceptance scenario. CI retains its broad push and PR gates. Its PR-only `mutation` job runs the qualified streaming mutations and buffering fault when a relevant source, test, fixture, Cargo manifest/lockfile, qualification tool, patch or workflow path changes; see [mutation qualification](mutation-qualification.md) for commands and evidence requirements. The broader target remains:
 
 - During development: run the smallest meaningful failing/passing scenario and changed-scope `make check`.
 - Before committing/pushing: `make check` plus the affected acceptance scenario. Do not run local `make quality-gates` or `make check-full`; broad quality/release gates belong to post-merge `main` CI.
