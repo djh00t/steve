@@ -269,3 +269,177 @@ async fn drain_active_stream() {
     .await
     .expect("active stream drain scenario exceeded 30 seconds");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn inference_saturation_keeps_management_live() {
+    use tokio_stream::StreamExt;
+    use upstream::{ControlledUpstream, Tail};
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let first = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fixture\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"steve-test-model\"}}\n\n";
+        let tail = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture\",\"status\":\"completed\"}}\n\n";
+        let mut upstream = ControlledUpstream::start(
+            "/v1/responses",
+            first.as_slice(),
+            Tail::Bytes(tail.as_slice().into()),
+        )
+        .await
+        .expect("start controlled upstream");
+        let upstream_url = upstream.url();
+        let mut steve = SteveProcess::start_with_upstream_urls(Some(&upstream_url), None)
+            .expect("start Steve process with controlled upstream");
+        let listeners = steve
+            .wait_ready(Duration::from_secs(15))
+            .await
+            .expect("Steve listeners become ready");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("build HTTP client");
+        let inference = format!("http://{}/v1/responses", listeners.inference);
+        let mut requests = tokio::task::JoinSet::new();
+        for index in 0..32 {
+            let client = client.clone();
+            let inference = inference.clone();
+            requests.spawn(async move {
+                let response = client
+                    .post(inference)
+                    // Held bodies must outlive every bounded management probe.
+                    .timeout(Duration::from_secs(65))
+                    .json(&json!({"model":"steve-test-model","input":format!("held {index}"),"stream":true}))
+                    .send()
+                    .await
+                    .expect("send held inference request");
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                let mut response = response.bytes_stream();
+                let mut received = Vec::with_capacity(first.len());
+                while !received.ends_with(b"\n\n") {
+                    let chunk = response
+                        .next()
+                        .await
+                        .expect("stream ended before first SSE event")
+                        .expect("read first SSE event");
+                    received.extend_from_slice(&chunk);
+                }
+                assert_eq!(received, first);
+                (received, response)
+            });
+        }
+
+        let mut responses = Vec::with_capacity(32);
+        while let Some(result) = requests.join_next().await {
+            responses.push(result.expect("held inference request task failed"));
+        }
+        let captured = upstream
+            .wait_for_requests(32, Duration::from_secs(5))
+            .await
+            .expect("upstream did not receive 32 inference requests");
+        assert_eq!(captured.len(), 32);
+        assert_eq!(upstream.request_count(), 32);
+        assert_eq!(upstream.tail_count(), 0);
+
+        let rejected = client
+            .post(&inference)
+            .json(&json!({"model":"steve-test-model","input":"overflow","stream":true}))
+            .send()
+            .await
+            .expect("send inference request beyond capacity");
+        assert_eq!(rejected.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.headers()[reqwest::header::CONTENT_TYPE], "application/json");
+        assert_eq!(rejected.headers()[reqwest::header::CACHE_CONTROL], "no-store");
+        assert_eq!(rejected.headers()[reqwest::header::RETRY_AFTER], "1");
+        assert_eq!(
+            rejected.bytes().await.expect("read overload response").as_ref(),
+            br#"{"error":{"type":"overloaded","code":"admission_limit","message":"inference capacity exhausted"}}"#
+        );
+        assert_eq!(upstream.request_count(), 32, "rejected request reached upstream");
+
+        let management = format!("http://{}", listeners.management);
+        let live: Value = client
+            .get(format!("{management}/health/live"))
+            .send()
+            .await
+            .expect("request management liveness while saturated")
+            .error_for_status()
+            .expect("management liveness status")
+            .json()
+            .await
+            .expect("parse management liveness");
+        assert_eq!(live["status"], "ok");
+        assert_eq!(live["admission"]["inference"]["active"], 32);
+        assert_eq!(live["admission"]["inference"]["rejected_total"], 1);
+
+        let ready: Value = client
+            .get(format!("{management}/health/ready"))
+            .send()
+            .await
+            .expect("request management readiness while saturated")
+            .error_for_status()
+            .expect("management readiness status")
+            .json()
+            .await
+            .expect("parse management readiness");
+        assert_eq!(ready["status"], "ready");
+        assert_eq!(ready["admission"]["inference"]["active"], 32);
+        assert_eq!(ready["admission"]["inference"]["rejected_total"], 1);
+
+        let status: Value = client
+            .get(format!("{management}/api/v1/system/status"))
+            .send()
+            .await
+            .expect("request management status while saturated")
+            .error_for_status()
+            .expect("management status response")
+            .json()
+            .await
+            .expect("parse management status");
+        assert_eq!(status["admission"]["inference"]["limit"], 32);
+        assert_eq!(status["admission"]["inference"]["active"], 32);
+        assert_eq!(status["admission"]["inference"]["rejected_total"], 1);
+        assert_eq!(status["admission"]["management"]["active"], 1);
+        assert_eq!(status["active_inference_requests"], 32);
+        assert_eq!(status["active_management_requests"], 1);
+
+        let version: Value = client
+            .get(format!("{management}/api/v1/system/version"))
+            .send()
+            .await
+            .expect("request management version while saturated")
+            .error_for_status()
+            .expect("management version response")
+            .json()
+            .await
+            .expect("parse management version");
+        assert_eq!(version["name"], "steve");
+
+        upstream.release_tail();
+        for (received, response) in &mut responses {
+            let mut complete = received.clone();
+            while let Some(chunk) = response.next().await {
+                complete.extend_from_slice(&chunk.expect("read released inference stream"));
+            }
+            assert_eq!(complete, [first.as_slice(), tail.as_slice()].concat());
+        }
+        assert_eq!(upstream.tail_count(), 32);
+
+        let recovered = client
+            .post(&inference)
+            .json(&json!({"model":"steve-test-model","input":"recovered","stream":true}))
+            .send()
+            .await
+            .expect("send inference request after releasing permits");
+        assert_eq!(recovered.status(), reqwest::StatusCode::OK);
+        let mut recovered = recovered.bytes_stream();
+        let mut complete = Vec::new();
+        while let Some(chunk) = recovered.next().await {
+            complete.extend_from_slice(&chunk.expect("read recovered inference stream"));
+        }
+        assert_eq!(complete, [first.as_slice(), tail.as_slice()].concat());
+        assert_eq!(upstream.request_count(), 33);
+        assert_eq!(upstream.tail_count(), 33);
+    })
+    .await
+    .expect("inference saturation scenario exceeded 60 seconds");
+}
