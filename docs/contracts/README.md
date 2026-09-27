@@ -6,7 +6,7 @@ This index reflects the 2026-09-27 backlog snapshot. Paths are **planned artifac
 | --- | --- | --- | --- |
 | [STV-M0-01 (#84)](https://github.com/djh00t/steve/issues/84) | Coordinate accounting failure contracts | Child artifacts below; former umbrella draft is unaccepted | COORDINATION: #483/#484/#485 plus consumer handoff |
 | [STV-M0-16 (#483)](https://github.com/djh00t/steve/issues/483) | Incident/admission state, HTTP/status contract and incident lifetime | [Incident/admission proposal](stv-m0-16.md) | PROPOSED: restart/disposition decision pending David/Cos acceptance; implementation remains blocked |
-| [STV-M0-17 (#484)](https://github.com/djh00t/steve/issues/484) | Journal ownership and replacement overlap | `docs/contracts/stv-m0-17.md` | READY: proposal only; parallel with #483 |
+| [STV-M0-17 (#484)](https://github.com/djh00t/steve/issues/484) | Journal ownership and replacement overlap | [Ownership proposal](stv-m0-17.md) | PROPOSED: David/Cos acceptance and platform qualification pending; runtime consumers blocked |
 | [STV-M0-18 (#485)](https://github.com/djh00t/steve/issues/485) | Drain/replay acknowledgement and completion evidence | `docs/contracts/stv-m0-18.md` | BLOCKED on accepted #483/#484 artifacts |
 | [STV-M0-09 (#90)](https://github.com/djh00t/steve/issues/90) | Independent admission budgets | [Admission proposal](stv-m0-09.md) | Accepted via [#466](https://github.com/djh00t/steve/pull/466) at `63f9cce`; implementation leaves #468-470 merged, composed #92 remains separate |
 | [STV-M1-04 (#94)](https://github.com/djh00t/steve/issues/94) | Chat accounting event identity, payload and emission cardinality | `docs/m1-acceptance.md` (contract note only) | BLOCKED by STV-M0-01 (#84) |
