@@ -19,7 +19,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, oneshot, watch, Mutex},
+    sync::{mpsc, watch},
     task::JoinHandle,
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -32,21 +32,25 @@ pub enum Tail {
 }
 
 struct UpstreamState {
-    request_tx: watch::Sender<Option<Value>>,
+    request_tx: mpsc::Sender<Value>,
     request_count: Arc<AtomicUsize>,
+    request_overflow: Arc<AtomicBool>,
     first: Bytes,
     tail: Tail,
-    release_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    release_tx: watch::Sender<bool>,
     tail_sent: Arc<AtomicBool>,
+    tail_count: Arc<AtomicUsize>,
     body_drop_tx: watch::Sender<bool>,
 }
 
 pub struct ControlledUpstream {
     addr: SocketAddr,
-    request_rx: watch::Receiver<Option<Value>>,
+    request_rx: mpsc::Receiver<Value>,
     request_count: Arc<AtomicUsize>,
-    release_tx: Option<oneshot::Sender<()>>,
+    request_overflow: Arc<AtomicBool>,
+    release_tx: watch::Sender<bool>,
     tail_sent: Arc<AtomicBool>,
+    tail_count: Arc<AtomicUsize>,
     body_drop_rx: watch::Receiver<bool>,
     server: Option<JoinHandle<()>>,
 }
@@ -55,18 +59,22 @@ impl ControlledUpstream {
     pub async fn start(path: &str, first: impl Into<Bytes>, tail: Tail) -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        let (request_tx, request_rx) = watch::channel(None);
+        let (request_tx, request_rx) = mpsc::channel(32);
         let request_count = Arc::new(AtomicUsize::new(0));
+        let request_overflow = Arc::new(AtomicBool::new(false));
         let tail_sent = Arc::new(AtomicBool::new(false));
-        let (release_tx, release_rx) = oneshot::channel();
+        let tail_count = Arc::new(AtomicUsize::new(0));
+        let (release_tx, _) = watch::channel(false);
         let (body_drop_tx, body_drop_rx) = watch::channel(false);
         let state = UpstreamState {
             request_tx,
             request_count: request_count.clone(),
+            request_overflow: request_overflow.clone(),
             first: first.into(),
             tail,
-            release_rx: Arc::new(Mutex::new(Some(release_rx))),
+            release_tx: release_tx.clone(),
             tail_sent: tail_sent.clone(),
+            tail_count: tail_count.clone(),
             body_drop_tx,
         };
         let app = Router::new()
@@ -80,8 +88,10 @@ impl ControlledUpstream {
             addr,
             request_rx,
             request_count,
-            release_tx: Some(release_tx),
+            request_overflow,
+            release_tx,
             tail_sent,
+            tail_count,
             body_drop_rx,
             server: Some(server),
         })
@@ -92,29 +102,53 @@ impl ControlledUpstream {
     }
 
     pub async fn wait_for_request(&mut self, timeout: Duration) -> Result<Value, String> {
+        self.wait_for_requests(1, timeout)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "request channel closed".to_owned())
+    }
+
+    pub async fn wait_for_requests(
+        &mut self,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Value>, String> {
+        if count > 32 {
+            return Err(format!("cannot capture {count} requests; maximum is 32"));
+        }
         tokio::time::timeout(timeout, async {
-            loop {
-                if let Some(request) = self.request_rx.borrow_and_update().clone() {
-                    return Ok(request);
+            let mut requests = Vec::with_capacity(count);
+            while requests.len() < count {
+                if self.request_overflow.load(Ordering::SeqCst) {
+                    return Err(
+                        "upstream request capture exceeded its 32-request capacity".to_owned()
+                    );
                 }
-                self.request_rx
-                    .changed()
-                    .await
-                    .map_err(|_| "request channel closed".to_owned())?;
+                match self.request_rx.recv().await {
+                    Some(request) => requests.push(request),
+                    None => return Err("request channel closed".to_owned()),
+                }
             }
+            if self.request_overflow.load(Ordering::SeqCst) {
+                return Err("upstream request capture exceeded its 32-request capacity".to_owned());
+            }
+            Ok(requests)
         })
         .await
-        .map_err(|_| "timed out waiting for upstream request".to_owned())?
+        .map_err(|_| "timed out waiting for upstream requests".to_owned())?
     }
 
     pub fn release_tail(&mut self) {
-        if let Some(release) = self.release_tx.take() {
-            let _ = release.send(());
-        }
+        self.release_tx.send_replace(true);
     }
 
     pub fn tail_was_sent(&self) -> bool {
         self.tail_sent.load(Ordering::SeqCst)
+    }
+
+    pub fn tail_count(&self) -> usize {
+        self.tail_count.load(Ordering::SeqCst)
     }
 
     pub async fn wait_for_body_drop(&mut self, timeout: Duration) -> Result<(), String> {
@@ -140,7 +174,7 @@ impl ControlledUpstream {
 
 impl Drop for ControlledUpstream {
     fn drop(&mut self) {
-        self.release_tx.take();
+        self.release_tx.send_replace(true);
         if let Some(server) = self.server.take() {
             server.abort();
         }
@@ -153,7 +187,9 @@ async fn serve_request(State(state): State<Arc<UpstreamState>>, body: Body) -> R
         Err(_) => Value::Null,
     };
     state.request_count.fetch_add(1, Ordering::SeqCst);
-    let _ = state.request_tx.send(Some(request));
+    if state.request_tx.try_send(request).is_err() {
+        state.request_overflow.store(true, Ordering::SeqCst);
+    }
 
     let (body_tx, body_rx) = mpsc::channel(2);
     if body_tx
@@ -163,16 +199,19 @@ async fn serve_request(State(state): State<Arc<UpstreamState>>, body: Body) -> R
     {
         return Response::new(Body::empty());
     }
-    let release_rx = state.release_rx.lock().await.take();
+    let mut release_rx = state.release_tx.subscribe();
     let tail = state.tail.clone();
     let tail_sent = state.tail_sent.clone();
+    let tail_count = state.tail_count.clone();
     tokio::spawn(async move {
-        let Some(release_rx) = release_rx else {
+        if !*release_rx.borrow() {
+            tokio::select! {
+                result = release_rx.changed() => if result.is_err() { return; },
+                _ = body_tx.closed() => return,
+            }
+        }
+        if body_tx.is_closed() {
             return;
-        };
-        tokio::select! {
-            result = release_rx => if result.is_err() { return; },
-            _ = body_tx.closed() => return,
         }
         let result = match tail {
             Tail::Bytes(bytes) => body_tx.send(Ok(bytes)).await,
@@ -180,6 +219,7 @@ async fn serve_request(State(state): State<Arc<UpstreamState>>, body: Body) -> R
         };
         if result.is_ok() {
             tail_sent.store(true, Ordering::SeqCst);
+            tail_count.fetch_add(1, Ordering::SeqCst);
         }
     });
 
