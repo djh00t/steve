@@ -236,6 +236,7 @@ async fn drain_active_stream() {
         let readiness: Value = readiness.json().await.expect("parse readiness response");
         assert_eq!(readiness["status"], "not_ready");
         assert_eq!(readiness["phase"], "draining");
+        assert_eq!(readiness["inflight"], 1, "held stream keeps its lifecycle guard");
 
         let live = client
             .get(format!("http://{}/health/live", listeners.management))
