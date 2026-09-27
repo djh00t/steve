@@ -41,6 +41,9 @@ The optional macOS Swift menu-bar app can:
 
 - [Architecture and product specification](docs/specs/2026-09-26-steve-gateway.md)
 - [MVP plan and backlog](docs/plans/2026-09-26-steve-mvp.md)
+- [Reviewed work-package index](docs/backlog-index.md)
+- [Work-package readiness and parallel delivery](docs/work-packages.md)
+- [Testing policy and rollout](docs/testing.md)
 
 ## Planned CLI
 
@@ -108,7 +111,7 @@ Invalid JSON or a missing or empty required field returns HTTP 400 with the Stev
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Before pushing, run `make check` and `make quality-gates`.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Before pushing, run `make check` and the affected acceptance scenario. Broad quality gates run in hosted CI.
 
 ## License
 
