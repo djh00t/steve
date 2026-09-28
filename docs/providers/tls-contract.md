@@ -1,6 +1,8 @@
-# STV-PROV-38: upstream TLS backend and trust contract (proposal)
+# STV-PROV-38: upstream TLS backend and trust contract (accepted policy)
 
-**Decision requested:** pin reqwest to `=0.12.28`, enable Rustls with bundled WebPKI roots, and allow one optional additive PEM CA bundle. This is a planning proposal reviewed against `0f5f72506e28fb172c5339dddc9733482a5f41e5`; production `main` remains `6d635f546b66514ed96393803806e12015add4dc`. No runtime or dependency change is included here. Rustls plus bundled roots avoids platform-native TLS differences and keeps public trust roots explicit and portable across developer, test, and server environments.
+**Accepted policy:** pin reqwest to `=0.12.28`, enable Rustls with bundled WebPKI roots, and allow one optional additive PEM CA bundle. This policy was accepted by review and merge of [PR #494](https://github.com/djh00t/steve/pull/494), exact accepted producer revision `1cb584f137dc648ef98a726def5756b7b63b429c`, merged as `624cf29e549ec01b062dcd25655ee083b6b8f6b9` on 2026-09-27. It was reviewed against `0f5f72506e28fb172c5339dddc9733482a5f41e5`; production `main` remained `6d635f546b66514ed96393803806e12015add4dc` at review time. No runtime or dependency change is included here. Rustls plus bundled roots avoids platform-native TLS differences and keeps public trust roots explicit and portable across developer, test, and server environments.
+
+The policy content below is immutable from the accepted producer revision. Later edits in this file only synchronize handoff ownership, issue links, and prerequisite wording; they do not change the accepted TLS policy.
 
 ## Contract
 
@@ -82,21 +84,27 @@ Versioned references: [reqwest 0.12.28 features](https://docs.rs/reqwest/0.12.28
 
 ## Sequenced handoffs
 
-Issue bodies are the dispatch briefs; accepted producer revisions and actual fixture APIs must be present before any leaf becomes READY. #497 follows both positive protocol proofs, and #498 follows #497 because they edit the same test file.
+Issue bodies are the dispatch briefs; accepted producer revisions and actual fixture APIs must be present before any fixture-dependent leaf becomes READY. #133 coordinates three serial 5–10 minute children: #602 pins the manifest dependencies, #603 owns the trusted TLS fixture and cleanup, and #604 owns negative certificate variants. #497 follows both positive protocol proofs, and #498 follows #497 because they edit the same test file.
 
 Each implementation handoff is intended to fit 5–10 active minutes. All handoffs require accepted #491 and met prerequisites #72 and #73. Live issue state checked on 2026-09-27 confirms #72 and #73 are closed. Commands are future acceptance gates and become runnable as the named tests are added.
 
 | Handoff | Additional dependencies (all require accepted #491 and met #72/#73) | Owns | Exact acceptance command |
 |---|---|---|---|
-| `tls-fixture` (#133), 8–10 min | none | `Cargo.toml`, new `tests/support/upstream_tls.rs`, fixed files in `tests/fixtures/tls/`, new `tests/e2e_tls_fixture.rs` | `cargo test --all-features --test e2e_tls_fixture stv_prov_38_fixture_acceptance -- --exact` |
+| [`tls-dependency-pin` (#602)](https://github.com/djh00t/steve/issues/602) | #491, #72, #73 | `Cargo.toml` exact reqwest/tokio-rustls entries | `cargo test --all-features --test e2e_provider_fixture provider_fixture_controls -- --exact` |
+| [`trusted-tls-fixture` (#603)](https://github.com/djh00t/steve/issues/603) | #602 | `tests/support/upstream_tls.rs`, trusted fixture files and cleanup; the helper accepts a caller Axum `Router` because `src/test_upstream::router()` is binary-private | `cargo test --all-features --test e2e_tls_fixture stv_prov_38_fixture_acceptance -- --exact` |
+| [`negative-cert-variants` (#604)](https://github.com/djh00t/steve/issues/604) | #603 | Negative certificate fixture variants for later rejection tests | `cargo test --all-features --test e2e_tls_fixture stv_prov_38_certificate_variants -- --exact` |
 | [`provider-url-policy` (#495)](https://github.com/djh00t/steve/issues/495), 5–7 min | none | `src/proxy/mod.rs`, both upstream modules | `cargo test --all-features proxy::tests::http_requires_numeric_loopback -- --exact` |
-| [`shared-upstream-tls` (#496)](https://github.com/djh00t/steve/issues/496), 8–10 min | #133, provider URL policy | `src/config.rs`, `src/server.rs`, both upstream modules, `tests/support/process.rs`, new `tests/e2e_upstream_tls.rs`, `config.example.toml`, affected README config snippets | `cargo test --all-features --test e2e_upstream_tls stv_prov_38_shared_trust_acceptance -- --exact` |
-| `openai-upstream-https` (#134), 5–8 min | #133, URL policy, shared TLS | `tests/e2e.rs` | `cargo test --all-features --test e2e stv_prov_32_acceptance -- --exact` |
+| [`shared-upstream-tls` (#496)](https://github.com/djh00t/steve/issues/496), 8–10 min | #603, provider URL policy | `src/config.rs`, `src/server.rs`, both upstream modules, `tests/support/process.rs`, new `tests/e2e_upstream_tls.rs`, `config.example.toml`, affected README config snippets | `cargo test --all-features --test e2e_upstream_tls stv_prov_38_shared_trust_acceptance -- --exact` |
+| `openai-upstream-https` (#134), 5–8 min | #603, URL policy, shared TLS | `tests/e2e.rs` | `cargo test --all-features --test e2e stv_prov_32_acceptance -- --exact` |
 | `anthropic-upstream-https` (#135), 5–8 min | #134 and its prerequisites | `tests/e2e_messages.rs` | `cargo test --all-features --test e2e_messages stv_prov_36_acceptance -- --exact` |
-| [`tls-certificate-rejection` (#497)](https://github.com/djh00t/steve/issues/497), 8–10 min | #496, #134, #135; negative cert fixtures from #133 | focused tests in `tests/e2e_upstream_tls.rs` | `cargo test --all-features --test e2e_upstream_tls stv_prov_38_certificate_rejection -- --exact` |
+| [`tls-certificate-rejection` (#497)](https://github.com/djh00t/steve/issues/497), 8–10 min | #496, #134, #135; negative cert fixtures from #604 | focused tests in `tests/e2e_upstream_tls.rs` | `cargo test --all-features --test e2e_upstream_tls stv_prov_38_certificate_rejection -- --exact` |
 | [`tls-redirect-rejection` (#498)](https://github.com/djh00t/steve/issues/498), 5–8 min | #496, #134, #135, #497 (single writer) | `tests/e2e_upstream_tls.rs` | `cargo test --all-features --test e2e_upstream_tls stv_prov_38_redirect_rejection -- --exact` |
 
-**#133:** owns the exact manifest entries: `reqwest = { version = "=0.12.28", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"] }` and dev-only `tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring", "tls12"] }`. Build one small Axum-compatible TLS listener with at most four concurrent handshakes, a five-second handshake timeout, orderly shutdown, and task cleanup. Its fixture acceptance uses reqwest trusting the checked-in CA and captures one request. Check in fixtures needed by later leaves with isolated failures: the trusted-CA leaf has SAN `IP:127.0.0.1` and validity `2020-01-01` through `2035-01-01`; the unknown-CA leaf has the same correct SAN and validity dates but chains only to an untrusted CA; the wrong-IP-SAN leaf chains to the trusted CA, is valid `2020-01-01` through `2035-01-01`, and has a non-loopback IP SAN; the expired leaf chains to the trusted CA, has SAN `IP:127.0.0.1`, and is valid only `2020-01-01` through `2021-01-01`. Server leaf/key are DER for tokio-rustls; reqwest's trusted CA bundle is PEM. Keep public CA PEM separate from server private key. Do not add rcgen, pemfile, or a test framework.
+**#133 coordination:** serialize #602, #603, and #604. #602 owns the exact manifest entries: `reqwest = { version = "=0.12.28", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots"] }` and dev-only `tokio-rustls = { version = "=0.26.5", default-features = false, features = ["ring", "tls12"] }`.
+
+**#603:** builds one small Axum-compatible TLS listener with at most four concurrent handshakes, a five-second handshake timeout, orderly shutdown, and task cleanup. Its helper accepts a caller Axum `Router` because `src/test_upstream::router()` is binary-private. The trusted fixture acceptance uses reqwest trusting the checked-in CA and captures one request. The trusted-CA leaf has SAN `IP:127.0.0.1` and validity `2020-01-01` through `2035-01-01`; server leaf/key are DER for tokio-rustls; reqwest's trusted CA bundle is PEM. Keep public CA PEM separate from server private key. Do not add rcgen, pemfile, or a test framework.
+
+**#604:** owns the isolated negative certificate variants needed by later rejection tests: unknown issuer with correct SAN/current validity; trusted issuer with wrong IP SAN/current validity; trusted issuer with correct IP SAN/expired validity. The expired leaf remains valid only `2020-01-01` through `2021-01-01`.
 
 **`provider-url-policy`:** add one crate-private validator in `src/proxy/mod.rs`; call it from both existing URL normalizers, preserving protocol-specific path normalization and error types. Accept absolute HTTPS. Accept HTTP only for host strings that parse directly to loopback `IpAddr` (`127.0.0.0/8` or `::1`); reject non-loopback IPs and every hostname, including `localhost`, without DNS lookup. The test covers accepted HTTPS, IPv4/IPv6 loopback, `localhost`, and non-loopback IP for both protocol normalizers.
 
@@ -104,16 +112,16 @@ Each implementation handoff is intended to fit 5–10 active minutes. All handof
 
 **#134 and #135:** each adds its named real-process protocol round trip through the TLS fixture and verifies the captured request; each also checks numeric-loopback HTTP compatibility using the existing fixture. They do not edit the manifest or shared helpers. #135 follows #134 by dependency order.
 
-**`tls-certificate-rejection`:** use the isolated fixtures supplied by #133: unknown issuer with correct SAN/current validity; trusted issuer with wrong IP SAN/current validity; trusted issuer with correct IP SAN/expired validity. Through the configured OpenAI and Anthropic HTTPS request paths, assert each fails for its single intended validation fault. The expired-leaf test checks UTC is within `2026–2034`; outside that window it fails as fixture setup and cannot report a pass.
+**`tls-certificate-rejection`:** use the isolated fixtures supplied by #604: unknown issuer with correct SAN/current validity; trusted issuer with wrong IP SAN/current validity; trusted issuer with correct IP SAN/expired validity. Through the configured OpenAI and Anthropic HTTPS request paths, assert each fails for its single intended validation fault. The expired-leaf test checks UTC is within `2026–2034`; outside that window it fails as fixture setup and cannot report a pass.
 
 **`tls-redirect-rejection`:** return a redirect from the TLS upstream and assert OpenAI, Anthropic, and provider health do not follow it. Provider health may retain its existing “3xx reachable” status, but the redirect target must receive no request. URL rejection for non-loopback HTTP is covered by `provider-url-policy`.
 
 ## Prerequisites and future gates (not implemented)
 
-- #133 must prove the reqwest-enabled local TLS fixture; the provider E2E leaves use it rather than plain HTTP alone.
+- #602 must pin the reqwest-enabled manifest entries; #603 must prove the trusted local TLS fixture and cleanup; #604 must provide isolated negative certificate variants. The provider E2E leaves use these children rather than plain HTTP alone.
 - The shared seam must fail startup for invalid CA input and apply the same trust roots to OpenAI, Anthropic, and health. Its acceptance is a real process test, not a duplicate parser-only test.
 - #134 and #135 prove trusted HTTPS and numeric-loopback HTTP compatibility. The named certificate-rejection and redirect-rejection handoffs are required before calling TLS qualification complete.
 - Tests use fixed local fixtures and no live provider, account, key, or credential. Time-sensitive expired-certificate checks require UTC `2026–2034` and fail as fixture setup outside that interval.
 - Provider/account credential binding remains outside this contract and follows the accepted account schema (#100). Gateway listener TLS is a separate boundary and remains unqualified here.
 
-#491 is **READY for exact-artifact review/acceptance only**. All commands above are future acceptance gates; none has been run for this proposal.
+#491 is **ACCEPTED via PR #494** at exact producer revision `1cb584f137dc648ef98a726def5756b7b63b429c` (merge `624cf29e549ec01b062dcd25655ee083b6b8f6b9`). All commands above are future acceptance gates; none has been run as runtime qualification for this policy.

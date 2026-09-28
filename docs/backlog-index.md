@@ -36,9 +36,9 @@ Replacing one leaf with three brought that snapshot to **390 active leaves**, in
 
 ## Provider transport contract decomposition
 
-[#132](https://github.com/djh00t/steve/issues/132) now coordinates two bounded proposals: [STV-PROV-38 TLS trust #491](https://github.com/djh00t/steve/issues/491) is READY to propose; [STV-PROV-39 credential transport #492](https://github.com/djh00t/steve/issues/492) waits for the existing account schema/lifecycle contract [#100](https://github.com/djh00t/steve/issues/100). Their artifact ownership is disjoint; provider work must not redefine account grants, secret references or rotation.
+[#132](https://github.com/djh00t/steve/issues/132) now coordinates two bounded workstreams: [STV-PROV-38 TLS trust #491](https://github.com/djh00t/steve/issues/491) is accepted via [PR #494](https://github.com/djh00t/steve/pull/494), exact policy revision `1cb584f137dc648ef98a726def5756b7b63b429c`, merge `624cf29e549ec01b062dcd25655ee083b6b8f6b9`; [STV-PROV-39 credential transport #492](https://github.com/djh00t/steve/issues/492) remains blocked on the existing account schema/lifecycle contract [#100](https://github.com/djh00t/steve/issues/100). Their artifact ownership is disjoint; provider work must not redefine account grants, secret references or rotation.
 
-The TLS fixture #133 and HTTPS-only OpenAI/Anthropic leaves #134/#135 depend on accepted #491 rather than the whole coordination parent or account schema. #133 owns the manifest; URL policy #495 and shared CA/client wiring #496 precede protocol proof #134, then #135. Certificate rejection #497 follows both positive proofs; redirect refusal #498 follows #497 to serialize their shared test file. They remain BLOCKED until exact trust/fixture inputs and executable prerequisites exist. Account-sourced credential isolation remains in #398 after #492 and its account prerequisites; no acceptance requirement was removed. The [TLS proposal](providers/tls-contract.md) and issue briefs record exact ownership, acceptance commands and mutation expectations; confirm accepted producer interfaces before dispatch.
+The TLS fixture coordination parent #133 and HTTPS-only OpenAI/Anthropic leaves #134/#135 depend on accepted #491 rather than the whole coordination parent or account schema. #133 serializes #602/#603/#604: #602 is READY for the Cargo.toml pin, while #603 is BLOCKED on #602 and owns the trusted TLS fixture, caller Axum `Router` seam and cleanup; #604 is BLOCKED on #603 and owns negative certificate variants. URL policy #495 is READY now that #491, #72 and #73 are satisfied. Shared CA/client wiring #496 follows #495 and #603 before protocol proof #134, then #135; certificate rejection #497 follows both positive proofs, and redirect refusal #498 follows #497 to serialize their shared test file. #134/#135/#496–#498 remain BLOCKED pending their executable briefs, fixture interfaces, version refresh and runtime qualification. Account-sourced credential isolation remains in #398 after #492 and its account prerequisites; no acceptance requirement was removed. The [TLS contract](providers/tls-contract.md) and issue briefs record exact ownership, acceptance commands and mutation expectations; confirm accepted producer interfaces before dispatch.
 
 Replacing #132 with two proposal leaves brought that snapshot to 391 active leaves. Tracking four TLS implementation/qualification handoffs (#495–#498) brought that snapshot to **395 active leaves**. Coordination parents #84/#91/#132 are excluded; the original table below remains historical. [The provider contract index](providers/transport-auth-contract.md) points to the child artifacts and acceptance gates, not a second credential schema.
 
@@ -52,7 +52,7 @@ Replacing one leaf with three brings the current inventory to **397 active leave
 
 ## Original 385-item readiness snapshot (historical)
 
-These counts describe the original audit, not today's issue graph. For example, the current provider table has 40 active leaves plus coordination parent #132 (2 proposal-ready, 29 blocked, 9 deferred; TLS proposal awaits acceptance); its historical row below remains 35. Use current issue bodies and the decomposition sections for dispatch.
+These counts describe the original audit, not today's issue graph. The #491 TLS policy is accepted and #495 is READY; the historical provider row below remains 35. Use current issue bodies and the decomposition sections for dispatch.
 
 | Area | READY | BLOCKED | DEFERRED | Total |
 | --- | ---: | ---: | ---: | ---: |
@@ -226,12 +226,15 @@ Start with the real-process harness and independent contract decisions. Complete
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
 | [STV-PROV-02](https://github.com/djh00t/steve/issues/132) | Coordinate TLS and credential transport contracts | COORDINATION | #491, #492 |
-| [STV-PROV-38](https://github.com/djh00t/steve/issues/491) | Define upstream TLS backend and trust contract | READY to propose | None |
+| [STV-PROV-38](https://github.com/djh00t/steve/issues/491) | Define upstream TLS backend and trust contract | ACCEPTED via [#494](https://github.com/djh00t/steve/pull/494), exact policy revision `1cb584f137dc648ef98a726def5756b7b63b429c`, merge `624cf29e549ec01b062dcd25655ee083b6b8f6b9` | #495 READY; #133 coordinates #602/#603/#604 (#602 READY, #603/#604 BLOCKED); #134/#135/#496–#498 remain BLOCKED pending executable briefs, fixture interfaces, version refresh and runtime qualification |
 | [STV-PROV-39](https://github.com/djh00t/steve/issues/492) | Bind accepted account credentials to upstream protocol requests | BLOCKED | #100 |
-| [STV-PROV-37](https://github.com/djh00t/steve/issues/133) | Provide and qualify local TLS upstream fixture | BLOCKED | #491, #72, #73 |
+| [STV-PROV-37](https://github.com/djh00t/steve/issues/133) | Coordinate local TLS upstream fixture children #602/#603/#604 | COORDINATION | #491, #72, #73 |
+| [TLS dependency pin](https://github.com/djh00t/steve/issues/602) | Pin exact TLS dependencies in Cargo.toml | READY | #491, #72, #73 |
+| [Trusted TLS fixture](https://github.com/djh00t/steve/issues/603) | Provide trusted TLS fixture, caller Axum Router seam and cleanup | BLOCKED | #602 |
+| [Negative certificate variants](https://github.com/djh00t/steve/issues/604) | Provide isolated negative certificate fixtures | BLOCKED | #603 |
 | [STV-PROV-32](https://github.com/djh00t/steve/issues/134) | Wire OpenAI upstream through HTTPS transport | BLOCKED | #491, #133, #495, #496, #72, #73 |
 | [STV-PROV-36](https://github.com/djh00t/steve/issues/135) | Wire Anthropic upstream through HTTPS transport | BLOCKED | #491, #133, #134, #495, #496, #72, #73 |
-| [STV-PROV-40](https://github.com/djh00t/steve/issues/495) | Enforce provider URL scheme and loopback policy | BLOCKED | #491, #72, #73 |
+| [STV-PROV-40](https://github.com/djh00t/steve/issues/495) | Enforce provider URL scheme and loopback policy | READY | #491, #72, #73 |
 | [STV-PROV-41](https://github.com/djh00t/steve/issues/496) | Wire shared additive TLS trust through provider clients | BLOCKED | #491, #133, #495, #72, #73 |
 | [STV-PROV-42](https://github.com/djh00t/steve/issues/497) | Reject invalid TLS certificates on both providers | BLOCKED | #491, #133, #496, #134, #135, #72, #73 |
 | [STV-PROV-43](https://github.com/djh00t/steve/issues/498) | Prevent redirects across requests and health probes | BLOCKED | #491, #133, #496, #134, #135, #497, #72, #73 |
