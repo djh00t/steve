@@ -2,7 +2,7 @@
 
 Snapshot: 2026-09-27; source base `6630577677f40e4ba6a491074f0c91a57d7ddd6e`.
 
-Review tracking: [#60](https://github.com/djh00t/steve/issues/60). GitHub issues contain the complete briefs. This index records the review snapshot; read the linked issue and current merge state before dispatch.
+Review tracking: [#60](https://github.com/djh00t/steve/issues/60). GitHub issues contain the complete briefs. The readiness counts below are historical; package rows are current dispatch pointers, so read the linked issue and current merge state before dispatch.
 
 Use the [delivery phases and workstreams](delivery-plan.md), [contract registry](contracts/README.md), [readiness rules](work-packages.md) and [testing policy](testing.md). Estimates are 5–10 active minutes after prerequisites land. BLOCKED leaves require their contract owner to supply exact approved details before dispatch; deferred discovery is not an implementation-ready feature.
 
@@ -10,7 +10,7 @@ Use the [delivery phases and workstreams](delivery-plan.md), [contract registry]
 
 The original 385-item inventory was a planning snapshot, not 385 dispatchable junior tasks. The second review at base `a55309d` examined every row for size, executable prerequisites, contract/schema completeness and shared ownership. Each linked area parent records the per-package corrections. Split/combine recommendations preserve existing IDs until the relevant contract producer can publish concrete replacements and update all dependency links.
 
-Of the original 22 READY rows, 21 prepare decisions or qualification proposals; only the process smoke package is implementation work, accepted on main via PR #457. No unresolved money, security, routing or platform choice is approved by a READY label. Integration acceptance gates verify composed results and are not ten-minute feature implementations. The counts below remain the original review snapshot; consult current issues before dispatch.
+Of the original 22 READY rows, 21 prepare decisions or qualification proposals; only the process smoke package is implementation work, accepted on main via PR #457. No unresolved money, security, routing or platform choice is approved by a READY label. Integration acceptance gates verify composed results and are not ten-minute feature implementations. The counts below remain the original review snapshot; package rows and current issue bodies are the dispatch source.
 
 The immediate test split adds [STV-TST-11 (#458)](https://github.com/djh00t/steve/issues/458) for held object-store writes and [STV-TST-12 (#459)](https://github.com/djh00t/steve/issues/459) for Messages disconnect proof. STV-TST-02 now owns the provider fixture; STV-TST-04 owns Responses only; Chat stays in #33. After adding those two test slices and retiring four duplicate registration-only packages, that review produced 383 active packages; the original summary below remains a 385-row audit snapshot.
 
@@ -36,9 +36,9 @@ Replacing one leaf with three brought that snapshot to **390 active leaves**, in
 
 ## Provider transport contract decomposition
 
-[#132](https://github.com/djh00t/steve/issues/132) now coordinates two bounded proposals: [STV-PROV-38 TLS trust #491](https://github.com/djh00t/steve/issues/491) is READY to propose; [STV-PROV-39 credential transport #492](https://github.com/djh00t/steve/issues/492) waits for the existing account schema/lifecycle contract [#100](https://github.com/djh00t/steve/issues/100). Their artifact ownership is disjoint; provider work must not redefine account grants, secret references or rotation.
+[#132](https://github.com/djh00t/steve/issues/132) now coordinates two bounded workstreams: [STV-PROV-38 TLS trust #491](https://github.com/djh00t/steve/issues/491) is accepted via [PR #494](https://github.com/djh00t/steve/pull/494), exact policy revision `1cb584f137dc648ef98a726def5756b7b63b429c`, merge `624cf29e549ec01b062dcd25655ee083b6b8f6b9`; [STV-PROV-39 credential transport #492](https://github.com/djh00t/steve/issues/492) remains blocked on the existing account schema/lifecycle contract [#100](https://github.com/djh00t/steve/issues/100). Their artifact ownership is disjoint; provider work must not redefine account grants, secret references or rotation.
 
-The TLS fixture #133 and HTTPS-only OpenAI/Anthropic leaves #134/#135 depend on accepted #491 rather than the whole coordination parent or account schema. #133 owns the manifest; URL policy #495 and shared CA/client wiring #496 precede protocol proof #134, then #135. Certificate rejection #497 follows both positive proofs; redirect refusal #498 follows #497 to serialize their shared test file. They remain BLOCKED until exact trust/fixture inputs and executable prerequisites exist. Account-sourced credential isolation remains in #398 after #492 and its account prerequisites; no acceptance requirement was removed. The [TLS proposal](providers/tls-contract.md) and issue briefs record exact ownership, acceptance commands and mutation expectations; confirm accepted producer interfaces before dispatch.
+The TLS fixture coordination parent #133 and HTTPS-only OpenAI/Anthropic leaves #134/#135 depend on accepted #491 rather than the whole coordination parent or account schema. #133 serializes #602/#603/#604: #602 is READY for the Cargo.toml pin, while #603 is BLOCKED on #602 and owns the trusted TLS fixture, caller Axum `Router` seam and cleanup; #604 is BLOCKED on #603 and owns negative certificate variants. URL policy #495 is READY now that #491, #72 and #73 are satisfied. Shared CA/client wiring #496 follows #495 and #603 before protocol proof #134, then #135; certificate rejection #497 follows both positive proofs, and redirect refusal #498 follows #497 to serialize their shared test file. #134/#135/#496–#498 remain BLOCKED pending their executable briefs, fixture interfaces, version refresh and runtime qualification. Account-sourced credential isolation remains in #398 after #492 and its account prerequisites; no acceptance requirement was removed. The [TLS contract](providers/tls-contract.md) and issue briefs record exact ownership, acceptance commands and mutation expectations; confirm accepted producer interfaces before dispatch.
 
 Replacing #132 with two proposal leaves brought that snapshot to 391 active leaves. Tracking four TLS implementation/qualification handoffs (#495–#498) brought that snapshot to **395 active leaves**. Coordination parents #84/#91/#132 are excluded; the original table below remains historical. [The provider contract index](providers/transport-auth-contract.md) points to the child artifacts and acceptance gates, not a second credential schema.
 
@@ -52,7 +52,7 @@ Replacing one leaf with three brings the current inventory to **397 active leave
 
 ## Original 385-item readiness snapshot (historical)
 
-These counts describe the original audit, not today's issue graph. For example, the current provider table has 40 active leaves plus coordination parent #132 (2 proposal-ready, 29 blocked, 9 deferred; TLS proposal awaits acceptance); its historical row below remains 35. Use current issue bodies and the decomposition sections for dispatch.
+These counts describe the original audit, not today's issue graph. The #491 TLS policy is accepted and #495 is READY; the historical provider row below remains 35. Use current issue bodies and the decomposition sections for dispatch.
 
 | Area | READY | BLOCKED | DEFERRED | Total |
 | --- | ---: | ---: | ---: | ---: |
@@ -85,46 +85,48 @@ Start with the real-process harness and independent contract decisions. Complete
 
 ## Packages
 
+`CLOSED` records GitHub issue lifecycle only; it does not imply implemented behavior or composed acceptance, even when the issue body retains blocked labels.
+
 ### Testing
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
 | [STV-TST-01](https://github.com/djh00t/steve/issues/72) | Add a real Steve process smoke harness | ACCEPTED (PR #457) | None |
-| [STV-TST-02](https://github.com/djh00t/steve/issues/73) | Add a deterministic held-tail provider fixture | BLOCKED | #72 |
-| [STV-TST-03](https://github.com/djh00t/steve/issues/74) | Qualify targeted Rust mutation testing | BLOCKED | #72, #73 |
-| [STV-TST-04](https://github.com/djh00t/steve/issues/75) | Prove Responses disconnect cancels upstream without replay | BLOCKED | #72, #73 |
-| [STV-TST-05](https://github.com/djh00t/steve/issues/76) | Prove official OpenAI SDK streaming compatibility | BLOCKED | #72, #75, #33 |
-| [STV-TST-06](https://github.com/djh00t/steve/issues/77) | Prove official Anthropic SDK streaming compatibility | BLOCKED | #72, #459 |
-| [STV-TST-07](https://github.com/djh00t/steve/issues/78) | Wire process smoke into PR and main CI | BLOCKED | #72 |
-| [STV-TST-08](https://github.com/djh00t/steve/issues/79) | Wire targeted mutations into PR CI | BLOCKED | #74, #78 |
+| [STV-TST-02](https://github.com/djh00t/steve/issues/73) | Add a deterministic held-tail provider fixture | CLOSED | #72 |
+| [STV-TST-03](https://github.com/djh00t/steve/issues/74) | Qualify targeted Rust mutation testing | CLOSED | #72, #73 |
+| [STV-TST-04](https://github.com/djh00t/steve/issues/75) | Prove Responses disconnect cancels upstream without replay | CLOSED | #72, #73 |
+| [STV-TST-05](https://github.com/djh00t/steve/issues/76) | Prove official OpenAI SDK streaming compatibility | CLOSED | #72, #75, #33 |
+| [STV-TST-06](https://github.com/djh00t/steve/issues/77) | Prove official Anthropic SDK streaming compatibility | CLOSED | #72, #459 |
+| [STV-TST-07](https://github.com/djh00t/steve/issues/78) | Wire process smoke into PR and main CI | CLOSED | #72 |
+| [STV-TST-08](https://github.com/djh00t/steve/issues/79) | Wire targeted mutations into PR CI | CLOSED | #74, #78 |
 | [STV-TST-09](https://github.com/djh00t/steve/issues/82) | Replace doctor-only backend checks with parity E2E on main | BLOCKED | #80, #81, #78 |
-| [STV-TST-10](https://github.com/djh00t/steve/issues/83) | Run official SDK smoke in CI | BLOCKED | #76, #77 |
-| [STV-TST-11](https://github.com/djh00t/steve/issues/458) | Add a held S3 PutObject fixture | BLOCKED | #72, #73 |
-| [STV-TST-12](https://github.com/djh00t/steve/issues/459) | Prove Messages disconnect cancels upstream without replay | BLOCKED | #72, #73 |
+| [STV-TST-10](https://github.com/djh00t/steve/issues/83) | Run official SDK smoke in CI | CLOSED | #76, #77 |
+| [STV-TST-11](https://github.com/djh00t/steve/issues/458) | Add a held S3 PutObject fixture | CLOSED | #72, #73 |
+| [STV-TST-12](https://github.com/djh00t/steve/issues/459) | Prove Messages disconnect cancels upstream without replay | CLOSED | #72, #73 |
 
 ### Post-M0 reliability
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-M0-05](https://github.com/djh00t/steve/issues/80) | Prove SQLite and PostgreSQL serve parity | BLOCKED | #72 |
-| [STV-M0-06](https://github.com/djh00t/steve/issues/81) | Prove filesystem and S3 object-store parity | BLOCKED | #72 |
+| [STV-M0-05](https://github.com/djh00t/steve/issues/80) | Prove SQLite and PostgreSQL serve parity | CLOSED | #72 |
+| [STV-M0-06](https://github.com/djh00t/steve/issues/81) | Prove filesystem and S3 object-store parity | CLOSED | #72 |
 | [STV-M0-01](https://github.com/djh00t/steve/issues/84) | Coordinate accounting failure contracts | COORDINATION | #483, #484, #485 |
 | [STV-M0-02](https://github.com/djh00t/steve/issues/85) | Preserve journal framing and report corrupt tails | BLOCKED | #84, #72 |
 | [STV-M0-03](https://github.com/djh00t/steve/issues/86) | Retry accounting reconciliation without startup loss | BLOCKED | #84, #72 |
 | [STV-M0-04](https://github.com/djh00t/steve/issues/87) | Prove idempotent journal replay after partial DB success | BLOCKED | #84, #72 |
-| [STV-M0-07](https://github.com/djh00t/steve/issues/88) | Prove noncritical queue pressure leaves management responsive | BLOCKED | #72, #458 |
-| [STV-M0-08](https://github.com/djh00t/steve/issues/89) | Prove live-but-unready drain with an active stream | BLOCKED | #72, #73 |
-| [STV-M0-09](https://github.com/djh00t/steve/issues/90) | Define independent admission-budget contract | READY | None |
-| [STV-M0-10](https://github.com/djh00t/steve/issues/91) | Coordinate listener admission implementation | COORDINATION | #468, #469, #470 |
-| [STV-M0-11](https://github.com/djh00t/steve/issues/92) | Prove listener budgets with a real process | BLOCKED | #91, #72, #73, #471 |
+| [STV-M0-07](https://github.com/djh00t/steve/issues/88) | Prove noncritical queue pressure leaves management responsive | CLOSED | #72, #458 |
+| [STV-M0-08](https://github.com/djh00t/steve/issues/89) | Prove live-but-unready drain with an active stream | CLOSED | #72, #73 |
+| [STV-M0-09](https://github.com/djh00t/steve/issues/90) | Define independent admission-budget contract | CLOSED | None |
+| [STV-M0-10](https://github.com/djh00t/steve/issues/91) | Coordinate listener admission implementation | CLOSED | #468, #469, #470 |
+| [STV-M0-11](https://github.com/djh00t/steve/issues/92) | Prove listener budgets with a real process | CLOSED | #91, #72, #73, #471 |
 | [STV-M0-12](https://github.com/djh00t/steve/issues/93) | Bound, circuit-break and observe history-worker failures | BLOCKED | #458 |
 
 ### M1
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-M1-03](https://github.com/djh00t/steve/issues/33) | Verify Chat disconnect cancellation and no replay | BLOCKED | #39, #73 |
-| [STV-M1-04](https://github.com/djh00t/steve/issues/94) | Define the Chat accounting event contract | BLOCKED | #84 |
+| [STV-M1-03](https://github.com/djh00t/steve/issues/33) | Verify Chat disconnect cancellation and no replay | CLOSED | #39, #73 |
+| [STV-M1-04](https://github.com/djh00t/steve/issues/94) | Define the Chat accounting event contract | BLOCKED | accepted #483; #484/#485 remain runtime recovery-qualification inputs |
 | [STV-M1-05](https://github.com/djh00t/steve/issues/95) | Enqueue completed nonstream Chat attempts | BLOCKED | #94 |
 | [STV-M1-06](https://github.com/djh00t/steve/issues/96) | Enqueue streamed Chat attempts at terminal state | BLOCKED | #94, #33 |
 | [STV-M1-07](https://github.com/djh00t/steve/issues/97) | Prove saturated Chat accounting does not delay SSE | BLOCKED | #96, #73, #84 |
@@ -141,7 +143,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M2-02](https://github.com/djh00t/steve/issues/100) | Freeze provider account, credentials, access and binding contract | BLOCKED | #99 |
 | [STV-M2-03](https://github.com/djh00t/steve/issues/101) | Freeze account pool policy, routing and affinity semantics | BLOCKED | #100 |
 | [STV-M2-04](https://github.com/djh00t/steve/issues/105) | Add relational organisation, user and client schema | BLOCKED | #99, #103, #104, #72 |
-| [STV-M2-14](https://github.com/djh00t/steve/issues/106) | Freeze listener exposure and management authentication contract | READY | None |
+| [STV-M2-14](https://github.com/djh00t/steve/issues/106) | Freeze listener exposure and management authentication contract | BLOCKED | #576, #577, #590 |
 | [STV-M2-59](https://github.com/djh00t/steve/issues/107) | Add PostgreSQL organisation, user and client schema | BLOCKED | #105, #104, #102, #72 |
 | [STV-M2-05](https://github.com/djh00t/steve/issues/108) | Authenticate local clients and attach resolved identity | BLOCKED | #99, #105, #106, #107, #72 |
 | [STV-M2-17](https://github.com/djh00t/steve/issues/109) | Authenticate every management route | BLOCKED | #99, #108, #106, #73, #72 |
@@ -187,11 +189,11 @@ Start with the real-process harness and independent contract decisions. Complete
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-M3-40](https://github.com/djh00t/steve/issues/102) | Freeze migration versioning and backend parity contract | READY | None |
-| [STV-M3-13](https://github.com/djh00t/steve/issues/103) | Apply versioned SQLite migrations | BLOCKED | #102, #72 |
-| [STV-M3-44](https://github.com/djh00t/steve/issues/104) | Apply PostgreSQL side of migration inventory | BLOCKED | #103, #102, #72 |
+| [STV-M3-40](https://github.com/djh00t/steve/issues/102) | Freeze migration versioning and backend parity contract | ACCEPTED via [#489](https://github.com/djh00t/steve/pull/489), exact revision `a8c9b729f7067272a1622bb4f4a9cf637efa13b0` (merge `4472ca59896465fcf27b0d1df1d5218552d80efd`) | None; runtime consumers remain blocked |
+| [STV-M3-13](https://github.com/djh00t/steve/issues/103) | Apply versioned SQLite migrations | BLOCKED | Accepted #102 contract; #72; owned runner and exact scenario remain unimplemented |
+| [STV-M3-44](https://github.com/djh00t/steve/issues/104) | Apply PostgreSQL side of migration inventory | BLOCKED | Accepted #102 contract; #103, #72; owned runner and exact scenario remain unimplemented |
 | [STV-M3-01](https://github.com/djh00t/steve/issues/116) | Freeze session association and conversation-ID contract | BLOCKED | #99 |
-| [STV-M3-03](https://github.com/djh00t/steve/issues/117) | Add session and external-identifier schema | BLOCKED | #115, #116, #103, #104, #72 |
+| [STV-M3-03](https://github.com/djh00t/steve/issues/117) | Add session and external-identifier schema | BLOCKED | #500, #105, #107, #116, #103, #104, #72 |
 | [STV-M3-04](https://github.com/djh00t/steve/issues/119) | Resolve canonical Steve session IDs and return the session header | BLOCKED | #108, #118, #116, #117, #72 |
 | [STV-M3-05](https://github.com/djh00t/steve/issues/120) | Persist logical request-to-session and turn links | BLOCKED | #117, #118, #119, #103, #104, #72 |
 | [STV-M3-02](https://github.com/djh00t/steve/issues/121) | Freeze content capture, metadata-only and retention contract | BLOCKED | #116 |
@@ -224,12 +226,15 @@ Start with the real-process harness and independent contract decisions. Complete
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
 | [STV-PROV-02](https://github.com/djh00t/steve/issues/132) | Coordinate TLS and credential transport contracts | COORDINATION | #491, #492 |
-| [STV-PROV-38](https://github.com/djh00t/steve/issues/491) | Define upstream TLS backend and trust contract | READY to propose | None |
+| [STV-PROV-38](https://github.com/djh00t/steve/issues/491) | Define upstream TLS backend and trust contract | ACCEPTED via [#494](https://github.com/djh00t/steve/pull/494), exact policy revision `1cb584f137dc648ef98a726def5756b7b63b429c`, merge `624cf29e549ec01b062dcd25655ee083b6b8f6b9` | #495 READY; #133 coordinates #602/#603/#604 (#602 READY, #603/#604 BLOCKED); #134/#135/#496–#498 remain BLOCKED pending executable briefs, fixture interfaces, version refresh and runtime qualification |
 | [STV-PROV-39](https://github.com/djh00t/steve/issues/492) | Bind accepted account credentials to upstream protocol requests | BLOCKED | #100 |
-| [STV-PROV-37](https://github.com/djh00t/steve/issues/133) | Provide and qualify local TLS upstream fixture | BLOCKED | #491, #72, #73 |
+| [STV-PROV-37](https://github.com/djh00t/steve/issues/133) | Coordinate local TLS upstream fixture children #602/#603/#604 | COORDINATION | #491, #72, #73 |
+| [TLS dependency pin](https://github.com/djh00t/steve/issues/602) | Pin exact TLS dependencies in Cargo.toml | READY | #491, #72, #73 |
+| [Trusted TLS fixture](https://github.com/djh00t/steve/issues/603) | Provide trusted TLS fixture, caller Axum Router seam and cleanup | BLOCKED | #602 |
+| [Negative certificate variants](https://github.com/djh00t/steve/issues/604) | Provide isolated negative certificate fixtures | BLOCKED | #603 |
 | [STV-PROV-32](https://github.com/djh00t/steve/issues/134) | Wire OpenAI upstream through HTTPS transport | BLOCKED | #491, #133, #495, #496, #72, #73 |
 | [STV-PROV-36](https://github.com/djh00t/steve/issues/135) | Wire Anthropic upstream through HTTPS transport | BLOCKED | #491, #133, #134, #495, #496, #72, #73 |
-| [STV-PROV-40](https://github.com/djh00t/steve/issues/495) | Enforce provider URL scheme and loopback policy | BLOCKED | #491, #72, #73 |
+| [STV-PROV-40](https://github.com/djh00t/steve/issues/495) | Enforce provider URL scheme and loopback policy | READY | #491, #72, #73 |
 | [STV-PROV-41](https://github.com/djh00t/steve/issues/496) | Wire shared additive TLS trust through provider clients | BLOCKED | #491, #133, #495, #72, #73 |
 | [STV-PROV-42](https://github.com/djh00t/steve/issues/497) | Reject invalid TLS certificates on both providers | BLOCKED | #491, #133, #496, #134, #135, #72, #73 |
 | [STV-PROV-43](https://github.com/djh00t/steve/issues/498) | Prevent redirects across requests and health probes | BLOCKED | #491, #133, #496, #134, #135, #497, #72, #73 |
@@ -476,7 +481,7 @@ Legacy V1 issues #422–#424 are listed here as M8 requirements inputs; their ID
 | [STV-M8-10](https://github.com/djh00t/steve/issues/346) | Detect supported local container runtimes | BLOCKED | #337, #340 |
 | [STV-M8-11](https://github.com/djh00t/steve/issues/348) | Present onboarding choices | BLOCKED | #342, #343, #344, #345, #346, #340 |
 | [STV-M8-12](https://github.com/djh00t/steve/issues/347) | Connect to a remote Steve deployment | BLOCKED | #339, #343, #106, #109, #340 |
-| [STV-V1-12](https://github.com/djh00t/steve/issues/422) | Discover native supervisor/coordinator requirements | READY | #1, #89 |
+| [STV-V1-12](https://github.com/djh00t/steve/issues/422) | Discover native supervisor/coordinator requirements | CLOSED | #1, #89 |
 | [STV-V1-13](https://github.com/djh00t/steve/issues/423) | Discover signed release and versioned installation requirements | BLOCKED | #336 |
 | [STV-V1-14](https://github.com/djh00t/steve/issues/424) | Discover upgrade cutover and rollback requirements | BLOCKED | #1, #89, #422, #423 |
 | [STV-M8-13](https://github.com/djh00t/steve/issues/341) | Decompose native installation | BLOCKED | #336, #337, #293, #423 |
