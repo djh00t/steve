@@ -187,9 +187,9 @@ Start with the real-process harness and independent contract decisions. Complete
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-M3-40](https://github.com/djh00t/steve/issues/102) | Freeze migration versioning and backend parity contract | READY | None |
-| [STV-M3-13](https://github.com/djh00t/steve/issues/103) | Apply versioned SQLite migrations | BLOCKED | #102, #72 |
-| [STV-M3-44](https://github.com/djh00t/steve/issues/104) | Apply PostgreSQL side of migration inventory | BLOCKED | #103, #102, #72 |
+| [STV-M3-40](https://github.com/djh00t/steve/issues/102) | Freeze migration versioning and backend parity contract | ACCEPTED via [#489](https://github.com/djh00t/steve/pull/489), exact revision `a8c9b729f7067272a1622bb4f4a9cf637efa13b0` (merge `4472ca59896465fcf27b0d1df1d5218552d80efd`) | None; runtime consumers remain blocked |
+| [STV-M3-13](https://github.com/djh00t/steve/issues/103) | Apply versioned SQLite migrations | BLOCKED | Accepted #102 contract; #72; owned runner and exact scenario remain unimplemented |
+| [STV-M3-44](https://github.com/djh00t/steve/issues/104) | Apply PostgreSQL side of migration inventory | BLOCKED | Accepted #102 contract; #103, #72; owned runner and exact scenario remain unimplemented |
 | [STV-M3-01](https://github.com/djh00t/steve/issues/116) | Freeze session association and conversation-ID contract | BLOCKED | #99 |
 | [STV-M3-03](https://github.com/djh00t/steve/issues/117) | Add session and external-identifier schema | BLOCKED | #115, #116, #103, #104, #72 |
 | [STV-M3-04](https://github.com/djh00t/steve/issues/119) | Resolve canonical Steve session IDs and return the session header | BLOCKED | #108, #118, #116, #117, #72 |
