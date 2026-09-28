@@ -2,10 +2,10 @@
 //!
 //! Posts JSON to OpenAI-compatible chat completions and Responses endpoints.
 //! Responses SSE chunks are returned unbuffered so ingress can stop the
-//! upstream by dropping the stream. The base URL must be absolute `http`;
-//! this slice is aimed at the deterministic test upstream.
+//! upstream by dropping the stream. The base URL must be absolute `https` or
+//! numeric-loopback `http`.
 
-use super::stream::CancelToken;
+use super::{stream::CancelToken, validate_upstream_url};
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
@@ -59,7 +59,8 @@ pub struct OpenAiUpstream {
 }
 
 impl OpenAiUpstream {
-    /// `base_url` is an absolute `http` origin or an OpenAI-style `/v1` root.
+    /// `base_url` is an absolute `https` or numeric-loopback `http` origin,
+    /// with an optional OpenAI-style `/v1` root and no embedded credentials.
     /// `timeout` bounds JSON calls and the response-header wait for SSE.
     pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, SteveError> {
         let base_url = normalize_base_url(base_url.into())?;
@@ -361,16 +362,9 @@ fn normalize_base_url(raw: String) -> Result<String, SteveError> {
     let url = reqwest::Url::parse(&trimmed).map_err(|err| SteveError::Config {
         message: format!("base URL is invalid: {err}"),
     })?;
-    if url.scheme() != "http" {
-        return Err(SteveError::Config {
-            message: "base URL must use http".into(),
-        });
-    }
-    if url.host_str().is_none() {
-        return Err(SteveError::Config {
-            message: "base URL is missing a host".into(),
-        });
-    }
+    validate_upstream_url(&trimmed, &url).map_err(|message| SteveError::Config {
+        message: message.into(),
+    })?;
 
     Ok(trimmed)
 }
@@ -466,7 +460,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_base_url_and_zero_timeout() {
-        for base_url in ["", "   ", "/v1", "127.0.0.1:18080", "https://127.0.0.1/v1"] {
+        for base_url in ["", "   ", "/v1", "127.0.0.1:18080", "ftp://127.0.0.1/v1"] {
             let err = OpenAiUpstream::new(base_url, Duration::from_secs(1)).expect_err(base_url);
             match err {
                 SteveError::Config { message } => assert!(!message.is_empty()),

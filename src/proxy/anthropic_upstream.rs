@@ -3,10 +3,10 @@
 //! Posts JSON to `{base_url}/v1/messages` (or `{base_url}/messages` when the
 //! base URL already ends in `/v1`). Non-streaming calls parse the JSON body.
 //! Streaming calls return the SSE bytes as they arrive and do not buffer the
-//! upstream body. The base URL must be absolute `http`; this slice is aimed
-//! at the deterministic test upstream. Ingress wiring is intentionally absent.
+//! upstream body. The base URL must be absolute `https` or numeric-loopback
+//! `http`.
 
-use super::stream::CancelToken;
+use super::{stream::CancelToken, validate_upstream_url};
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
@@ -61,7 +61,8 @@ pub struct AnthropicUpstream {
 }
 
 impl AnthropicUpstream {
-    /// `base_url` is an absolute `http` origin or an Anthropic-style `/v1` root.
+    /// `base_url` is an absolute `https` or numeric-loopback `http` origin,
+    /// with an optional Anthropic-style `/v1` root and no embedded credentials.
     /// `timeout` bounds the non-streaming call and, for SSE, the wait for
     /// response headers. SSE body reads are not cut off by that timeout.
     pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, AnthropicError> {
@@ -282,16 +283,9 @@ fn normalize_base_url(raw: String) -> Result<String, AnthropicError> {
     let url = reqwest::Url::parse(&trimmed).map_err(|err| AnthropicError::Config {
         message: format!("base URL is invalid: {err}"),
     })?;
-    if url.scheme() != "http" {
-        return Err(AnthropicError::Config {
-            message: "base URL must use http".into(),
-        });
-    }
-    if url.host_str().is_none() {
-        return Err(AnthropicError::Config {
-            message: "base URL is missing a host".into(),
-        });
-    }
+    validate_upstream_url(&trimmed, &url).map_err(|message| AnthropicError::Config {
+        message: message.into(),
+    })?;
 
     Ok(trimmed)
 }
@@ -385,7 +379,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_base_url_and_zero_timeout() {
-        for base_url in ["", "   ", "/v1", "127.0.0.1:18080", "https://127.0.0.1/v1"] {
+        for base_url in ["", "   ", "/v1", "127.0.0.1:18080", "ftp://127.0.0.1/v1"] {
             let err = AnthropicUpstream::new(base_url, Duration::from_secs(1)).expect_err(base_url);
             match err {
                 AnthropicError::Config { message } => assert!(!message.is_empty()),
