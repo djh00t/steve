@@ -16,6 +16,12 @@ CONTRACT = Path(__file__).resolve().parents[1] / "docs/contracts/stv-m2-60.md"
 ATTRIBUTION_KEYS = {"organisation_id", "user_id", "client_id"}
 
 
+def require(condition: bool, message: str) -> None:
+    """Keep fixture checks active when Python optimization is enabled."""
+    if not condition:
+        raise AssertionError(message)
+
+
 def examples() -> dict[str, object]:
     """Load the JSON fixture embedded in the contract artifact."""
     source = CONTRACT.read_text(encoding="utf-8")
@@ -62,7 +68,7 @@ def must_reject_sql(
     try:
         db.execute(sql, values)
     except sqlite3.IntegrityError as exc:
-        assert expected_error in str(exc), str(exc)
+        require(expected_error in str(exc), str(exc))
         return
     raise AssertionError(f"accepted invalid SQL write: {sql}")
 
@@ -71,15 +77,15 @@ def check_wire(data: dict[str, object]) -> tuple[str, str, str]:
     """Exercise complete, legacy, partial, malformed and unknown wire cases."""
     request = data["complete_request"]
     attempt = data["complete_attempt"]
-    assert isinstance(request, dict) and isinstance(attempt, dict)
-    assert "attribution" in request and "attribution" in attempt
+    require(isinstance(request, dict) and isinstance(attempt, dict), "missing records")
+    require("attribution" in request and "attribution" in attempt, "missing member")
     captured = attribution(request)
-    assert captured is not None and attribution(attempt) == captured
+    require(captured is not None and attribution(attempt) == captured, "tuple drift")
     for key in ("legacy_request_attribution_absent", "legacy_request_attribution_null"):
         record = data[key]
-        assert isinstance(record, dict) and attribution(record) is None
+        require(isinstance(record, dict) and attribution(record) is None, key)
     partial = data["reject_partial_attribution"]
-    assert isinstance(partial, dict)
+    require(isinstance(partial, dict), "missing partial case")
     must_reject(partial)
     must_reject({"attribution": {"organisation_id": captured[0]}})
     must_reject({"attribution": dict(request["attribution"], extra="unknown")})
@@ -138,12 +144,15 @@ def check_relationships(
                     JOIN organisations o ON o.id = u.organisation_id
                     WHERE c.id = ? AND o.inactive_at IS NULL
                     AND u.inactive_at IS NULL AND c.inactive_at IS NULL"""
-        assert db.execute(active, (captured[2],)).fetchone() == captured
+        require(
+            db.execute(active, (captured[2],)).fetchone() == captured,
+            "active chain",
+        )
 
         missing = data["reject_user_with_missing_organisation"]
-        assert isinstance(missing, dict)
+        require(isinstance(missing, dict), "missing parent case")
         row = missing["user_row"]
-        assert isinstance(row, dict)
+        require(isinstance(row, dict), "missing user row")
         must_reject_sql(
             db,
             "INSERT INTO users VALUES (?, ?, ?, ?, ?)",
@@ -173,10 +182,12 @@ def check_relationships(
             "UPDATE organisations SET inactive_at = ? WHERE id = ?",
             (stamp, captured[0]),
         )
-        assert db.execute(active, (captured[2],)).fetchone() is None
-        assert db.execute(
-            "SELECT id FROM clients WHERE id = ?", (captured[2],)
-        ).fetchone()
+        require(db.execute(active, (captured[2],)).fetchone() is None, "inactive chain")
+        require(
+            db.execute("SELECT id FROM clients WHERE id = ?", (captured[2],)).fetchone()
+            is not None,
+            "lost historical Client",
+        )
         must_reject_sql(
             db,
             "DELETE FROM organisations WHERE id = ?",
@@ -184,7 +195,10 @@ def check_relationships(
             "FOREIGN KEY constraint failed",
         )
         for table in ("organisations", "users", "clients"):
-            assert db.execute(f"SELECT count(*) FROM {table}").fetchone() == (1,)
+            require(
+                db.execute(f"SELECT count(*) FROM {table}").fetchone() == (1,),
+                table,
+            )
 
 
 def main() -> None:
