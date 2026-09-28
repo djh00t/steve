@@ -40,7 +40,7 @@ UUIDv7 uses the existing `uuid` dependency and current `Uuid` request/attempt ID
 
 For both `Request` and `RequestAttempt`, newly serialized values must contain the `attribution` member. Its value is either JSON `null` or an object with exactly the three required, non-null members `organisation_id`, `user_id`, and `client_id`, each a canonical UUID string. This all-or-null choice has no representation for partial ancestry. On legacy deserialization only, an absent member and explicit `null` both mean unknown attribution and map to `None`; a present object with a missing, null, or malformed ID is rejected. Unknown members inside the attribution object are rejected; this proposal does not alter outer `Request`/`RequestAttempt` unknown-member handling. The implementation consumer must encode the legacy absent-member rule explicitly rather than infer it from current Serde defaults.
 
-### Documentation fixtures (not executable evidence)
+### Contract examples and executable reference fixture
 
 All IDs and timestamps below are synthetic contract examples, not observed runtime values. Complete attribution is identical on the logical request and its attempt; legacy absence/null means no trusted tuple; partial attribution and a missing parent are rejected.
 
@@ -103,7 +103,7 @@ All IDs and timestamps below are synthetic contract examples, not observed runti
 }
 ```
 
-These are illustrative documentation fixtures only. Before contract acceptance, the registry requires an executable fixture and its exact runnable command/evidence at the reviewed revision. No command result or runtime qualification is claimed here.
+Run `python3 -B scripts/check_stv_m2_60.py` from the repository root. The standard-library [reference fixture](../../scripts/check_stv_m2_60.py) executes the JSON cases above and checks canonical UUIDv7 attribution, legacy absence/null, rejection of partial/unknown/malformed tuples, SQLite parent-link enforcement, inactive-ancestor resolution, and restricted deletion. It prints `STV-M2-60 contract fixture: passed (reference semantics only)` on success. This checks the proposed contract examples; it does not qualify Steve's future principal runtime, PostgreSQL migrations, or acceptance by David/Cos.
 
 ## Compatibility and migration scope
 
