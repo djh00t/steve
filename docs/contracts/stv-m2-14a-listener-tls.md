@@ -1,6 +1,6 @@
 # STV-M2-14A (#576): listener and remote TLS boundary proposal
 
-**State: proposal for review only; no boundary below is accepted.** Review, READY status, or merge of this file does not accept a security policy or authorize implementation. David or Cos must accept this exact artifact revision before #106 can consume it. TLS implementation and qualification remain separate work owned by an explicitly named owner.
+**State: proposal for review only; no boundary below is accepted yet.** Publication, green CI, or READY status alone is not acceptance. David or Cos reviewing and merging this exact artifact revision accepts the proposal for #106, but does not authorize runtime implementation or deployment. TLS implementation and qualification remain separate work owned by an explicitly named owner.
 
 ## Scope and current behavior
 
