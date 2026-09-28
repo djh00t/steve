@@ -9,6 +9,7 @@ use process::SteveProcess;
 use serde_json::{json, Value};
 use sqlx::{postgres::PgPoolOptions, sqlite::SqlitePoolOptions};
 use std::time::Duration;
+use tempfile::tempdir;
 use tokio::time::Instant;
 
 #[tokio::test]
@@ -19,6 +20,126 @@ async fn database_backend_contract() {
             .into_string()
             .expect("STEVE_TEST_POSTGRES_URL must be valid UTF-8");
         run_database_backend_contract(Some(&database_url)).await;
+    }
+}
+
+#[tokio::test]
+async fn sqlite_rejects_migration_ledger_drift() {
+    for (case, rows) in [
+        ("valid v1", vec![(1_i64, "m0_foundation")]),
+        ("name drift", vec![(1_i64, "m0_changed")]),
+        (
+            "gap and future version",
+            vec![(1_i64, "m0_foundation"), (3_i64, "v0003_future")],
+        ),
+    ] {
+        let temp = tempdir().expect("create SQLite temp directory");
+        let database_path = temp.path().join("seeded.db");
+        let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect to seeded SQLite database");
+        sqlx::query(
+            "CREATE TABLE steve_schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create migration ledger");
+        sqlx::query(
+            "CREATE TABLE steve_background_events (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create application table");
+        for &(version, name) in &rows {
+            sqlx::query(
+                "INSERT INTO steve_schema_migrations(version, name, applied_at)
+                 VALUES (?, ?, ?)",
+            )
+            .bind(version)
+            .bind(name)
+            .bind("2026-09-28T00:00:00Z")
+            .execute(&pool)
+            .await
+            .expect("seed migration row");
+        }
+        sqlx::query(
+            "INSERT INTO steve_background_events(id, kind, payload, created_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind("preserve-me")
+        .bind("fixture")
+        .bind("payload")
+        .bind("2026-09-28T00:00:00Z")
+        .execute(&pool)
+        .await
+        .expect("seed application data");
+        pool.close().await;
+
+        let mut steve =
+            SteveProcess::start_with_database_url(&database_url).expect("start Steve process");
+        let ready = steve.wait_ready(Duration::from_secs(15)).await;
+        if case == "valid v1" {
+            assert!(ready.is_ok(), "valid v1 must reach readiness");
+            drop(steve);
+        } else {
+            let error = match ready {
+                Ok(_) => panic!("drifted migration ledger must block readiness"),
+                Err(error) => error,
+            };
+            assert!(error.contains("migration"), "{case}: {error}");
+        }
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("reconnect to seeded SQLite database");
+        let actual_rows: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT version, name, applied_at FROM steve_schema_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query migration ledger");
+        let actual_events: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT id, kind, payload, created_at FROM steve_background_events
+             ORDER BY id, kind, payload, created_at",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query application data");
+        let expected_rows: Vec<_> = rows
+            .iter()
+            .map(|(version, name)| {
+                (
+                    *version,
+                    (*name).to_owned(),
+                    "2026-09-28T00:00:00Z".to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(actual_rows, expected_rows);
+        assert_eq!(
+            actual_events,
+            vec![(
+                "preserve-me".to_owned(),
+                "fixture".to_owned(),
+                "payload".to_owned(),
+                "2026-09-28T00:00:00Z".to_owned(),
+            )]
+        );
+        pool.close().await;
     }
 }
 

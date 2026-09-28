@@ -4,6 +4,8 @@ use chrono::Utc;
 use sqlx::{postgres::PgPoolOptions, sqlite::SqlitePoolOptions, PgPool, SqlitePool};
 use std::path::Path;
 
+const SQLITE_V1_MIGRATION_NAME: &str = "m0_foundation";
+
 #[derive(Clone)]
 pub enum DatabasePool {
     Sqlite(SqlitePool),
@@ -132,6 +134,16 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    let ledger: Vec<(i64, String)> =
+        sqlx::query_as("SELECT version, name FROM steve_schema_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await?;
+    if !ledger.is_empty()
+        && (ledger.len() != 1 || ledger[0].0 != 1 || ledger[0].1 != SQLITE_V1_MIGRATION_NAME)
+    {
+        anyhow::bail!("SQLite migration ledger is not the known v1 prefix");
+    }
+
     let current: i64 =
         sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM steve_schema_migrations")
             .fetch_one(pool)
@@ -153,7 +165,7 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
             "INSERT INTO steve_schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
         )
         .bind(1_i64)
-        .bind("m0_foundation")
+        .bind(SQLITE_V1_MIGRATION_NAME)
         .bind(Utc::now().to_rfc3339())
         .execute(&mut *tx)
         .await?;
