@@ -16,7 +16,7 @@ No runtime test or TLS qualification is evidence for this documentation proposal
 
 ## A — loopback defaults and classification
 
-**Proposed boundary:** fresh defaults are `127.0.0.1:11435` for inference and `127.0.0.1:8790` for management. An explicitly configured `127.0.0.1` or `[::1]` address is loopback. Classify exposure with `addr.ip().is_loopback()`; every other address, including IPv4/IPv6 wildcards, is remote.
+**Proposed boundary:** fresh defaults are `127.0.0.1:11435` for inference and `127.0.0.1:8790` for management. Any explicitly configured address for which `addr.ip().is_loopback()` is true is loopback, including `127.0.0.1`, `127.0.0.2`, and `[::1]`. Every other address, including IPv4/IPv6 wildcards, is remote.
 
 `server.inference_bind` and `server.management_bind` remain string configuration fields. They must parse as complete numeric `SocketAddr` values. Hostnames, partial values, malformed values, and empty values fail startup before either listener binds. Existing environment overrides remain supported, with `STEVE_INFERENCE_BIND` taking precedence over `STEVE_BIND` for inference and `STEVE_MANAGEMENT_BIND` applying to management. Do not silently replace an invalid or remote value.
 
@@ -64,7 +64,7 @@ Rollback restores the prior binary and its compatible configuration together thr
 
 | Given | When | Then |
 |---|---|---|
-| Fresh configuration or explicit loopback binds | Listener addresses are parsed and classified | Defaults are exactly `127.0.0.1:11435` and `127.0.0.1:8790`; `[::1]` is loopback; malformed/hostname values fail before either bind. |
+| Fresh configuration or explicit loopback binds | Listener addresses are parsed and classified | Defaults are exactly `127.0.0.1:11435` and `127.0.0.1:8790`; `127.0.0.2` and `[::1]` are also loopback; malformed/hostname values fail before either bind. |
 | Any non-loopback listener | Startup evaluates security mode | `disabled` fails before binding; `native_tls` is required for both listeners; remote inference also waits for accepted #502 caller authentication. |
 | `tls_mode = "disabled"` with either certificate/key path present | Startup validates the security table | Startup fails before either listener binds; both paths must be absent in disabled mode. |
 | Missing, unreadable, malformed, mismatched, unsupported, encrypted, or insecure certificate/key material | `native_tls` startup validation runs | Startup fails before either socket opens and diagnostics contain no key/certificate contents. |
