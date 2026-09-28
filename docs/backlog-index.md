@@ -2,7 +2,7 @@
 
 Snapshot: 2026-09-27; source base `6630577677f40e4ba6a491074f0c91a57d7ddd6e`.
 
-Review tracking: [#60](https://github.com/djh00t/steve/issues/60). GitHub issues contain the complete briefs. This index records the review snapshot; read the linked issue and current merge state before dispatch.
+Review tracking: [#60](https://github.com/djh00t/steve/issues/60). GitHub issues contain the complete briefs. The readiness counts below are historical; package rows are current dispatch pointers, so read the linked issue and current merge state before dispatch.
 
 Use the [delivery phases and workstreams](delivery-plan.md), [contract registry](contracts/README.md), [readiness rules](work-packages.md) and [testing policy](testing.md). Estimates are 5–10 active minutes after prerequisites land. BLOCKED leaves require their contract owner to supply exact approved details before dispatch; deferred discovery is not an implementation-ready feature.
 
@@ -10,7 +10,7 @@ Use the [delivery phases and workstreams](delivery-plan.md), [contract registry]
 
 The original 385-item inventory was a planning snapshot, not 385 dispatchable junior tasks. The second review at base `a55309d` examined every row for size, executable prerequisites, contract/schema completeness and shared ownership. Each linked area parent records the per-package corrections. Split/combine recommendations preserve existing IDs until the relevant contract producer can publish concrete replacements and update all dependency links.
 
-Of the original 22 READY rows, 21 prepare decisions or qualification proposals; only the process smoke package is implementation work, accepted on main via PR #457. No unresolved money, security, routing or platform choice is approved by a READY label. Integration acceptance gates verify composed results and are not ten-minute feature implementations. The counts below remain the original review snapshot; consult current issues before dispatch.
+Of the original 22 READY rows, 21 prepare decisions or qualification proposals; only the process smoke package is implementation work, accepted on main via PR #457. No unresolved money, security, routing or platform choice is approved by a READY label. Integration acceptance gates verify composed results and are not ten-minute feature implementations. The counts below remain the original review snapshot; package rows and current issue bodies are the dispatch source.
 
 The immediate test split adds [STV-TST-11 (#458)](https://github.com/djh00t/steve/issues/458) for held object-store writes and [STV-TST-12 (#459)](https://github.com/djh00t/steve/issues/459) for Messages disconnect proof. STV-TST-02 now owns the provider fixture; STV-TST-04 owns Responses only; Chat stays in #33. After adding those two test slices and retiring four duplicate registration-only packages, that review produced 383 active packages; the original summary below remains a 385-row audit snapshot.
 
@@ -85,46 +85,48 @@ Start with the real-process harness and independent contract decisions. Complete
 
 ## Packages
 
+`CLOSED` records GitHub issue lifecycle only; it does not imply implemented behavior or composed acceptance, even when the issue body retains blocked labels.
+
 ### Testing
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
 | [STV-TST-01](https://github.com/djh00t/steve/issues/72) | Add a real Steve process smoke harness | ACCEPTED (PR #457) | None |
-| [STV-TST-02](https://github.com/djh00t/steve/issues/73) | Add a deterministic held-tail provider fixture | BLOCKED | #72 |
-| [STV-TST-03](https://github.com/djh00t/steve/issues/74) | Qualify targeted Rust mutation testing | BLOCKED | #72, #73 |
-| [STV-TST-04](https://github.com/djh00t/steve/issues/75) | Prove Responses disconnect cancels upstream without replay | BLOCKED | #72, #73 |
-| [STV-TST-05](https://github.com/djh00t/steve/issues/76) | Prove official OpenAI SDK streaming compatibility | BLOCKED | #72, #75, #33 |
-| [STV-TST-06](https://github.com/djh00t/steve/issues/77) | Prove official Anthropic SDK streaming compatibility | BLOCKED | #72, #459 |
-| [STV-TST-07](https://github.com/djh00t/steve/issues/78) | Wire process smoke into PR and main CI | BLOCKED | #72 |
-| [STV-TST-08](https://github.com/djh00t/steve/issues/79) | Wire targeted mutations into PR CI | BLOCKED | #74, #78 |
+| [STV-TST-02](https://github.com/djh00t/steve/issues/73) | Add a deterministic held-tail provider fixture | CLOSED | #72 |
+| [STV-TST-03](https://github.com/djh00t/steve/issues/74) | Qualify targeted Rust mutation testing | CLOSED | #72, #73 |
+| [STV-TST-04](https://github.com/djh00t/steve/issues/75) | Prove Responses disconnect cancels upstream without replay | CLOSED | #72, #73 |
+| [STV-TST-05](https://github.com/djh00t/steve/issues/76) | Prove official OpenAI SDK streaming compatibility | CLOSED | #72, #75, #33 |
+| [STV-TST-06](https://github.com/djh00t/steve/issues/77) | Prove official Anthropic SDK streaming compatibility | CLOSED | #72, #459 |
+| [STV-TST-07](https://github.com/djh00t/steve/issues/78) | Wire process smoke into PR and main CI | CLOSED | #72 |
+| [STV-TST-08](https://github.com/djh00t/steve/issues/79) | Wire targeted mutations into PR CI | CLOSED | #74, #78 |
 | [STV-TST-09](https://github.com/djh00t/steve/issues/82) | Replace doctor-only backend checks with parity E2E on main | BLOCKED | #80, #81, #78 |
-| [STV-TST-10](https://github.com/djh00t/steve/issues/83) | Run official SDK smoke in CI | BLOCKED | #76, #77 |
-| [STV-TST-11](https://github.com/djh00t/steve/issues/458) | Add a held S3 PutObject fixture | BLOCKED | #72, #73 |
-| [STV-TST-12](https://github.com/djh00t/steve/issues/459) | Prove Messages disconnect cancels upstream without replay | BLOCKED | #72, #73 |
+| [STV-TST-10](https://github.com/djh00t/steve/issues/83) | Run official SDK smoke in CI | CLOSED | #76, #77 |
+| [STV-TST-11](https://github.com/djh00t/steve/issues/458) | Add a held S3 PutObject fixture | CLOSED | #72, #73 |
+| [STV-TST-12](https://github.com/djh00t/steve/issues/459) | Prove Messages disconnect cancels upstream without replay | CLOSED | #72, #73 |
 
 ### Post-M0 reliability
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-M0-05](https://github.com/djh00t/steve/issues/80) | Prove SQLite and PostgreSQL serve parity | BLOCKED | #72 |
-| [STV-M0-06](https://github.com/djh00t/steve/issues/81) | Prove filesystem and S3 object-store parity | BLOCKED | #72 |
+| [STV-M0-05](https://github.com/djh00t/steve/issues/80) | Prove SQLite and PostgreSQL serve parity | CLOSED | #72 |
+| [STV-M0-06](https://github.com/djh00t/steve/issues/81) | Prove filesystem and S3 object-store parity | CLOSED | #72 |
 | [STV-M0-01](https://github.com/djh00t/steve/issues/84) | Coordinate accounting failure contracts | COORDINATION | #483, #484, #485 |
 | [STV-M0-02](https://github.com/djh00t/steve/issues/85) | Preserve journal framing and report corrupt tails | BLOCKED | #84, #72 |
 | [STV-M0-03](https://github.com/djh00t/steve/issues/86) | Retry accounting reconciliation without startup loss | BLOCKED | #84, #72 |
 | [STV-M0-04](https://github.com/djh00t/steve/issues/87) | Prove idempotent journal replay after partial DB success | BLOCKED | #84, #72 |
-| [STV-M0-07](https://github.com/djh00t/steve/issues/88) | Prove noncritical queue pressure leaves management responsive | BLOCKED | #72, #458 |
-| [STV-M0-08](https://github.com/djh00t/steve/issues/89) | Prove live-but-unready drain with an active stream | BLOCKED | #72, #73 |
-| [STV-M0-09](https://github.com/djh00t/steve/issues/90) | Define independent admission-budget contract | READY | None |
-| [STV-M0-10](https://github.com/djh00t/steve/issues/91) | Coordinate listener admission implementation | COORDINATION | #468, #469, #470 |
-| [STV-M0-11](https://github.com/djh00t/steve/issues/92) | Prove listener budgets with a real process | BLOCKED | #91, #72, #73, #471 |
+| [STV-M0-07](https://github.com/djh00t/steve/issues/88) | Prove noncritical queue pressure leaves management responsive | CLOSED | #72, #458 |
+| [STV-M0-08](https://github.com/djh00t/steve/issues/89) | Prove live-but-unready drain with an active stream | CLOSED | #72, #73 |
+| [STV-M0-09](https://github.com/djh00t/steve/issues/90) | Define independent admission-budget contract | CLOSED | None |
+| [STV-M0-10](https://github.com/djh00t/steve/issues/91) | Coordinate listener admission implementation | CLOSED | #468, #469, #470 |
+| [STV-M0-11](https://github.com/djh00t/steve/issues/92) | Prove listener budgets with a real process | CLOSED | #91, #72, #73, #471 |
 | [STV-M0-12](https://github.com/djh00t/steve/issues/93) | Bound, circuit-break and observe history-worker failures | BLOCKED | #458 |
 
 ### M1
 
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
-| [STV-M1-03](https://github.com/djh00t/steve/issues/33) | Verify Chat disconnect cancellation and no replay | BLOCKED | #39, #73 |
-| [STV-M1-04](https://github.com/djh00t/steve/issues/94) | Define the Chat accounting event contract | BLOCKED | #84 |
+| [STV-M1-03](https://github.com/djh00t/steve/issues/33) | Verify Chat disconnect cancellation and no replay | CLOSED | #39, #73 |
+| [STV-M1-04](https://github.com/djh00t/steve/issues/94) | Define the Chat accounting event contract | BLOCKED | accepted #483; #484/#485 remain runtime recovery-qualification inputs |
 | [STV-M1-05](https://github.com/djh00t/steve/issues/95) | Enqueue completed nonstream Chat attempts | BLOCKED | #94 |
 | [STV-M1-06](https://github.com/djh00t/steve/issues/96) | Enqueue streamed Chat attempts at terminal state | BLOCKED | #94, #33 |
 | [STV-M1-07](https://github.com/djh00t/steve/issues/97) | Prove saturated Chat accounting does not delay SSE | BLOCKED | #96, #73, #84 |
@@ -141,7 +143,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M2-02](https://github.com/djh00t/steve/issues/100) | Freeze provider account, credentials, access and binding contract | BLOCKED | #99 |
 | [STV-M2-03](https://github.com/djh00t/steve/issues/101) | Freeze account pool policy, routing and affinity semantics | BLOCKED | #100 |
 | [STV-M2-04](https://github.com/djh00t/steve/issues/105) | Add relational organisation, user and client schema | BLOCKED | #99, #103, #104, #72 |
-| [STV-M2-14](https://github.com/djh00t/steve/issues/106) | Freeze listener exposure and management authentication contract | READY | None |
+| [STV-M2-14](https://github.com/djh00t/steve/issues/106) | Freeze listener exposure and management authentication contract | BLOCKED | #576, #577, #590 |
 | [STV-M2-59](https://github.com/djh00t/steve/issues/107) | Add PostgreSQL organisation, user and client schema | BLOCKED | #105, #104, #102, #72 |
 | [STV-M2-05](https://github.com/djh00t/steve/issues/108) | Authenticate local clients and attach resolved identity | BLOCKED | #99, #105, #106, #107, #72 |
 | [STV-M2-17](https://github.com/djh00t/steve/issues/109) | Authenticate every management route | BLOCKED | #99, #108, #106, #73, #72 |
@@ -191,7 +193,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M3-13](https://github.com/djh00t/steve/issues/103) | Apply versioned SQLite migrations | BLOCKED | Accepted #102 contract; #72; owned runner and exact scenario remain unimplemented |
 | [STV-M3-44](https://github.com/djh00t/steve/issues/104) | Apply PostgreSQL side of migration inventory | BLOCKED | Accepted #102 contract; #103, #72; owned runner and exact scenario remain unimplemented |
 | [STV-M3-01](https://github.com/djh00t/steve/issues/116) | Freeze session association and conversation-ID contract | BLOCKED | #99 |
-| [STV-M3-03](https://github.com/djh00t/steve/issues/117) | Add session and external-identifier schema | BLOCKED | #115, #116, #103, #104, #72 |
+| [STV-M3-03](https://github.com/djh00t/steve/issues/117) | Add session and external-identifier schema | BLOCKED | #500, #105, #107, #116, #103, #104, #72 |
 | [STV-M3-04](https://github.com/djh00t/steve/issues/119) | Resolve canonical Steve session IDs and return the session header | BLOCKED | #108, #118, #116, #117, #72 |
 | [STV-M3-05](https://github.com/djh00t/steve/issues/120) | Persist logical request-to-session and turn links | BLOCKED | #117, #118, #119, #103, #104, #72 |
 | [STV-M3-02](https://github.com/djh00t/steve/issues/121) | Freeze content capture, metadata-only and retention contract | BLOCKED | #116 |
@@ -476,7 +478,7 @@ Legacy V1 issues #422–#424 are listed here as M8 requirements inputs; their ID
 | [STV-M8-10](https://github.com/djh00t/steve/issues/346) | Detect supported local container runtimes | BLOCKED | #337, #340 |
 | [STV-M8-11](https://github.com/djh00t/steve/issues/348) | Present onboarding choices | BLOCKED | #342, #343, #344, #345, #346, #340 |
 | [STV-M8-12](https://github.com/djh00t/steve/issues/347) | Connect to a remote Steve deployment | BLOCKED | #339, #343, #106, #109, #340 |
-| [STV-V1-12](https://github.com/djh00t/steve/issues/422) | Discover native supervisor/coordinator requirements | READY | #1, #89 |
+| [STV-V1-12](https://github.com/djh00t/steve/issues/422) | Discover native supervisor/coordinator requirements | CLOSED | #1, #89 |
 | [STV-V1-13](https://github.com/djh00t/steve/issues/423) | Discover signed release and versioned installation requirements | BLOCKED | #336 |
 | [STV-V1-14](https://github.com/djh00t/steve/issues/424) | Discover upgrade cutover and rollback requirements | BLOCKED | #1, #89, #422, #423 |
 | [STV-M8-13](https://github.com/djh00t/steve/issues/341) | Decompose native installation | BLOCKED | #336, #337, #293, #423 |
