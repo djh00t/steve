@@ -6,6 +6,22 @@ use std::path::Path;
 
 const SQLITE_V1_MIGRATION_NAME: &str = "m0_foundation";
 
+type SqliteLedgerColumnManifest = (
+    &'static str,
+    &'static str,
+    i64,
+    Option<&'static str>,
+    i64,
+    i64,
+);
+type SqliteLedgerColumn = (i64, String, String, i64, Option<String>, i64, i64);
+
+const SQLITE_V1_LEDGER_COLUMNS: [SqliteLedgerColumnManifest; 3] = [
+    ("version", "INTEGER", 0, None, 1, 0),
+    ("name", "TEXT", 1, None, 0, 0),
+    ("applied_at", "TEXT", 1, None, 0, 0),
+];
+
 #[derive(Clone)]
 pub enum DatabasePool {
     Sqlite(SqlitePool),
@@ -133,6 +149,35 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    let columns: Vec<SqliteLedgerColumn> =
+        sqlx::query_as("PRAGMA table_xinfo(steve_schema_migrations)")
+            .fetch_all(pool)
+            .await?;
+    let expected_columns: Vec<SqliteLedgerColumn> = SQLITE_V1_LEDGER_COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(cid, (name, ty, notnull, default, pk, hidden))| {
+            (
+                cid as i64,
+                (*name).to_owned(),
+                (*ty).to_owned(),
+                *notnull,
+                default.map(str::to_owned),
+                *pk,
+                *hidden,
+            )
+        })
+        .collect();
+    // INTEGER PRIMARY KEY DESC has the same columns but is not a rowid alias.
+    let ordinary_primary_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_index_list('steve_schema_migrations') WHERE origin = 'pk'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if columns != expected_columns || ordinary_primary_keys != 0 {
+        anyhow::bail!("SQLite migration ledger column shape does not match v1");
+    }
 
     let ledger: Vec<(i64, String)> =
         sqlx::query_as("SELECT version, name FROM steve_schema_migrations ORDER BY version")
