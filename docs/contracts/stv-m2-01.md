@@ -4,7 +4,7 @@
 
 | Producer | Canonical artifact | Acceptance gate |
 |---|---|---|
-| [STV-M2-60 principal IDs and relationships](https://github.com/djh00t/steve/issues/500) | `docs/contracts/stv-m2-60.md` | READY for a bounded proposal; David/Cos reviews and merges the exact artifact. |
+| [STV-M2-60 principal IDs and relationships](https://github.com/djh00t/steve/issues/500) | `docs/contracts/stv-m2-60.md` | PROPOSED in merged [PR #518](https://github.com/djh00t/steve/pull/518) at `504dabec31f8fa086c43667b3da173e02f3f5617`; explicit David/Cos acceptance and executable contract evidence remain pending. |
 | [STV-M2-61 bootstrap and client credential lifecycle](https://github.com/djh00t/steve/issues/501) | `docs/contracts/stv-m2-61.md` | BLOCKED on accepted STV-M2-60 and management/listener contract #106. |
 | [STV-M2-62 inference auth and resolved identity](https://github.com/djh00t/steve/issues/502) | `docs/contracts/stv-m2-62.md` | BLOCKED on accepted STV-M2-60/STV-M2-61. |
 

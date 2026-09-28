@@ -44,11 +44,11 @@ Replacing #132 with two proposal leaves brought that snapshot to 391 active leav
 
 ## Identity and client-auth contract decomposition
 
-[#99](https://github.com/djh00t/steve/issues/99) is now a coordinator for three independently reviewed artifacts: principal IDs/relationships [#500](https://github.com/djh00t/steve/issues/500), local bootstrap/client credential lifecycle [#501](https://github.com/djh00t/steve/issues/501), and inference auth/resolved identity [#502](https://github.com/djh00t/steve/issues/502). #500 is READY to propose; #501 waits for accepted #500 and management/listener contract #106; #502 waits for accepted #500/#501. #106 has no new prerequisite on #99 or the bootstrap child.
+[#99](https://github.com/djh00t/steve/issues/99) is now a coordinator for three independently reviewed artifacts: principal IDs/relationships [#500](https://github.com/djh00t/steve/issues/500), local bootstrap/client credential lifecycle [#501](https://github.com/djh00t/steve/issues/501), and inference auth/resolved identity [#502](https://github.com/djh00t/steve/issues/502). #500's proposal was published in merged [PR #518](https://github.com/djh00t/steve/pull/518); explicit acceptance and executable contract evidence remain pending. #501 waits for accepted #500 and management/listener contract #106; #502 waits for accepted #500/#501. #106 has no new prerequisite on #99 or the bootstrap child.
 
 Existing #99 consumers keep that acceptance gate until the child artifacts compose, exact revisions are accepted, and consumer briefs are re-sized against actual interfaces. #100 keeps provider credentials and access grants; #106 management/listener security; #110 audit schema; #116 session association. The [identity contract index](contracts/stv-m2-01.md) records ownership, not a new security policy.
 
-Replacing one leaf with three brings the current inventory to **397 active leaves** (M2 now has 47). Coordinators #84/#91/#99/#132 are excluded. The original readiness snapshot below remains historical. Original M0 acceptance is unchanged.
+Replacing one leaf with three brought that inventory to **397 active leaves** (M2 has 47). Coordinators #84/#91/#99/#132 are excluded. The table below is the original readiness snapshot except for the refreshed #500 and #106 handoff rows; issue bodies remain authoritative for live readiness. Original M0 acceptance is unchanged.
 
 ## Original 385-item readiness snapshot (historical)
 
@@ -137,13 +137,13 @@ Start with the real-process harness and independent contract decisions. Complete
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
 | [STV-M2-01](https://github.com/djh00t/steve/issues/99) | Coordinate local identity and client-auth contracts | COORDINATION | #500, #501, #502 |
-| [STV-M2-60](https://github.com/djh00t/steve/issues/500) | Propose local principal IDs and relationships | READY to propose | None |
+| [STV-M2-60](https://github.com/djh00t/steve/issues/500) | Propose local principal IDs and relationships | PROPOSED; acceptance/evidence pending | PR #518 merged; explicit acceptance and executable fixture |
 | [STV-M2-61](https://github.com/djh00t/steve/issues/501) | Propose local bootstrap and client credential lifecycle | BLOCKED | #500, #106 |
 | [STV-M2-62](https://github.com/djh00t/steve/issues/502) | Propose inference auth and resolved identity semantics | BLOCKED | #500, #501 |
 | [STV-M2-02](https://github.com/djh00t/steve/issues/100) | Freeze provider account, credentials, access and binding contract | BLOCKED | #99 |
 | [STV-M2-03](https://github.com/djh00t/steve/issues/101) | Freeze account pool policy, routing and affinity semantics | BLOCKED | #100 |
 | [STV-M2-04](https://github.com/djh00t/steve/issues/105) | Add relational organisation, user and client schema | BLOCKED | #99, #103, #104, #72 |
-| [STV-M2-14](https://github.com/djh00t/steve/issues/106) | Freeze listener exposure and management authentication contract | BLOCKED | #576, #577, #590 |
+| [STV-M2-14](https://github.com/djh00t/steve/issues/106) | Freeze listener exposure and management authentication contract | BLOCKED | #590 merged; name TLS owner and re-size #109/#143 |
 | [STV-M2-59](https://github.com/djh00t/steve/issues/107) | Add PostgreSQL organisation, user and client schema | BLOCKED | #105, #104, #102, #72 |
 | [STV-M2-05](https://github.com/djh00t/steve/issues/108) | Authenticate local clients and attach resolved identity | BLOCKED | #99, #105, #106, #107, #72 |
 | [STV-M2-17](https://github.com/djh00t/steve/issues/109) | Authenticate every management route | BLOCKED | #99, #108, #106, #73, #72 |
