@@ -42,6 +42,7 @@ pub struct ServerConfig {
     pub drain_timeout_seconds: u64,
     pub openai_upstream_url: Option<String>,
     pub anthropic_upstream_url: Option<String>,
+    pub upstream_ca_bundle: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -89,6 +90,7 @@ impl Default for ServerConfig {
             drain_timeout_seconds: 60,
             openai_upstream_url: None,
             anthropic_upstream_url: None,
+            upstream_ca_bundle: None,
         }
     }
 }

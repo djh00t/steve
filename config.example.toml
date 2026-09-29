@@ -7,6 +7,9 @@ drain_timeout_seconds = 60
 # openai_upstream_url = "http://127.0.0.1:18080"
 # Local unauthenticated test_upstream fixture only; provider credentials are later work.
 # anthropic_upstream_url = "http://127.0.0.1:18080"
+# Add PEM certificate authorities to the built-in WebPKI roots for both upstreams and health probes.
+# Relative paths use Steve's working directory; restart Steve after changing the bundle.
+# upstream_ca_bundle = "certs/upstream-ca.pem"
 
 [database]
 url = "sqlite://data/steve.db?mode=rwc"

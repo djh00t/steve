@@ -63,19 +63,26 @@ impl OpenAiUpstream {
     /// with an optional OpenAI-style `/v1` root and no embedded credentials.
     /// `timeout` bounds JSON calls and the response-header wait for SSE.
     pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, SteveError> {
-        let base_url = normalize_base_url(base_url.into())?;
-        if timeout.is_zero() {
-            return Err(SteveError::Config {
-                message: "timeout must be greater than zero".into(),
-            });
-        }
-
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|err| SteveError::Config {
                 message: format!("http client: {err}"),
             })?;
+        Self::with_client(base_url, timeout, http)
+    }
+
+    pub(crate) fn with_client(
+        base_url: impl Into<String>,
+        timeout: Duration,
+        http: reqwest::Client,
+    ) -> Result<Self, SteveError> {
+        let base_url = normalize_base_url(base_url.into())?;
+        if timeout.is_zero() {
+            return Err(SteveError::Config {
+                message: "timeout must be greater than zero".into(),
+            });
+        }
 
         Ok(Self {
             base_url,
