@@ -1,6 +1,6 @@
 # STV-M1-04: Chat terminal-attempt accounting event
 
-This contract consumes [STV-M0-16](contracts/stv-m0-16.md) at the explicitly accepted [PR #567 head `7d2a54b03394be8d71c2018b73286e7a08a64cd5`](https://github.com/djh00t/steve/issues/483#issuecomment-5885737021). That acceptance covers incident/admission policy, not runtime recovery qualification. This note defines the event offered to `DeferredQueues::accounting` by [#95](https://github.com/djh00t/steve/issues/95) and [#96](https://github.com/djh00t/steve/issues/96); it does not implement emission, persistence, or the #484/#485 recovery mechanisms.
+This contract uses [STV-M0-16](contracts/stv-m0-16.md) at [PR #567 head `7d2a54b03394be8d71c2018b73286e7a08a64cd5`](https://github.com/djh00t/steve/issues/483#issuecomment-5885737021) as the owner-selected working design baseline. Final operator/release acceptance awaits the combined M1 gate. This note defines the event offered to `DeferredQueues::accounting` by [#95](https://github.com/djh00t/steve/issues/95) and [#96](https://github.com/djh00t/steve/issues/96); it does not implement emission, persistence, or the #484/#485 recovery mechanisms.
 
 ## Shape and identity
 
@@ -26,7 +26,7 @@ Nonstream success or final upstream failure emits after its attempt is terminal;
 
 ## Incident boundary
 
-Offer the event without waiting for the database worker. Queue or journal-channel acceptance is not a durable write, replay acknowledgement, or proof of recoverability. Under accepted STV-M0-16, primary-queue **and** journal failure (including later database-write failure followed by journal failure), or journal write/flush failure, latches the accounting incident when the serving process observes it. An already admitted Chat request may finish forwarding; inference whose admission linearizes after the local latch gets `503 accounting_incident` while state is `blocked` or `unreconciled`. Successful fallback alone does not latch an incident. Event identity never reconstructs a discarded payload. #484 owns logical ownership and restart/overlap evidence; #485 owns replay, disposition and resumption evidence. This contract makes no recovery-completion claim.
+Offer the event without waiting for the database worker. Queue or journal-channel acceptance is not a durable write, replay acknowledgement, or proof of recoverability. Under the STV-M0-16 working design baseline, primary-queue **and** journal failure (including later database-write failure followed by journal failure), or journal write/flush failure, latches the accounting incident when the serving process observes it. An already admitted Chat request may finish forwarding; inference whose admission linearizes after the local latch gets `503 accounting_incident` while state is `blocked` or `unreconciled`. Successful fallback alone does not latch an incident. Event identity never reconstructs a discarded payload. #484 owns logical ownership and restart/overlap evidence; #485 owns replay, disposition and resumption evidence. This contract makes no recovery-completion claim.
 
 ## Review examples
 
