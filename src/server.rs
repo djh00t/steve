@@ -22,6 +22,7 @@ use http_body::{Frame, SizeHint};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    future::{self, Future},
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -102,6 +103,7 @@ struct AppState {
     provider_probe: ProviderProbeState,
     shutdown: mpsc::Sender<ShutdownRequest>,
     drain_timeout: Duration,
+    active_work_cancelled: watch::Receiver<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -342,6 +344,7 @@ pub async fn run(
     );
     let timeout = Duration::from_secs(cfg.server.drain_timeout_seconds);
     let (shutdown, shutdown_requests) = mpsc::channel(1);
+    let (active_work_cancel, active_work_cancelled) = watch::channel(false);
     let state = Arc::new(AppState {
         lifecycle: lifecycle.clone(),
         deferred,
@@ -361,6 +364,7 @@ pub async fn run(
         provider_probe,
         shutdown: shutdown.clone(),
         drain_timeout: timeout,
+        active_work_cancelled,
     });
 
     let inference_app = inference_router(state.clone());
@@ -398,6 +402,7 @@ pub async fn run(
             timeout,
             inference_shutdown_tx,
             inference_abort.clone(),
+            active_work_cancel,
         )
         .await
     });
@@ -484,6 +489,7 @@ async fn coordinate_shutdown(
     timeout: Duration,
     inference_shutdown: watch::Sender<bool>,
     inference_abort: tokio::task::AbortHandle,
+    active_work_cancel: watch::Sender<bool>,
 ) -> ShutdownOutcome {
     let request = match requests
         .recv()
@@ -505,6 +511,7 @@ async fn coordinate_shutdown(
     lifecycle.drain(request.reason);
 
     if let Err(error) = deferred.prepare_shutdown(deadline).await {
+        cancel_active_work(&active_work_cancel, &lifecycle).await;
         inference_abort.abort();
         tokio::task::yield_now().await;
         let _ = deferred.shutdown(deadline).await;
@@ -514,6 +521,7 @@ async fn coordinate_shutdown(
         };
     }
     if let Err(error) = deferred.mark_unclean(deadline).await {
+        cancel_active_work(&active_work_cancel, &lifecycle).await;
         inference_abort.abort();
         tokio::task::yield_now().await;
         let _ = deferred.shutdown(deadline).await;
@@ -528,13 +536,15 @@ async fn coordinate_shutdown(
         || tokio::time::timeout(remaining, lifecycle.wait_for_zero())
             .await
             .is_err();
+    let inflight_at_deadline = lifecycle.inflight();
     if timed_out {
         tracing::warn!(
             event = "drain_timeout",
             timeout_seconds = timeout.as_secs(),
-            inflight = lifecycle.inflight(),
+            inflight = inflight_at_deadline,
             "drain deadline reached"
         );
+        cancel_active_work(&active_work_cancel, &lifecycle).await;
         inference_abort.abort();
         tokio::task::yield_now().await;
     } else {
@@ -545,12 +555,17 @@ async fn coordinate_shutdown(
     let result = if timed_out {
         Err(anyhow::anyhow!(
             "drain deadline reached with {} request(s) in flight",
-            lifecycle.inflight()
+            inflight_at_deadline
         ))
     } else {
         queues
     };
     ShutdownOutcome { request, result }
+}
+
+async fn cancel_active_work(cancel: &watch::Sender<bool>, lifecycle: &Lifecycle) {
+    cancel.send_replace(true);
+    lifecycle.wait_for_zero().await;
 }
 
 fn server_result(
@@ -788,6 +803,71 @@ fn hold_inflight_until_body_end(response: Response, guard: InflightGuard) -> Res
     hold_guard_until_body_end(response, guard)
 }
 
+fn cancel_body_on_forced_shutdown(
+    response: Response,
+    cancelled: watch::Receiver<bool>,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Body::new(CancelledBody {
+            inner: Some(body),
+            cancelled: active_work_cancelled(cancelled),
+        }),
+    )
+}
+
+fn active_work_cancelled(
+    mut cancelled: watch::Receiver<bool>,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        while !*cancelled.borrow_and_update() {
+            if cancelled.changed().await.is_err() {
+                future::pending::<()>().await;
+            }
+        }
+    })
+}
+
+struct CancelledBody {
+    inner: Option<Body>,
+    cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl HttpBody for CancelledBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.cancelled.as_mut().poll(cx).is_ready() {
+            this.inner.take();
+            return Poll::Ready(None);
+        }
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = Pin::new(inner).poll_frame(cx);
+        if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
+            this.inner.take();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().is_none_or(HttpBody::is_end_stream)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner
+            .as_ref()
+            .map_or_else(SizeHint::default, HttpBody::size_hint)
+    }
+}
+
 fn hold_guard_until_body_end<G: Send + Unpin + 'static>(response: Response, guard: G) -> Response {
     let (parts, body) = response.into_parts();
     Response::from_parts(
@@ -996,9 +1076,20 @@ async fn admit_inference(
             .into_response();
     };
 
-    hold_inflight_until_body_end(
-        hold_guard_until_body_end(next.run(request).await, permit),
-        inflight,
+    let mut cancelled = active_work_cancelled(state.active_work_cancelled.clone());
+    let response = tokio::select! {
+        biased;
+        _ = &mut cancelled => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "draining"})),
+            ).into_response();
+        }
+        response = next.run(request) => response,
+    };
+    cancel_body_on_forced_shutdown(
+        hold_inflight_until_body_end(hold_guard_until_body_end(response, permit), inflight),
+        state.active_work_cancelled.clone(),
     )
 }
 
@@ -1274,6 +1365,7 @@ mod tests {
         lifecycle.ready("test");
         let counters = Arc::new(RequestCounters::default());
         let (shutdown, _shutdown_requests) = mpsc::channel(1);
+        let (_active_work_cancel, active_work_cancelled) = watch::channel(false);
         let state = Arc::new(AppState {
             lifecycle,
             deferred,
@@ -1295,6 +1387,7 @@ mod tests {
             provider_probe: ProviderProbeState::new(None, None).unwrap(),
             shutdown,
             drain_timeout: Duration::from_secs(60),
+            active_work_cancelled,
         });
         (state, dir)
     }

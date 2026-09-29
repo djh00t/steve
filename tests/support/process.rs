@@ -203,6 +203,30 @@ impl SteveProcess {
     }
 
     #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn start_with_stream_shutdown_fixture(
+        openai_upstream_url: &str,
+        database_url: &str,
+        accounting_root: &Path,
+        drain_timeout_seconds: u64,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            Some(openai_upstream_url),
+            None,
+            drain_timeout_seconds,
+            None,
+            None,
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn start_with_shutdown_and_object_store(
         database_url: &str,
         accounting_root: &Path,

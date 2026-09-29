@@ -624,6 +624,315 @@ async fn accounting_shutdown_timeout_survives_restart() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn management_drain_timeout_cancels_chat_body_before_accounting_closes() {
+    use tokio_stream::StreamExt;
+    use upstream::{ControlledUpstream, Tail};
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting-root");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("stream-timeout.db").display()
+        );
+        assert!(
+            provision(&root).status.success(),
+            "provision accounting root"
+        );
+        let pool = prepare_sqlite(&database_url).await;
+        let first = b"data: {\"id\":\"chatcmpl_timeout\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}]}\n\n";
+        let mut upstream = ControlledUpstream::start(
+            "/v1/chat/completions",
+            first.as_slice(),
+            Tail::Bytes(b"data: [DONE]\n\n".as_slice().into()),
+        )
+        .await
+        .expect("start held Chat upstream");
+        let mut process = SteveProcess::start_with_stream_shutdown_fixture(
+            &upstream.url(),
+            &database_url,
+            &root,
+            1,
+            100,
+            500,
+            25,
+        )
+        .expect("start held-stream shutdown fixture");
+        let listeners = process
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .expect("held-stream fixture ready");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("held-stream client");
+        let response = client
+            .post(format!(
+                "http://{}/v1/chat/completions",
+                listeners.inference
+            ))
+            .json(&json!({
+                "model":"steve-test-model",
+                "messages":[{"role":"user","content":"hold until drain deadline"}],
+                "stream":true
+            }))
+            .send()
+            .await
+            .expect("request held Chat stream");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        upstream
+            .wait_for_request(Duration::from_secs(3))
+            .await
+            .expect("Chat request reached held upstream");
+        let mut response = response.bytes_stream();
+        assert_eq!(
+            response
+                .next()
+                .await
+                .expect("stream ended before first Chat event")
+                .expect("read first Chat event"),
+            first.as_slice()
+        );
+
+        let drain_started = Instant::now();
+        trigger_shutdown(
+            &mut process,
+            listeners.management,
+            ShutdownTrigger::Management,
+        )
+        .await;
+        upstream
+            .wait_for_body_drop(Duration::from_secs(2))
+            .await
+            .expect("held upstream body was not cancelled by the drain deadline");
+        assert!(
+            drain_started.elapsed() < Duration::from_secs(2),
+            "held upstream body outlived the one-second drain deadline"
+        );
+        assert!(!upstream.tail_was_sent());
+        let response_end = tokio::time::timeout(Duration::from_secs(2), response.next())
+            .await
+            .expect("held client response body was not cancelled by the drain deadline");
+        assert!(
+            response_end.is_none() || response_end.is_some_and(|chunk| chunk.is_err()),
+            "held client response emitted data after drain cancellation"
+        );
+        let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let rows = sqlite_events(&database_url).await;
+                let terminal = rows
+                    .into_iter()
+                    .filter(|row| row.1 == "chat.attempt.terminal.v1")
+                    .collect::<Vec<_>>();
+                if terminal.len() == 1 {
+                    break terminal.into_iter().next().expect("one terminal event");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("cancelled Chat terminal accounting was not persisted");
+        assert_eq!(
+            serde_json::from_str::<Value>(&terminal.2).expect("terminal payload")["status"],
+            "cancelled"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            sqlite_events(&database_url)
+                .await
+                .iter()
+                .filter(|row| row.1 == "chat.attempt.terminal.v1")
+                .count(),
+            1,
+            "cancelled Chat terminal accounting must be exact-once"
+        );
+
+        assert!(process.is_running().expect("management timeout stays alive"));
+        let ready = client
+            .get(format!("http://{}/health/ready", listeners.management))
+            .send()
+            .await
+            .expect("timed-out management readiness");
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let ready: Value = ready.json().await.expect("timed-out readiness JSON");
+        assert_eq!(ready["status"], "not_ready");
+        assert_eq!(ready["phase"], "draining");
+        assert_eq!(
+            latest_generation_state(&root)["phase"],
+            "unclean",
+            "deadline expiry must retain unresolved generation evidence"
+        );
+
+        process.send_sigterm().expect("stop timed-out management drain");
+        let status = process
+            .wait_for_exit(Duration::from_secs(5))
+            .await
+            .expect("timed-out management process exits without an orphan");
+        assert!(!status.success(), "drain timeout must remain non-success");
+        assert!(
+            process
+                .log_output()
+                .contains("drain deadline reached with 1 request(s) in flight"),
+            "timeout lost the inflight count captured at the deadline:\n{}",
+            process.log_output()
+        );
+        pool.close().await;
+    })
+    .await
+    .expect("held-stream management drain scenario exceeded 20 seconds");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_preparation_failure_cancels_held_chat_before_accounting_closes() {
+    use tokio_stream::StreamExt;
+    use upstream::{ControlledUpstream, Tail};
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting-root");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("prepare-failure.db").display()
+        );
+        assert!(
+            provision(&root).status.success(),
+            "provision accounting root"
+        );
+        let pool = prepare_sqlite(&database_url).await;
+        let first = b"data: {\"id\":\"chatcmpl_prepare_failure\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}]}\n\n";
+        let mut upstream = ControlledUpstream::start(
+            "/v1/chat/completions",
+            first.as_slice(),
+            Tail::Bytes(b"data: [DONE]\n\n".as_slice().into()),
+        )
+        .await
+        .expect("start preparation-failure upstream");
+        let mut process = SteveProcess::start_with_stream_shutdown_fixture(
+            &upstream.url(),
+            &database_url,
+            &root,
+            1,
+            100,
+            500,
+            25,
+        )
+        .expect("start preparation-failure fixture");
+        let listeners = process
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .expect("preparation-failure fixture ready");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("preparation-failure client");
+        let response = client
+            .post(format!(
+                "http://{}/v1/chat/completions",
+                listeners.inference
+            ))
+            .json(&json!({
+                "model":"steve-test-model",
+                "messages":[{"role":"user","content":"hold through preparation failure"}],
+                "stream":true
+            }))
+            .send()
+            .await
+            .expect("request held Chat stream");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        upstream
+            .wait_for_request(Duration::from_secs(3))
+            .await
+            .expect("Chat request reached preparation-failure upstream");
+        let mut response = response.bytes_stream();
+        assert_eq!(
+            response
+                .next()
+                .await
+                .expect("stream ended before first Chat event")
+                .expect("read first Chat event"),
+            first.as_slice()
+        );
+        let coordination_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("coordination.lock"))
+            .expect("open accounting coordination lock");
+        coordination_lock
+            .lock()
+            .expect("hold accounting coordination lock");
+
+        trigger_shutdown(
+            &mut process,
+            listeners.management,
+            ShutdownTrigger::Management,
+        )
+        .await;
+        upstream
+            .wait_for_body_drop(Duration::from_secs(2))
+            .await
+            .expect("preparation failure left the held upstream body alive");
+        assert!(!upstream.tail_was_sent());
+        let response_end = tokio::time::timeout(Duration::from_secs(2), response.next())
+            .await
+            .expect("preparation failure left the client response body alive");
+        assert!(response_end.is_none() || response_end.is_some_and(|chunk| chunk.is_err()));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let terminal = sqlite_events(&database_url)
+                    .await
+                    .into_iter()
+                    .filter(|row| row.1 == "chat.attempt.terminal.v1")
+                    .collect::<Vec<_>>();
+                if terminal.len() == 1 {
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&terminal[0].2)
+                            .expect("terminal payload")["status"],
+                        "cancelled"
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("preparation-failure terminal accounting was not persisted once");
+        assert!(process
+            .is_running()
+            .expect("preparation-failure management drain stays alive"));
+        let ready = client
+            .get(format!("http://{}/health/ready", listeners.management))
+            .send()
+            .await
+            .expect("preparation-failure readiness");
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        File::unlock(&coordination_lock).expect("release accounting coordination lock");
+        process
+            .send_sigterm()
+            .expect("stop preparation-failure management drain");
+        let status = process
+            .wait_for_exit(Duration::from_secs(5))
+            .await
+            .expect("preparation-failure process exits without an orphan");
+        assert!(!status.success(), "preparation failure must remain non-success");
+        let logs = process.log_output();
+        assert!(
+            logs.contains("timed out preparing accounting shutdown")
+                || logs.contains("timed out acquiring accounting file lock"),
+            "shutdown replaced the original preparation error:\n{}",
+            logs
+        );
+        pool.close().await;
+    })
+    .await
+    .expect("preparation-failure cancellation scenario exceeded 20 seconds");
+}
+
 #[tokio::test]
 async fn accounting_shutdown_bounds_held_nonstream_body() {
     let temp = tempfile::tempdir().expect("tempdir");
