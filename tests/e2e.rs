@@ -134,46 +134,60 @@ async fn sqlite_rejects_migration_ledger_column_drift() {
 
 #[tokio::test]
 async fn sqlite_rejects_foundation_column_drift() {
-    for (case, table_schema, should_ready, extra) in [
+    for (case, table_schema, seed_ledger, should_ready, extra) in [
         (
             "valid v1",
             "id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL",
+            true,
             true,
             ExtraColumn::None,
         ),
         (
             "nullable kind",
             "id TEXT PRIMARY KEY, kind TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL",
+            true,
+            false,
+            ExtraColumn::None,
+        ),
+        (
+            "empty ledger and nullable kind",
+            "id TEXT PRIMARY KEY, kind TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL",
+            false,
             false,
             ExtraColumn::None,
         ),
         (
             "generated extra",
             "id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, extra TEXT GENERATED ALWAYS AS (kind || '-generated') VIRTUAL",
+            true,
             false,
             ExtraColumn::Generated,
         ),
         (
             "ordinary extra",
             "id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, extra TEXT",
+            true,
             false,
             ExtraColumn::Stored("extra-sentinel"),
         ),
         (
             "wrong type",
             "id BLOB PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL",
+            true,
             false,
             ExtraColumn::None,
         ),
         (
             "wrong primary key",
             "id TEXT, kind TEXT NOT NULL PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL",
+            true,
             false,
             ExtraColumn::None,
         ),
         (
             "default",
             "id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT 'now'",
+            true,
             false,
             ExtraColumn::None,
         ),
@@ -198,13 +212,15 @@ async fn sqlite_rejects_foundation_column_drift() {
             .execute(&pool)
             .await
             .expect("create application table");
-        sqlx::query(
-            "INSERT INTO steve_schema_migrations(version, name, applied_at)
-             VALUES (1, 'm0_foundation', '2026-09-28T00:00:00Z')",
-        )
-        .execute(&pool)
-        .await
-        .expect("seed migration ledger");
+        if seed_ledger {
+            sqlx::query(
+                "INSERT INTO steve_schema_migrations(version, name, applied_at)
+                 VALUES (1, 'm0_foundation', '2026-09-28T00:00:00Z')",
+            )
+            .execute(&pool)
+            .await
+            .expect("seed migration ledger");
+        }
         sqlx::query(
             "INSERT INTO steve_background_events(id, kind, payload, created_at)
              VALUES ('preserve-me', 'fixture', 'payload', '2026-09-28T00:00:00Z')",
@@ -251,15 +267,16 @@ async fn sqlite_rejects_foundation_column_drift() {
         .fetch_all(&pool)
         .await
         .expect("query migration ledger");
-        assert_eq!(
-            ledger,
+        let expected_ledger = if seed_ledger {
             vec![(
                 1,
                 "m0_foundation".to_owned(),
                 "2026-09-28T00:00:00Z".to_owned(),
-            )],
-            "{case}"
-        );
+            )]
+        } else {
+            vec![]
+        };
+        assert_eq!(ledger, expected_ledger, "{case}");
         let events: Vec<(String, String, String, String)> = sqlx::query_as(
             "SELECT id, kind, payload, created_at FROM steve_background_events ORDER BY id",
         )

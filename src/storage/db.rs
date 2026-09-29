@@ -202,6 +202,7 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
         sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM steve_schema_migrations")
             .fetch_one(pool)
             .await?;
+    let expected_application_columns = expected_sqlite_columns(&SQLITE_V1_APPLICATION_COLUMNS);
 
     if current < 1 {
         let mut tx = pool.begin().await?;
@@ -215,6 +216,13 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
         )
         .execute(&mut *tx)
         .await?;
+        let application_columns: Vec<SqliteColumn> =
+            sqlx::query_as("PRAGMA table_xinfo(steve_background_events)")
+                .fetch_all(&mut *tx)
+                .await?;
+        if application_columns != expected_application_columns {
+            anyhow::bail!("SQLite application column shape does not match v1");
+        }
         sqlx::query(
             "INSERT INTO steve_schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
         )
@@ -224,14 +232,14 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-    }
-
-    let application_columns: Vec<SqliteColumn> =
-        sqlx::query_as("PRAGMA table_xinfo(steve_background_events)")
-            .fetch_all(pool)
-            .await?;
-    if application_columns != expected_sqlite_columns(&SQLITE_V1_APPLICATION_COLUMNS) {
-        anyhow::bail!("SQLite application column shape does not match v1");
+    } else {
+        let application_columns: Vec<SqliteColumn> =
+            sqlx::query_as("PRAGMA table_xinfo(steve_background_events)")
+                .fetch_all(pool)
+                .await?;
+        if application_columns != expected_application_columns {
+            anyhow::bail!("SQLite application column shape does not match v1");
+        }
     }
 
     Ok(())
