@@ -104,6 +104,7 @@ pub(crate) struct ChatCompletionReply {
     pub(crate) body: ChatCompletionReplyBody,
     pub(crate) request: Option<Request>,
     pub(crate) model: Option<String>,
+    pub(crate) requested_stream: bool,
     pub(crate) attempts: Vec<RequestAttempt>,
 }
 
@@ -127,6 +128,7 @@ pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
                 body: ChatCompletionReplyBody::Stub(ChatCompletionStub::from(&handoff)),
                 request: Some(handoff.request),
                 model: Some(handoff.model),
+                requested_stream: handoff.stream,
                 attempts: vec![handoff.attempt],
             }
         }
@@ -135,6 +137,7 @@ pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
             body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
             request: None,
             model: None,
+            requested_stream: false,
             attempts: Vec::new(),
         },
     }
@@ -152,6 +155,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
                 body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
                 request: None,
                 model: None,
+                requested_stream: false,
                 attempts: Vec::new(),
             }
         }
@@ -183,6 +187,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
                     })),
                     request: Some(handoff.request),
                     model: Some(handoff.model),
+                    requested_stream: handoff.stream,
                     attempts: vec![attempt.lock().expect("attempt lock").clone()],
                 }
             }
@@ -206,6 +211,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
                     }),
                     request: Some(handoff.request),
                     model: Some(handoff.model),
+                    requested_stream: handoff.stream,
                     attempts: vec![attempt.lock().expect("attempt lock").clone()],
                 }
             }
@@ -266,6 +272,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
         body: response,
         request: Some(handoff.request),
         model: Some(handoff.model),
+        requested_stream: handoff.stream,
         attempts,
     }
 }

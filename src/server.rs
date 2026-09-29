@@ -709,7 +709,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
                 finished_at = ?finished_at,
                 "chat completions upstream attempt finished"
             );
-            if !streaming {
+            if !reply.requested_stream {
                 let provider = (!attempt.provider.is_empty() && attempt.provider != "unassigned")
                     .then_some(attempt.provider.as_str());
                 let account = (!attempt.account.is_empty() && attempt.account != "unassigned")
