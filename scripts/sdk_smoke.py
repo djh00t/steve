@@ -16,6 +16,12 @@ OPENAI_SDK_VERSION = "3.6.0"
 READY_TIMEOUT_SECONDS = 15
 
 
+def require(condition, message):
+    """Keep gate evidence active when Python optimization is enabled."""
+    if not condition:
+        raise RuntimeError(message)
+
+
 def log_tail(log_path):
     try:
         return "\n".join(log_path.read_text(encoding="utf-8").splitlines()[-20:])[-4000:]
@@ -57,14 +63,18 @@ def ready_address(child, log_path, event, address_field):
 
 
 def stop(child):
-    if child is None or child.poll() is not None:
+    if child is None:
         return
-    child.terminate()
-    try:
-        child.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        child.kill()
-        child.wait()
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired as error:
+                raise RuntimeError("failed to reap SDK smoke process after kill") from error
 
 
 def check_sdk(provider):
@@ -102,10 +112,10 @@ def anthropic_smoke(inference_addr, server_log, fixture_log):
             ) as stream:
                 streamed_text = "".join(stream.text_stream)
                 final_message = stream.get_final_message()
-            assert streamed_text == "steve-test-response", streamed_text
-            assert final_message.stop_reason == "end_turn", final_message.stop_reason
+            require(streamed_text == "steve-test-response", streamed_text)
+            require(final_message.stop_reason == "end_turn", final_message.stop_reason)
             final_text = [block.text for block in final_message.content if block.type == "text"]
-            assert final_text == ["steve-test-response"], final_message.content
+            require(final_text == ["steve-test-response"], final_message.content)
             client.close()
     except Exception as error:
         raise RuntimeError(
@@ -136,9 +146,12 @@ def openai_smoke(inference_addr, server_log, fixture_log):
                     event.delta for event in stream if event.type == "content.delta"
                 )
                 completion = stream.get_final_completion()
-            assert streamed_text == "steve-test-response", streamed_text
-            assert completion.choices[0].finish_reason == "stop", completion.choices
-            assert completion.choices[0].message.content == "steve-test-response"
+            require(streamed_text == "steve-test-response", streamed_text)
+            require(completion.choices[0].finish_reason == "stop", completion.choices)
+            require(
+                completion.choices[0].message.content == "steve-test-response",
+                completion.choices[0].message.content,
+            )
 
             with client.responses.stream(
                 model="steve-test-model",
@@ -156,21 +169,26 @@ def openai_smoke(inference_addr, server_log, fixture_log):
                     elif event.type == "response.output_text.delta":
                         streamed_text += event.delta
                 response = stream.get_final_response()
-            assert lifecycle == [
-                "response.created",
-                "response.in_progress",
-                "response.output_item.added",
-                "response.content_part.added",
-                "response.output_text.done",
-                "response.content_part.done",
-                "response.output_item.done",
-                "response.completed",
-            ], lifecycle
-            assert in_progress.status == "in_progress", in_progress
-            assert in_progress.id == response.id, (in_progress.id, response.id)
-            assert streamed_text == "steve-test-response", streamed_text
-            assert response.status == "completed", response.status
-            assert response.output_text == "steve-test-response", response.output_text
+            require(
+                lifecycle
+                == [
+                    "response.created",
+                    "response.in_progress",
+                    "response.output_item.added",
+                    "response.content_part.added",
+                    "response.output_text.done",
+                    "response.content_part.done",
+                    "response.output_item.done",
+                    "response.completed",
+                ],
+                lifecycle,
+            )
+            require(in_progress is not None, "response.in_progress event missing")
+            require(in_progress.status == "in_progress", in_progress)
+            require(in_progress.id == response.id, (in_progress.id, response.id))
+            require(streamed_text == "steve-test-response", streamed_text)
+            require(response.status == "completed", response.status)
+            require(response.output_text == "steve-test-response", response.output_text)
             client.close()
     except Exception as error:
         raise RuntimeError(

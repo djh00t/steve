@@ -462,7 +462,9 @@ fn clean_command(config_path: &Path) -> Command {
 }
 
 pub fn steve_command() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_steve"));
+    let binary =
+        std::env::var_os("STEVE_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_steve").into());
+    let mut command = Command::new(binary);
     for key in std::env::vars_os().map(|(key, _)| key).filter(|key| {
         let key = key.to_string_lossy();
         key.starts_with("STEVE_") || key.starts_with("RUST_LOG")

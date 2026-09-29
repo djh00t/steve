@@ -21,6 +21,8 @@ jobs:
         if: github.event_name == 'pull_request'
       - run: make quality-gates
         if: github.event_name == 'push'
+      - name: Verify Cargo.lock is unchanged
+        run: git diff --exit-code -- Cargo.lock
 
   official-sdk:
     runs-on: ubuntu-latest
@@ -35,10 +37,50 @@ jobs:
           "$RUNNER_TEMP/steve-sdk-venv/bin/python" -m pip install -r tests/requirements-sdk.txt
           "$RUNNER_TEMP/steve-sdk-venv/bin/python" -c 'from importlib.metadata import version; print("anthropic=" + version("anthropic")); print("openai=" + version("openai"))'
       - name: Build Steve
-        run: cargo build --all-features
+        run: cargo build --locked --all-features
       - name: Exercise official SDKs against local Steve
         timeout-minutes: 2
+        env:
+          PYTHONOPTIMIZE: "1"
         run: '"$RUNNER_TEMP/steve-sdk-venv/bin/python" scripts/sdk_smoke.py --provider all --binary target/debug/steve'
+
+  m1-release-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: steve_m1
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d steve_m1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      M1_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      M1_DEPLOYMENT_PATH: /var/lib/steve/accounting
+      STEVE_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/steve_m1
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run exact-candidate M1 functional gate
+        run: make m1-release-gate
+      - name: Upload M1 gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-release-gate-${{ env.M1_EXPECTED_SHA }}
+          path: target/m1-release-gate.json
+          if-no-files-found: error
 
   cross-platform:
     strategy:
@@ -58,8 +100,8 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets --all-features -- -D warnings
-          cargo check --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo check --locked --all-targets --all-features
 
   integrations:
     runs-on: ubuntu-latest
@@ -87,12 +129,12 @@ jobs:
           STEVE_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/steve
           STEVE_OBJECT_STORE: fs
           STEVE_OBJECT_ROOT: /tmp/steve-objects
-        run: cargo run -- doctor
+        run: cargo run --locked -- doctor
 
       - name: PostgreSQL database serve parity
         env:
           STEVE_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/steve
-        run: cargo test --test e2e --all-features database_backend_contract
+        run: cargo test --locked --test e2e --all-features database_backend_contract
 
       - name: Start S3-compatible test server
         run: |
@@ -135,7 +177,7 @@ jobs:
       - name: Object store backend parity
         env:
           STEVE_TEST_S3_ENDPOINT: http://127.0.0.1:5000
-        run: cargo test --bin steve --all-features object_store_backend_contract -- --nocapture
+        run: cargo test --locked --bin steve --all-features object_store_backend_contract -- --nocapture
 
       - name: S3-compatible doctor
         env:
@@ -147,7 +189,7 @@ jobs:
           STEVE_S3_REGION: us-east-1
           STEVE_S3_ACCESS_KEY_ID: test
           STEVE_S3_SECRET_ACCESS_KEY: test
-        run: cargo run -- doctor
+        run: cargo run --locked -- doctor
 
   container:
     if: github.event_name == 'push'

@@ -67,6 +67,8 @@ steve migrate
 
 **M1 — real proxy hot path: in progress.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. Chat Completions JSON/SSE, Responses JSON/SSE, and Anthropic Messages JSON/SSE forward to configured local fixtures; streams preserve raw event bytes, cancel upstream work when the client disconnects, and keep request guards until the response body ends. Non-stream Chat Completions includes bounded retry/multi-attempt tracking, and management provider-health probes are implemented. Final M1 acceptance and deferred side-effect integration remain.
 
+The combined candidate gate is runnable with `make m1-release-gate` or the browser-guided `make m1-demo`. Both require `M1_DEPLOYMENT_PATH` and an isolated `STEVE_TEST_POSTGRES_URL`; first create target evidence with `M1_TARGET_PARENT=/existing/deployment/parent M1_DEPLOYMENT_PATH=/intended/accounting/root make m1-target-qualification`. The gate builds with the tracked `Cargo.lock`, routes every Rust scenario through its recorded candidate binary, and keeps functional, hosted, target, legacy-adoption, and operator evidence separate. Operator acceptance is pending and required for every result. Its current candidate status is unaccepted until the combined gate has exact-head hosted evidence and target qualification. Windows/NTFS remains open and unknown under STV-M0-17.
+
 The MVP stays a complete vertical slice. Delivery order is in the [MVP plan](docs/plans/2026-09-26-steve-mvp.md). Protocol and product boundaries are in the [architecture spec](docs/specs/2026-09-26-steve-gateway.md).
 
 ## Chat Completions forwarding
