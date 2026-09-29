@@ -1,10 +1,10 @@
-# STV-M0-16: accounting incident and admission contract proposal
+# STV-M0-16: accounting incident and admission working design baseline
 
-**Status: proposal for David/Cos review; not accepted.** This preserves #84's accepted choice: preserve forwarding, fail visibly, stop later inference. It proposes externally visible semantics only. #484 owns storage ownership and replacement mechanisms; #485 owns drain/replay acknowledgements. No mechanism or persistence guarantee is specified here.
+**Status: owner-selected working design baseline for M1 engineering.** Final operator and release acceptance occurs once, at the combined touchable M1 release gate. This preserves #84's chosen policy: preserve forwarding, fail visibly, stop later inference. It defines externally visible semantics only. #484 owns storage ownership and replacement mechanisms; #485 owns drain/replay acknowledgements. No mechanism, runtime completion, or persistence guarantee is claimed here.
 
 Source review: verified against current main `675533dbe0e2d00af9ec71ca59eb34d9151ba63f`. Relevant seams are `src/deferred.rs::{QueueStats, spill_accounting_event}`, `src/server.rs::{ready, status, admit_inference}`, and `src/lifecycle.rs`. Current `accounting_spilled` means accepted by the journal channel, not written or durable; `accounting_lost` is a counter. Current readiness only reflects lifecycle phase, and inference admission has no accounting-failure gate. This is source-review context only; it makes no runtime guarantee.
 
-## Proposed state and transition table
+## State and transition table
 
 | State | Entry / transition | Inference admission | Readiness | Meaning |
 |---|---|---|---|---|
@@ -15,7 +15,7 @@ Source review: verified against current main `675533dbe0e2d00af9ec71ca59eb34d915
 
 The local cutoff is when a serving process observes the failure and latches `blocked`, serialized with that process's admission. This does not promise an instantaneous cluster-wide cutoff before another process observes the incident. #484 must define the logical owner identity, overlap propagation and restart handoff before implementation is ready. A request admitted before that point may finish normally, including its existing upstream forwarding. A failure discovered asynchronously cannot revoke already admitted work; once observed, subsequent inference admission is rejected while the incident remains blocked or unreconciled. Management status and recovery inspection remain available subject to existing management admission limits.
 
-## Proposed status and error contract
+## Status and error contract
 
 Keep `GET /api/v1/system/status` HTTP `200` while the process can answer. Add this required object; do not infer incident state from `queues.accounting_spilled` alone:
 
@@ -76,9 +76,9 @@ Literal `GET /health/ready` response fixture: HTTP 503. The lifecycle may still 
 {"status":"not_ready","phase":"ready","inflight":1,"admission":{"inference":{"limit":32,"active":1,"rejected_total":0},"management":{"limit":4,"active":0,"rejected_total":0}},"accounting_incident":{"state":"blocked","incident_id":"01995200-0000-7000-8000-000000000001","first_observed_at":"2026-09-27T08:00:00Z","cause":"primary_and_journal_unavailable","disposition":null,"payloads":{"pending_replay":{"volatile":0,"durable":0},"provisional":{"unknown":0},"outcome_totals":{"reconciled":0,"unrecoverable_lost":1}}}}
 ```
 
-## Recovery and incident lifetime proposal
+## Recovery and incident lifetime baseline
 
-**Proposal pending David/Cos acceptance: recommend sticky incident semantics across process restart**, represented as `unreconciled` when a known unresolved incident or an ambiguous crash state is inherited by the same logical owner, until verified recovery evidence closes it. Healthy replacement remains eligible for ready-before-old-exit; the mere presence of an active predecessor is not failure evidence. This avoids silently reopening inference after a restart that may have followed loss. Tradeoff: startup/readiness can remain blocked until #484/#485 provide ownership and recovery evidence; #483 does not prescribe how that evidence is stored or handed across overlapping processes.
+Use sticky incident semantics across process restart, represented as `unreconciled` when a known unresolved incident or an ambiguous crash state is inherited by the same logical owner, until verified recovery evidence closes it. Healthy replacement remains eligible for ready-before-old-exit; the mere presence of an active predecessor is not failure evidence. This avoids silently reopening inference after a restart that may have followed loss. Tradeoff: startup/readiness can remain blocked until #484/#485 provide ownership and recovery evidence; #483 does not prescribe how that evidence is stored or handed across overlapping processes.
 
 Acknowledgement requires an internally consistent closure snapshot: every volatile item must have been reconciled or truthfully classified as irrecoverably lost/unknown under #484/#485 evidence, and no known retained item may be discarded or relabeled merely to open admission. Pending replay counts must be zero before acknowledgement; terminal outcome totals and any accepted provisional uncertainty remain attached to the incident as its outcome record. A verified durable acknowledged record restores as acknowledged, preserving outcome totals, provisional uncertainty and disposition; missing or unverifiable acknowledgement restores as unreconciled, never clear.
 
@@ -93,18 +93,18 @@ Only confirmed durable retained payloads can be called replayable; resumption re
 - **Negative:** status reports `accounting_spilled > 0` as proof that all affected events are durable/replayable.
 - **Negative:** a known unresolved incident is reset merely by restart, or an event ID is presented as reconstruction of a lost payload.
 
-Consumers #94 and accounting implementation briefs should consume these exact state names, nullable-count rules, cutoff, 503 code, and recovery distinction only after David/Cos accepts this artifact. #484 must supply the mechanism and ownership that can truthfully establish cross-restart state; #485 must define replay acknowledgement and evidence. They must not weaken the accepted forwarding choice or assume ready-before-old-exit is overridden.
+Consumers #94 and accounting implementation briefs must use these exact state names, nullable-count rules, cutoff, 503 code, and recovery distinction as the working design baseline. #484 must supply the mechanism and ownership that can truthfully establish cross-restart state; #485 must define replay acknowledgement and evidence. They must not weaken the chosen forwarding policy or assume ready-before-old-exit is overridden. Final acceptance remains at the combined M1 release gate.
 
 ## Executable consumer qualification gate (not implemented)
 
-This proposal does not supply a runnable runtime qualification today and cannot unblock consumers by itself. Once #483/#484/#485 are accepted, the consumer handoff must add `tests/e2e_accounting_incident.rs` with the real-process scenario `accounting_incident_preserves_forwarding_and_restart_evidence`. Its exact qualification command is:
+This working baseline does not supply a runnable runtime qualification today and cannot unblock consumers by itself. The consumer handoff must add the real-process scenario `accounting_incident_preserves_forwarding_and_restart_evidence` to `tests/e2e_accounting.rs`. Its exact qualification command is:
 
 ```sh
-cargo test --all-features --test e2e_accounting_incident accounting_incident_preserves_forwarding_and_restart_evidence -- --exact --nocapture
+cargo test --all-features --test e2e_accounting accounting_incident_preserves_forwarding_and_restart_evidence -- --exact --nocapture
 ```
 
-The target does not exist yet; this command is a reserved consumer contract, not passing evidence. Dispatch requires an implementation brief owning that target and the accepted fault-injection/restart seams. Completion requires exactly one selected, passing scenario (zero selected is failure). Given an already admitted held upstream response, force both accounting paths to fail; prove the response still completes, later inference gets the exact 503, readiness is false, liveness/status remain available, and public disposition identity/reference fields are redacted. Restart the same owner and prove the accepted incident policy survives, then exercise the accepted recorded disposition and mixed-loss/uncertainty state. Fail the test when the incident gate or restart evidence check is deliberately bypassed. The accepted ownership/completion contracts must make those seams deterministic before this scenario is implemented; no placeholder test or simulated passing evidence is sufficient.
+The target does not exist yet; this command is a reserved consumer contract, not passing evidence. Dispatch requires an implementation brief owning that target and the defined fault-injection/restart seams. Completion requires exactly one selected, passing scenario (zero selected is failure). Given an already admitted held upstream response, force both accounting paths to fail; prove the response still completes, later inference gets the exact 503, readiness is false, liveness/status remain available, and public disposition identity/reference fields are redacted. Restart the same owner and prove the incident policy survives, then exercise the recorded disposition and mixed-loss/uncertainty state. Fail the test when the incident gate or restart evidence check is deliberately bypassed. The ownership/completion contracts must make those seams deterministic before this scenario is implemented; no placeholder test or simulated passing evidence is sufficient.
 
-**Unresolved acceptance question (proposal pending David/Cos acceptance):** Keep incidents blocked across restart, but permit an authorized operator to explicitly accept confirmed or irreducible possible loss and resume with a visible `acknowledged` incident? Recommendation: yes. The alternatives are restart clearing the incident, or requiring proven recovery even when uncertainty is irreducible (potentially permanent blocking). This extends the settled forwarding policy; it is not accepted until David/Cos decides.
+**Working baseline:** Keep incidents blocked across restart, but permit an authorized operator to explicitly accept confirmed or irreducible possible loss and resume with a visible `acknowledged` incident. Final operator and release acceptance of this behavior remains part of the combined M1 release gate.
 
-#484 acceptance dependency: demonstrate affirmative no-incident/reconciled evidence for healthy overlapping replacement while the predecessor is alive; old-process exit cannot be the only proof. The proposed acknowledgement must remain auditable through restart. #485 defines completion acknowledgements; implementation is blocked until both mechanisms are accepted and qualified.
+#484 implementation dependency: demonstrate affirmative no-incident/reconciled evidence for healthy overlapping replacement while the predecessor is alive; old-process exit cannot be the only proof. The acknowledgement must remain auditable through restart. #485 defines completion acknowledgements; runtime completion remains blocked until both mechanisms are implemented and qualified.
