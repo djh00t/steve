@@ -105,7 +105,8 @@ head SHA, compares base and head with `git diff --name-only --no-renames`, and
 runs only when a qualified source, test, fixture, Cargo manifest/lockfile,
 mutation patch/runner/verifier, or this workflow changed. The no-renames diff
 reports both old and new paths for a rename and includes head additions. The
-existing broad CI jobs remain in effect. The targeted job runs `make check`,
+other PR checks remain in effect; broad quality and container gates run on
+`main` after merge. The targeted job runs `make check`,
 the buffering runner's SIGTERM cleanup check, both generated mutants, and the
 reviewed buffering patch qualification. Mutation builds use cargo-mutants'
 disposable targets; inherited `CARGO_TARGET_DIR` is unset so they cannot reuse
