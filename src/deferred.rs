@@ -1,5 +1,5 @@
 use crate::{
-    accounting::{AccountingCoordinator, AccountingEvent, IncidentCause},
+    accounting::{AccountingCoordinator, AccountingDrainCounts, AccountingEvent, IncidentCause},
     config::Config,
     storage::{DatabasePool, InsertBackgroundEvent, ObjectStorage},
 };
@@ -22,13 +22,20 @@ pub struct DeferredQueues {
     accounting: Arc<Mutex<Option<mpsc::Sender<AccountingEvent>>>>,
     accounting_worker: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     accounting_journal: AccountingCoordinator,
-    history: mpsc::Sender<HistoryEvent>,
-    telemetry: mpsc::Sender<TelemetryEvent>,
+    background_db: DatabasePool,
+    accounting_retry: AccountingRetryPolicy,
+    history: Arc<Mutex<Option<mpsc::Sender<HistoryEvent>>>>,
+    history_worker: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    telemetry: Arc<Mutex<Option<mpsc::Sender<TelemetryEvent>>>>,
+    telemetry_worker: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     stats: Arc<QueueStats>,
 }
 
 #[derive(Default)]
 pub struct QueueStats {
+    accounting_admitted: AtomicU64,
+    accounting_completed: AtomicU64,
+    accounting_database_committed: AtomicU64,
     pub accounting_spilled: AtomicU64,
     pub accounting_lost: AtomicU64,
     pub history_dropped: AtomicU64,
@@ -99,12 +106,16 @@ impl DeferredQueues {
             retry_deadline: Duration::from_millis(cfg.queues.accounting_retry_deadline_ms),
             retry_interval: Duration::from_millis(cfg.queues.accounting_retry_interval_ms),
         };
+        let database_for_worker = background_db.clone();
         let accounting_worker = tokio::spawn(async move {
             while let Some(event) = accounting_rx.recv().await {
                 let outcome =
-                    insert_accounting_event(&background_db, &event, accounting_retry).await;
+                    insert_accounting_event(&database_for_worker, &event, accounting_retry).await;
                 match outcome {
                     InsertBackgroundEvent::Inserted | InsertBackgroundEvent::DuplicateIdentical => {
+                        stats_for_worker
+                            .accounting_database_committed
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     InsertBackgroundEvent::DuplicateConflict { .. } => {
                         error!(event_id = %event.id, "background accounting content conflict");
@@ -143,10 +154,13 @@ impl DeferredQueues {
                         );
                     }
                 }
+                stats_for_worker
+                    .accounting_completed
+                    .fetch_add(1, Ordering::Release);
             }
         });
 
-        tokio::spawn(async move {
+        let history_worker = tokio::spawn(async move {
             while let Some(event) = history_rx.recv().await {
                 if let Err(err) = objects.put(&event.key, event.data).await {
                     error!(%err, key = %event.key, "background history write failed");
@@ -154,7 +168,7 @@ impl DeferredQueues {
             }
         });
 
-        tokio::spawn(async move {
+        let telemetry_worker = tokio::spawn(async move {
             while let Some(event) = telemetry_rx.recv().await {
                 tracing::info!(kind = event.kind, payload = %event.payload, "deferred telemetry");
             }
@@ -164,14 +178,21 @@ impl DeferredQueues {
             accounting: Arc::new(Mutex::new(Some(accounting_tx))),
             accounting_worker: Arc::new(tokio::sync::Mutex::new(Some(accounting_worker))),
             accounting_journal,
-            history: history_tx,
-            telemetry: telemetry_tx,
+            background_db,
+            accounting_retry,
+            history: Arc::new(Mutex::new(Some(history_tx))),
+            history_worker: Arc::new(tokio::sync::Mutex::new(Some(history_worker))),
+            telemetry: Arc::new(Mutex::new(Some(telemetry_tx))),
+            telemetry_worker: Arc::new(tokio::sync::Mutex::new(Some(telemetry_worker))),
             stats,
         })
     }
 
     pub fn accounting(&self, kind: &'static str, payload: Value) {
         let event = AccountingEvent::new(kind, payload);
+        self.stats
+            .accounting_admitted
+            .fetch_add(1, Ordering::Release);
         let sender = self
             .accounting
             .lock()
@@ -195,45 +216,108 @@ impl DeferredQueues {
                     1,
                     0,
                 );
+                self.stats
+                    .accounting_completed
+                    .fetch_add(1, Ordering::Release);
             }
         }
     }
 
-    pub async fn shutdown_accounting(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| anyhow::anyhow!("accounting shutdown deadline is out of range"))?;
-        self.accounting.lock().expect("accounting producer").take();
-        if let Some(worker) = self.accounting_worker.lock().await.take() {
-            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), worker)
-                .await
-                .map_err(|_| anyhow::anyhow!("timed out stopping accounting worker"))?
-                .map_err(|error| anyhow::anyhow!("accounting worker failed: {error}"))?;
-        }
+    pub async fn prepare_shutdown(&self, deadline: Instant) -> Result<()> {
         let coordinator = self.accounting_journal.clone();
-        let shutdown = tokio::task::spawn_blocking(move || {
-            coordinator.begin_shutdown(deadline.saturating_duration_since(Instant::now()))
-        });
-        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), shutdown)
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out finalizing accounting ownership"))?
-            .map_err(|error| anyhow::anyhow!("accounting shutdown task failed: {error}"))??;
+        let remaining = remaining(deadline, "preparing accounting shutdown")?;
+        tokio::time::timeout(
+            remaining,
+            tokio::task::spawn_blocking(move || coordinator.prepare_shutdown(deadline)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out preparing accounting shutdown"))?
+        .map_err(|error| anyhow::anyhow!("accounting shutdown task failed: {error}"))??;
         Ok(())
     }
 
+    pub async fn mark_unclean(&self, deadline: Instant) -> Result<()> {
+        let coordinator = self.accounting_journal.clone();
+        let counts = self.accounting_counts();
+        tokio::time::timeout(
+            remaining(deadline, "publishing conservative unclean evidence")?,
+            tokio::task::spawn_blocking(move || coordinator.mark_unclean(counts)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out publishing conservative unclean evidence"))?
+        .map_err(|error| anyhow::anyhow!("unclean accounting evidence task failed: {error}"))??;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self, deadline: Instant) -> Result<()> {
+        self.accounting.lock().expect("accounting producer").take();
+        self.history.lock().expect("history producer").take();
+        self.telemetry.lock().expect("telemetry producer").take();
+        let evidence = self.mark_unclean(deadline).await;
+        join_worker(&self.accounting_worker, deadline, "accounting").await?;
+        self.mark_unclean(deadline).await?;
+        join_worker(&self.history_worker, deadline, "history").await?;
+        join_worker(&self.telemetry_worker, deadline, "telemetry").await?;
+        let counts = self.accounting_counts();
+        let coordinator = self.accounting_journal.clone();
+        let finish =
+            tokio::task::spawn_blocking(move || coordinator.finish_shutdown(deadline, counts));
+        tokio::time::timeout(
+            remaining(deadline, "finalizing accounting ownership")?,
+            finish,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out finalizing accounting ownership"))?
+        .map_err(|error| anyhow::anyhow!("accounting shutdown task failed: {error}"))??;
+        let remaining = remaining(deadline, "reconciling accounting shutdown")?;
+        tokio::time::timeout(
+            remaining,
+            AccountingCoordinator::reconcile_shutdown(
+                self.accounting_journal.root(),
+                &self.background_db,
+                self.accounting_retry.operation_timeout.min(remaining),
+                self.accounting_retry.retry_deadline.min(remaining),
+                self.accounting_retry.retry_interval,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out reconciling accounting shutdown"))??;
+        evidence?;
+        Ok(())
+    }
+
+    fn accounting_counts(&self) -> AccountingDrainCounts {
+        AccountingDrainCounts {
+            admitted: self.stats.accounting_admitted.load(Ordering::Acquire),
+            worker_completed: self.stats.accounting_completed.load(Ordering::Acquire),
+            database_committed: self
+                .stats
+                .accounting_database_committed
+                .load(Ordering::Acquire),
+        }
+    }
+
     pub fn history(&self, key: String, data: Bytes) {
-        if self.history.try_send(HistoryEvent { key, data }).is_err() {
+        let sender = self
+            .history
+            .lock()
+            .expect("history producer")
+            .as_ref()
+            .cloned();
+        if sender.is_none_or(|sender| sender.try_send(HistoryEvent { key, data }).is_err()) {
             self.stats.history_dropped.fetch_add(1, Ordering::Relaxed);
             warn!("history queue saturated; payload dropped");
         }
     }
 
     pub fn telemetry(&self, kind: &'static str, payload: Value) {
-        if self
+        let sender = self
             .telemetry
-            .try_send(TelemetryEvent { kind, payload })
-            .is_err()
-        {
+            .lock()
+            .expect("telemetry producer")
+            .as_ref()
+            .cloned();
+        if sender.is_none_or(|sender| sender.try_send(TelemetryEvent { kind, payload }).is_err()) {
             self.stats.telemetry_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -254,6 +338,34 @@ impl DeferredQueues {
     pub fn with_accounting_admission<T>(&self, admit: impl FnOnce() -> T) -> Result<T, Value> {
         self.accounting_journal.with_incident_admission(admit)
     }
+}
+
+async fn join_worker(
+    worker: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    deadline: Instant,
+    name: &str,
+) -> Result<()> {
+    let mut worker = worker.lock().await;
+    let Some(handle) = worker.as_mut() else {
+        return Ok(());
+    };
+    tokio::time::timeout(
+        remaining(deadline, &format!("stopping {name} worker"))?,
+        handle,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out stopping {name} worker"))?
+    .map_err(|error| anyhow::anyhow!("{name} worker failed: {error}"))?;
+    worker.take();
+    Ok(())
+}
+
+fn remaining(deadline: Instant, operation: &str) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("timed out {operation}");
+    }
+    Ok(remaining)
 }
 
 fn spill_accounting_event(

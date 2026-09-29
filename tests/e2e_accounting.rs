@@ -1,8 +1,11 @@
 #![allow(dead_code)]
 
+#[path = "support/object_store.rs"]
+mod object_store;
 #[path = "support/process.rs"]
 mod process;
 
+use object_store::HeldObjectStoreEndpoint;
 use process::{acquire_accounting_startup_lock, steve_command, SteveProcess};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -351,6 +354,460 @@ async fn wait_for_accounting_settle(root: &Path, database_url: &str, admitted: u
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+fn latest_generation_state(root: &Path) -> Value {
+    let mut states = fs::read_dir(root.join("generations"))
+        .expect("read generation states")
+        .map(|entry| entry.expect("generation state entry").path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".state.json"))
+        })
+        .collect::<Vec<_>>();
+    states.sort();
+    let path = states.last().expect("latest generation state");
+    serde_json::from_slice(&fs::read(path).expect("read latest generation state"))
+        .expect("valid latest generation state")
+}
+
+async fn wait_for_generation_phase(root: &Path, phase: &str) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state = latest_generation_state(root);
+            if state["phase"] == phase {
+                break state;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("generation did not reach {phase}"))
+}
+
+#[derive(Clone, Copy)]
+enum ShutdownTrigger {
+    Management,
+    Signal,
+}
+
+async fn trigger_shutdown(
+    process: &mut SteveProcess,
+    management: std::net::SocketAddr,
+    trigger: ShutdownTrigger,
+) {
+    match trigger {
+        ShutdownTrigger::Management => {
+            let response = reqwest::Client::new()
+                .post(format!("http://{management}/api/v1/system/drain"))
+                .send()
+                .await
+                .expect("request management drain");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+        ShutdownTrigger::Signal => process.send_sigterm().expect("send SIGTERM"),
+    }
+}
+
+#[tokio::test]
+async fn accounting_shutdown_barriers_complete() {
+    for trigger in [ShutdownTrigger::Management, ShutdownTrigger::Signal] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting-root");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("shutdown.db").display()
+        );
+        assert!(
+            provision(&root).status.success(),
+            "provision accounting root"
+        );
+        let pool = prepare_sqlite(&database_url).await;
+        let mut process =
+            SteveProcess::start_with_shutdown_fixture(&database_url, &root, 3, 100, 500, 25)
+                .expect("start shutdown fixture");
+        let listeners = process
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .expect("shutdown fixture ready");
+        let payload = json!({"value": {"shutdown": "barrier"}});
+        let response: Value = reqwest::Client::new()
+            .post(format!("http://{}/api/v1/test/echo", listeners.inference))
+            .json(&payload)
+            .send()
+            .await
+            .expect("send accounting event")
+            .error_for_status()
+            .expect("echo status")
+            .json()
+            .await
+            .expect("echo JSON");
+        assert_eq!(response, payload);
+
+        trigger_shutdown(&mut process, listeners.management, trigger).await;
+        let state = wait_for_generation_phase(&root, "reconciled").await;
+        assert_eq!(state["admitted_count"], 1);
+        assert_eq!(state["worker_completed_count"], 1);
+        assert_eq!(state["database_committed_count"], 1);
+
+        match trigger {
+            ShutdownTrigger::Management => {
+                assert!(process.is_running().expect("inspect drained process"));
+                let ready = reqwest::get(format!("http://{}/health/ready", listeners.management))
+                    .await
+                    .expect("read drained readiness");
+                assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+                let live = reqwest::get(format!("http://{}/health/live", listeners.management))
+                    .await
+                    .expect("read drained liveness");
+                assert_eq!(live.status(), reqwest::StatusCode::OK);
+                process.send_sigterm().expect("stop drained process");
+            }
+            ShutdownTrigger::Signal => {}
+        }
+        let status = process
+            .wait_for_exit(Duration::from_secs(5))
+            .await
+            .expect("shutdown process exits");
+        assert!(status.success(), "clean shutdown failed: {status}");
+        assert_eq!(sqlite_events(&database_url).await.len(), 1);
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn accounting_shutdown_timeout_survives_restart() {
+    for trigger in [ShutdownTrigger::Management, ShutdownTrigger::Signal] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting-root");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("timeout.db").display()
+        );
+        assert!(
+            provision(&root).status.success(),
+            "provision accounting root"
+        );
+        let pool = prepare_sqlite(&database_url).await;
+        let mut lock = pool.acquire().await.expect("acquire SQLite writer");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *lock)
+            .await
+            .expect("hold SQLite writer");
+
+        let mut process =
+            SteveProcess::start_with_shutdown_fixture(&database_url, &root, 3, 100, 5_000, 25)
+                .expect("start timeout fixture");
+        let listeners = process
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .expect("timeout fixture ready");
+        reqwest::Client::new()
+            .post(format!("http://{}/api/v1/test/echo", listeners.inference))
+            .json(&json!({"value": {"shutdown": "timeout"}}))
+            .send()
+            .await
+            .expect("send held accounting event")
+            .error_for_status()
+            .expect("held event response");
+
+        trigger_shutdown(&mut process, listeners.management, trigger).await;
+        wait_for_generation_phase(&root, "unclean").await;
+        assert!(
+            process
+                .is_running()
+                .expect("predecessor is live before successor startup"),
+            "predecessor exited before the live-ownership check"
+        );
+
+        let mut successor =
+            SteveProcess::start_with_shutdown_fixture(&database_url, &root, 1, 100, 200, 25)
+                .expect("start successor while predecessor owns generation");
+        let successor_status = successor
+            .wait_for_exit(Duration::from_millis(500))
+            .await
+            .expect("live predecessor journal lock rejects successor");
+        assert!(
+            !successor_status.success(),
+            "successor acquired accounting ownership while predecessor writer was live"
+        );
+        assert!(
+            successor.log_output().contains("busy generation")
+                || successor.log_output().contains("still serving")
+                || successor
+                    .log_output()
+                    .contains("timed out acquiring accounting file lock"),
+            "successor failed for a reason other than live accounting ownership:\n{}",
+            successor.log_output()
+        );
+        drop(successor);
+        assert!(process
+            .is_running()
+            .expect("inspect predecessor before deadline"));
+
+        let unresolved = wait_for_generation_phase(&root, "unclean").await;
+        assert_eq!(unresolved["admitted_count"], 1);
+        assert_eq!(unresolved["worker_completed_count"], 0);
+        assert_eq!(unresolved["database_committed_count"], 0);
+        assert_eq!(unresolved["journal_synced_count"], 0);
+
+        match trigger {
+            ShutdownTrigger::Management => {
+                assert!(process.is_running().expect("management drain stays alive"));
+                let ready = reqwest::get(format!("http://{}/health/ready", listeners.management))
+                    .await
+                    .expect("timed-out management readiness");
+                assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+                let live = reqwest::get(format!("http://{}/health/live", listeners.management))
+                    .await
+                    .expect("timed-out management liveness");
+                assert_eq!(live.status(), reqwest::StatusCode::OK);
+                process
+                    .send_sigterm()
+                    .expect("terminate timed-out management drain");
+            }
+            ShutdownTrigger::Signal => {}
+        }
+        let status = process
+            .wait_for_exit(Duration::from_secs(5))
+            .await
+            .expect("timed-out signal exits within the shared bound");
+        assert!(
+            !status.success(),
+            "timeout must be a non-success drain result"
+        );
+        let mut restarted =
+            SteveProcess::start_with_shutdown_fixture(&database_url, &root, 1, 100, 200, 25)
+                .expect("restart after predecessor termination");
+        let restarted_listeners = restarted
+            .wait_ready(Duration::from_secs(3))
+            .await
+            .expect("restart exposes fail-closed management surface");
+        let ready = reqwest::get(format!(
+            "http://{}/health/ready",
+            restarted_listeners.management
+        ))
+        .await
+        .expect("restart readiness");
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let ready: Value = ready.json().await.expect("restart readiness JSON");
+        assert_eq!(ready["accounting_incident"]["state"], "unreconciled");
+        restarted.send_sigterm().expect("stop fail-closed restart");
+        restarted
+            .wait_for_exit(Duration::from_secs(3))
+            .await
+            .expect("fail-closed restart exits");
+
+        sqlx::query("ROLLBACK")
+            .execute(&mut *lock)
+            .await
+            .expect("release SQLite writer");
+        drop(lock);
+        pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn accounting_shutdown_bounds_held_nonstream_body() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("accounting-root");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        temp.path().join("held-body.db").display()
+    );
+    assert!(
+        provision(&root).status.success(),
+        "provision accounting root"
+    );
+    let _pool = prepare_sqlite(&database_url).await;
+    let mut process =
+        SteveProcess::start_with_shutdown_fixture(&database_url, &root, 1, 100, 500, 25)
+            .expect("start held-body fixture");
+    let listeners = process
+        .wait_ready(Duration::from_secs(10))
+        .await
+        .expect("held-body fixture ready");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("held-body client");
+    let response = client
+        .post(format!("http://{}/api/v1/test/echo", listeners.inference))
+        .json(&json!({
+            "value": {"shutdown": "held-nonstream-body"},
+            "hold_response_ms": 5_000
+        }))
+        .send()
+        .await
+        .expect("held nonstream response headers");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let status: Value = client
+        .get(format!(
+            "http://{}/api/v1/system/status",
+            listeners.management
+        ))
+        .send()
+        .await
+        .expect("held-body status")
+        .error_for_status()
+        .expect("held-body status code")
+        .json()
+        .await
+        .expect("held-body status JSON");
+    assert_eq!(status["active_inference_requests"], 1);
+
+    process.send_sigterm().expect("send held-body SIGTERM");
+    let exit = process
+        .wait_for_exit(Duration::from_secs(3))
+        .await
+        .expect("held nonstream response is cancelled within shutdown bound");
+    assert!(
+        !exit.success(),
+        "held response deadline must report non-success"
+    );
+    let state = wait_for_generation_phase(&root, "unclean").await;
+    assert_eq!(state["admitted_count"], 1);
+    assert!(state["worker_completed_count"].as_u64().is_some());
+    drop(response);
+}
+
+#[tokio::test]
+async fn accounting_shutdown_replay_timeout_stays_unclean() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("accounting-root");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        temp.path().join("replay-timeout.db").display()
+    );
+    assert!(
+        provision(&root).status.success(),
+        "provision accounting root"
+    );
+    let pool = prepare_sqlite(&database_url).await;
+    let mut lock = pool.acquire().await.expect("acquire SQLite writer");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .expect("hold SQLite writer");
+    let mut process =
+        SteveProcess::start_with_shutdown_fixture(&database_url, &root, 1, 50, 150, 25)
+            .expect("start replay-timeout fixture");
+    let listeners = process
+        .wait_ready(Duration::from_secs(10))
+        .await
+        .expect("replay-timeout fixture ready");
+    reqwest::Client::new()
+        .post(format!("http://{}/api/v1/test/echo", listeners.inference))
+        .json(&json!({"value": {"shutdown": "replay-timeout"}}))
+        .send()
+        .await
+        .expect("send replay-timeout event")
+        .error_for_status()
+        .expect("replay-timeout response");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if generation_journals(&root)
+                .iter()
+                .any(|journal| fs::metadata(journal).is_ok_and(|metadata| metadata.len() > 0))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("event spills to the synced journal before shutdown");
+
+    process.send_sigterm().expect("send replay-timeout SIGTERM");
+    let exit = process
+        .wait_for_exit(Duration::from_secs(3))
+        .await
+        .expect("replay timeout exits within shutdown bound");
+    assert!(!exit.success(), "replay timeout must report non-success");
+    let state = wait_for_generation_phase(&root, "unclean").await;
+    assert_eq!(state["admitted_count"], 1);
+    assert_eq!(state["worker_completed_count"], 1);
+    assert_eq!(state["database_committed_count"], 0);
+    assert_eq!(state["journal_synced_count"], 1);
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut *lock)
+        .await
+        .expect("release SQLite writer");
+}
+
+#[tokio::test]
+async fn accounting_counts_refresh_before_later_worker_timeout() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("accounting-root");
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        temp.path().join("history-timeout.db").display()
+    );
+    assert!(
+        provision(&root).status.success(),
+        "provision accounting root"
+    );
+    let pool = prepare_sqlite(&database_url).await;
+    let mut endpoint = HeldObjectStoreEndpoint::start()
+        .await
+        .expect("start held object store");
+    let mut process = SteveProcess::start_with_shutdown_and_object_store(
+        &database_url,
+        &root,
+        &endpoint.url(),
+        1,
+        100,
+        500,
+        25,
+    )
+    .expect("start later-worker-timeout fixture");
+    let listeners = process
+        .wait_ready(Duration::from_secs(10))
+        .await
+        .expect("later-worker-timeout fixture ready");
+    reqwest::Client::new()
+        .post(format!("http://{}/api/v1/test/echo", listeners.inference))
+        .json(&json!({"value": {"shutdown": "history-timeout"}}))
+        .send()
+        .await
+        .expect("send history-timeout event")
+        .error_for_status()
+        .expect("history-timeout response");
+    endpoint
+        .wait_for_put(Duration::from_secs(3))
+        .await
+        .expect("history worker reaches held PutObject");
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while sqlite_events(&database_url).await.len() != 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("accounting worker commits before shutdown");
+
+    process
+        .send_sigterm()
+        .expect("send history-timeout SIGTERM");
+    let exit = process
+        .wait_for_exit(Duration::from_secs(3))
+        .await
+        .expect("later worker timeout exits within shutdown bound");
+    assert!(
+        !exit.success(),
+        "later worker timeout must report non-success"
+    );
+    let state = wait_for_generation_phase(&root, "unclean").await;
+    assert_eq!(state["admitted_count"], 1);
+    assert_eq!(state["worker_completed_count"], 1);
+    assert_eq!(state["database_committed_count"], 1);
+    assert_eq!(state["journal_synced_count"], 0);
+
+    let _ = endpoint.release();
+    endpoint.shutdown().await.expect("stop held object store");
+    pool.close().await;
 }
 
 async fn induce_runtime_incident(
@@ -2340,17 +2797,17 @@ async fn accounting_reconciles_after_db_recovery() {
     assert_eq!(active_state["phase"], "active");
     assert_eq!(active_state["journal_length"], journal_bytes.len() as u64);
 
+    sqlx::query("COMMIT")
+        .execute(&mut *lock)
+        .await
+        .expect("release SQLite write lock before shutdown reconciliation");
+    drop(lock);
     process.send_sigterm().expect("stop recovery Steve");
     let status = process
         .wait_for_exit(Duration::from_secs(5))
         .await
         .expect("recovery Steve exits");
     assert!(status.success(), "recovery Steve exited with {status}");
-    sqlx::query("COMMIT")
-        .execute(&mut *lock)
-        .await
-        .expect("release SQLite write lock after shutdown");
-    drop(lock);
 
     let mut restarted = SteveProcess::start_with_database_and_accounting(
         &database_url,

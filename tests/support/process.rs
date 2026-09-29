@@ -178,6 +178,53 @@ impl SteveProcess {
         )
     }
 
+    #[allow(dead_code)]
+    pub fn start_with_shutdown_fixture(
+        database_url: &str,
+        accounting_root: &Path,
+        drain_timeout_seconds: u64,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            None,
+            None,
+            drain_timeout_seconds,
+            None,
+            None,
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn start_with_shutdown_and_object_store(
+        database_url: &str,
+        accounting_root: &Path,
+        object_store_endpoint: &str,
+        drain_timeout_seconds: u64,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            None,
+            None,
+            drain_timeout_seconds,
+            Some(object_store_endpoint),
+            Some(16),
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            None,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn start_with_options(
         openai_upstream_url: Option<&str>,
@@ -373,6 +420,16 @@ impl SteveProcess {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_running(&mut self) -> io::Result<bool> {
+        Ok(self.child.try_wait()?.is_none())
+    }
+
+    #[allow(dead_code)]
+    pub fn log_output(&self) -> String {
+        self.logs()
     }
 
     pub fn database_path(&self) -> PathBuf {

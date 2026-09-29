@@ -143,6 +143,7 @@ struct ReplayPolicy {
     operation_timeout: Duration,
     retry_deadline: Duration,
     retry_interval: Duration,
+    allow_unclean_completion: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -215,6 +216,8 @@ pub(crate) struct AccountingCoordinator {
     generation_id: String,
     journal: SyncSender<JournalMessage>,
     journal_writer: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    #[allow(dead_code)]
+    final_sync_fault: Arc<AtomicBool>,
     accepting: Arc<AtomicBool>,
     state: Arc<Mutex<GenerationState>>,
     incident: Arc<Mutex<Incident>>,
@@ -247,7 +250,7 @@ struct IncidentPublication {
 
 enum JournalMessage {
     Event(AccountingEvent),
-    Shutdown(SyncSender<()>),
+    Shutdown(SyncSender<std::result::Result<(), String>>),
 }
 
 enum IncidentPublisherMessage {
@@ -261,6 +264,13 @@ pub(crate) struct AccountingSnapshot {
     pub(crate) installation_id: String,
     pub(crate) revision: u64,
     pub(crate) coverage: Vec<Coverage>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AccountingDrainCounts {
+    pub(crate) admitted: u64,
+    pub(crate) worker_completed: u64,
+    pub(crate) database_committed: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -416,6 +426,7 @@ struct GenerationState {
 enum GenerationPhase {
     Active,
     Draining,
+    Unclean,
     Adopting,
     Reconciled,
 }
@@ -583,7 +594,10 @@ fn has_unowned_incomplete_generation(root: &Path, incident: &Incident) -> Result
         let state: GenerationState = read_checked(path)?;
         if !matches!(
             state.phase,
-            GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Adopting
+            GenerationPhase::Active
+                | GenerationPhase::Draining
+                | GenerationPhase::Unclean
+                | GenerationPhase::Adopting
         ) {
             continue;
         }
@@ -903,6 +917,10 @@ fn publish_abandoned_active(root: &Path, state: &GenerationState) -> Result<()> 
 }
 
 impl AccountingCoordinator {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn provision(root: &Path) -> Result<()> {
         provision_root(root, None)
     }
@@ -982,6 +1000,26 @@ impl AccountingCoordinator {
             retry_deadline,
             retry_interval,
             restore_prior_incident,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn reconcile_shutdown(
+        root: &Path,
+        database: &DatabasePool,
+        operation_timeout: Duration,
+        retry_deadline: Duration,
+        retry_interval: Duration,
+    ) -> Result<()> {
+        reconcile_startup(
+            root,
+            database,
+            operation_timeout,
+            retry_deadline,
+            retry_interval,
+            false,
+            true,
         )
         .await
     }
@@ -1102,6 +1140,7 @@ impl AccountingCoordinator {
             incident_durable.clone(),
         )?;
         let (journal, receiver) = mpsc::sync_channel::<JournalMessage>(capacity.max(1));
+        let final_sync_fault = Arc::new(AtomicBool::new(false));
         let journal_writer = if read_only {
             drop(receiver);
             drop(journal_file);
@@ -1115,6 +1154,7 @@ impl AccountingCoordinator {
                 incident.clone(),
                 incident_publisher.clone(),
                 incident_submitted.clone(),
+                final_sync_fault.clone(),
             )?)
         };
         Ok(Self {
@@ -1122,6 +1162,7 @@ impl AccountingCoordinator {
             generation_id,
             journal,
             journal_writer: Arc::new(Mutex::new(journal_writer)),
+            final_sync_fault,
             accepting: Arc::new(AtomicBool::new(!read_only)),
             state,
             incident,
@@ -1196,20 +1237,14 @@ impl AccountingCoordinator {
         load_snapshot(&self.root)
     }
 
-    pub(crate) fn begin_shutdown(&self, timeout: Duration) -> Result<AccountingSnapshot> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .context("accounting shutdown deadline is out of range")?;
-        self.accepting.store(false, Ordering::Release);
-        self.stop_journal_writer(deadline)?;
-        self.stop_incident_publisher(deadline)?;
+    pub(crate) fn prepare_shutdown(&self, deadline: Instant) -> Result<AccountingSnapshot> {
         let lock = open_coordination_lock(&self.root)?;
         lock_with_timeout(
             &lock,
-            shutdown_remaining(deadline, "locking final accounting ownership")?.min(LOCK_TIMEOUT),
+            shutdown_remaining(deadline, "locking draining accounting ownership")?,
         )?;
         recover_checked_publications(&self.root)?;
-        shutdown_remaining(deadline, "recovering final accounting publications")?;
+        shutdown_remaining(deadline, "recovering draining accounting publications")?;
         let mut coordination: Coordination = read_checked(&self.root.join("coordination.json"))?;
         let mut state = self.state.lock().expect("accounting generation state");
         if state.generation_id == self.generation_id && state.phase == GenerationPhase::Reconciled {
@@ -1220,8 +1255,21 @@ impl AccountingCoordinator {
                 coverage: coordination.coverage,
             });
         }
-        if state.generation_id != self.generation_id || state.phase != GenerationPhase::Active {
+        if state.generation_id != self.generation_id
+            || !matches!(
+                state.phase,
+                GenerationPhase::Active | GenerationPhase::Draining
+            )
+        {
             bail!("accounting generation is not active");
+        }
+        if state.phase == GenerationPhase::Draining {
+            File::unlock(&lock).context("unlocking accounting coordination")?;
+            return Ok(AccountingSnapshot {
+                installation_id: coordination.installation_id,
+                revision: coordination.revision,
+                coverage: coordination.coverage,
+            });
         }
         let persisted: GenerationState =
             read_checked(&generation_state_path(&self.root, &self.generation_id))?;
@@ -1246,6 +1294,107 @@ impl AccountingCoordinator {
             revision: coordination.revision,
             coverage: coordination.coverage,
         })
+    }
+
+    pub(crate) fn finish_shutdown(
+        &self,
+        deadline: Instant,
+        counts: AccountingDrainCounts,
+    ) -> Result<AccountingSnapshot> {
+        self.accepting.store(false, Ordering::Release);
+        let journal_result = self.stop_journal_writer(deadline);
+        let publisher_result = self.stop_incident_publisher(deadline);
+        journal_result?;
+        publisher_result?;
+        let lock = open_coordination_lock(&self.root)?;
+        lock_with_timeout(
+            &lock,
+            shutdown_remaining(deadline, "locking final accounting ownership")?,
+        )?;
+        recover_checked_publications(&self.root)?;
+        shutdown_remaining(deadline, "recovering final accounting publications")?;
+        let mut coordination: Coordination = read_checked(&self.root.join("coordination.json"))?;
+        let mut state = self.state.lock().expect("accounting generation state");
+        if state.generation_id == self.generation_id && state.phase == GenerationPhase::Reconciled {
+            File::unlock(&lock).context("unlocking accounting coordination")?;
+            return Ok(AccountingSnapshot {
+                installation_id: coordination.installation_id,
+                revision: coordination.revision,
+                coverage: coordination.coverage,
+            });
+        }
+        if state.generation_id != self.generation_id
+            || !matches!(
+                state.phase,
+                GenerationPhase::Draining | GenerationPhase::Unclean
+            )
+        {
+            bail!("accounting generation is not draining");
+        }
+        state.revision += 1;
+        state.admitted_count = Some(counts.admitted);
+        state.worker_completed_count = Some(counts.worker_completed);
+        state.database_committed_count = Some(counts.database_committed);
+        state.journal_synced_count = Some(state.journal_synced_count.unwrap_or(0));
+        state.updated_at = Utc::now().to_rfc3339();
+        write_checked(
+            &generation_state_path(&self.root, &self.generation_id),
+            &*state,
+        )?;
+        coordination.revision += 1;
+        replace_coverage(&mut coordination.coverage, coverage(&state));
+        write_checked(&self.root.join("coordination.json"), &coordination)?;
+        File::unlock(&lock).context("unlocking accounting coordination")?;
+        Ok(AccountingSnapshot {
+            installation_id: coordination.installation_id,
+            revision: coordination.revision,
+            coverage: coordination.coverage,
+        })
+    }
+
+    pub(crate) fn mark_unclean(&self, counts: AccountingDrainCounts) -> Result<()> {
+        let lock = open_coordination_lock(&self.root)?;
+        lock.try_lock()
+            .map_err(|error| anyhow::anyhow!(error))
+            .context("locking unclean accounting ownership")?;
+        recover_checked_publications(&self.root)?;
+        let mut coordination: Coordination = read_checked(&self.root.join("coordination.json"))?;
+        let mut state = self.state.lock().expect("accounting generation state");
+        if state.generation_id != self.generation_id || state.phase == GenerationPhase::Reconciled {
+            File::unlock(&lock).context("unlocking accounting coordination")?;
+            return Ok(());
+        }
+        state.revision = state.revision.saturating_add(1);
+        state.phase = GenerationPhase::Unclean;
+        state.admitted_count = Some(counts.admitted);
+        state.worker_completed_count = Some(counts.worker_completed);
+        state.database_committed_count = Some(counts.database_committed);
+        state.journal_synced_count = Some(state.journal_synced_count.unwrap_or(0));
+        state.updated_at = Utc::now().to_rfc3339();
+        write_checked(
+            &generation_state_path(&self.root, &self.generation_id),
+            &*state,
+        )?;
+        coordination.revision = coordination.revision.saturating_add(1);
+        replace_coverage(&mut coordination.coverage, coverage(&state));
+        write_checked(&self.root.join("coordination.json"), &coordination)?;
+
+        File::unlock(&lock).context("unlocking accounting coordination")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_shutdown(&self, timeout: Duration) -> Result<AccountingSnapshot> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("accounting shutdown deadline is out of range")?;
+        self.prepare_shutdown(deadline)?;
+        self.mark_unclean(AccountingDrainCounts::default())?;
+        self.finish_shutdown(deadline, AccountingDrainCounts::default())
+    }
+
+    #[cfg(test)]
+    fn fail_next_final_sync(&self) {
+        self.final_sync_fault.store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1288,10 +1437,10 @@ impl AccountingCoordinator {
                 Err(TrySendError::Disconnected(_)) => break,
             }
         }
-        receiver
+        let acknowledged = receiver
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .context("waiting for accounting journal writer shutdown")?;
-        if let Some(handle) = self
+        let joined = if let Some(handle) = self
             .journal_writer
             .lock()
             .expect("accounting journal writer")
@@ -1299,8 +1448,12 @@ impl AccountingCoordinator {
         {
             handle
                 .join()
-                .map_err(|_| anyhow::anyhow!("accounting journal writer panicked"))?;
-        }
+                .map_err(|_| anyhow::anyhow!("accounting journal writer panicked"))
+        } else {
+            Ok(())
+        };
+        joined?;
+        acknowledged.map_err(anyhow::Error::msg)?;
         Ok(())
     }
 
@@ -2632,11 +2785,13 @@ async fn reconcile_startup(
     retry_deadline: Duration,
     retry_interval: Duration,
     restore_prior_incident: bool,
+    allow_unclean_completion: bool,
 ) -> Result<()> {
     let policy = ReplayPolicy {
         operation_timeout,
         retry_deadline,
         retry_interval,
+        allow_unclean_completion,
     };
     let database_durability = serde_json::to_value(database.durability_profile().await?)?;
     let root = resolve_accounting_root(root)?;
@@ -2741,7 +2896,10 @@ async fn reconcile_startup(
         }
         if !matches!(
             state.phase,
-            GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Adopting
+            GenerationPhase::Active
+                | GenerationPhase::Draining
+                | GenerationPhase::Unclean
+                | GenerationPhase::Adopting
         ) {
             continue;
         }
@@ -2763,6 +2921,14 @@ async fn reconcile_startup(
         .await;
         if let Err(error) = result {
             let current_incident: Incident = read_checked(&root.join("incident.json"))?;
+            if state.phase == GenerationPhase::Unclean
+                && current_incident.state == IncidentState::Clear
+                && !policy.allow_unclean_completion
+            {
+                publish_unreconciled(&root)?;
+                tracing::warn!(%error, generation_id = %state.generation_id, "published unclean shutdown as an unreconciled accounting incident");
+                continue;
+            }
             if state.phase == GenerationPhase::Active
                 && current_incident.state != IncidentState::Acknowledged
             {
@@ -2802,6 +2968,29 @@ async fn reconcile_generation(
     policy: ReplayPolicy,
     mut adoption: Option<&mut Adoption>,
 ) -> Result<()> {
+    if state.phase == GenerationPhase::Unclean && !policy.allow_unclean_completion {
+        bail!("unclean generation requires explicit reconciliation");
+    }
+    if matches!(
+        state.phase,
+        GenerationPhase::Draining | GenerationPhase::Unclean
+    ) {
+        let admitted = state
+            .admitted_count
+            .context("draining generation lacks admitted completion evidence")?;
+        let completed = state
+            .worker_completed_count
+            .context("draining generation lacks worker completion evidence")?;
+        state
+            .database_committed_count
+            .context("draining generation lacks database completion evidence")?;
+        state
+            .journal_synced_count
+            .context("draining generation lacks journal completion evidence")?;
+        if admitted != completed {
+            bail!("draining generation has incomplete worker evidence");
+        }
+    }
     let journal_path = generation_journal_path(root, &state.generation_id);
     let journal = OpenOptions::new()
         .read(true)
@@ -2917,6 +3106,11 @@ async fn reconcile_generation(
         bail!("accounting replay snapshot changed before publication");
     }
     let manifest_digest = digest(&fs::read(&manifest_path)?);
+    let replayed = manifest
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.outcome.acknowledges())
+        .count() as u64;
     current.revision += 1;
     current.phase = GenerationPhase::Reconciled;
     current.last_complete_record_boundary = Some(parsed.complete_boundary);
@@ -2924,13 +3118,25 @@ async fn reconcile_generation(
         current.admitted_count = Some(0);
         current.worker_completed_count = Some(0);
         current.journal_synced_count = Some(parsed.frames.len() as u64);
-        current.database_committed_count = Some(
-            manifest
-                .receipts
-                .iter()
-                .filter(|receipt| receipt.outcome.acknowledges())
-                .count() as u64,
-        );
+        current.database_committed_count = Some(replayed);
+    } else if matches!(
+        state.phase,
+        GenerationPhase::Draining | GenerationPhase::Unclean
+    ) {
+        let admitted = current
+            .admitted_count
+            .context("draining generation lost admitted completion evidence")?;
+        let committed = current
+            .database_committed_count
+            .context("draining generation lost database completion evidence")?
+            .saturating_add(replayed);
+        if current.journal_synced_count != Some(parsed.frames.len() as u64)
+            || current.worker_completed_count != Some(admitted)
+            || committed != admitted
+        {
+            bail!("draining generation completion evidence does not reconcile");
+        }
+        current.database_committed_count = Some(committed);
     }
     current.replay_manifest = Some(manifest_path.display().to_string());
     current.replay_manifest_digest = Some(manifest_digest);
@@ -3532,7 +3738,10 @@ fn verify_replay_publication_snapshot(root: &Path, manifest: &ReplayManifest) ->
         || state.revision != manifest.source_generation_revision
         || !matches!(
             state.phase,
-            GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Adopting
+            GenerationPhase::Active
+                | GenerationPhase::Draining
+                | GenerationPhase::Unclean
+                | GenerationPhase::Adopting
         )
         || coordination
             .coverage
@@ -3893,7 +4102,7 @@ fn recover_unresolved_coverage_gaps(root: &Path, coordination: &mut Coordination
         }
         if !matches!(
             state.phase,
-            GenerationPhase::Active | GenerationPhase::Draining
+            GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Unclean
         ) || state.revision <= prior.generation_state_revision
         {
             bail!("unresolved generation coverage gap is not recoverable");
@@ -4000,6 +4209,7 @@ fn canonicalize_missing_path(path: &Path) -> Result<PathBuf> {
     Ok(parent.join(path.file_name().context("path has no filename")?))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_writer(
     root: PathBuf,
     mut journal: File,
@@ -4008,6 +4218,7 @@ fn start_writer(
     incident: Arc<Mutex<Incident>>,
     incident_publisher: mpsc::Sender<IncidentPublisherMessage>,
     incident_submitted: Arc<AtomicU64>,
+    final_sync_fault: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("steve-accounting-journal".into())
@@ -4017,7 +4228,12 @@ fn start_writer(
                 let event = match message {
                     JournalMessage::Event(event) => event,
                     JournalMessage::Shutdown(completed) => {
-                        if let Err(err) = journal.sync_all() {
+                        let synced = if final_sync_fault.swap(false, Ordering::AcqRel) {
+                            Err(std::io::Error::other("injected final sync failure"))
+                        } else {
+                            journal.sync_all()
+                        };
+                        if let Err(err) = &synced {
                             tracing::error!(%err, "accounting journal final sync failed");
                             if let Err(latch_error) = queue_incident_publication(
                                 &incident,
@@ -4030,7 +4246,9 @@ fn start_writer(
                                 tracing::error!(%latch_error, "accounting incident publication failed");
                             }
                         }
-                        let _ = completed.send(());
+                        let _ = completed.send(
+                            synced.map_err(|error| format!("accounting journal final sync failed: {error}")),
+                        );
                         return;
                     }
                 };
@@ -4072,6 +4290,7 @@ fn append_event(
     state.revision += 1;
     state.journal_length += line.len() as u64;
     state.journal_evidence_digest = format_digest(hasher.clone().finalize());
+    state.journal_synced_count = Some(state.journal_synced_count.unwrap_or(0).saturating_add(1));
     state.updated_at = Utc::now().to_rfc3339();
     write_checked(&generation_state_path(root, &state.generation_id), &*state)?;
     coordination.revision += 1;
@@ -4488,7 +4707,10 @@ fn verify_generations_with_adoption(
                 File::unlock(&file)?;
                 if matches!(
                     state.phase,
-                    GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Adopting
+                    GenerationPhase::Active
+                        | GenerationPhase::Draining
+                        | GenerationPhase::Unclean
+                        | GenerationPhase::Adopting
                 ) && !allow_unlocked_replayable
                 {
                     bail!(
@@ -5320,9 +5542,10 @@ mod tests {
         let root = temp.path().join("accounting");
         AccountingCoordinator::provision(&root).expect("provision");
         let coordinator = AccountingCoordinator::start(&root, 1).expect("start coordinator");
-        let lock = root.join("coordination.lock");
-        let unavailable_lock = root.join("coordination.lock.unavailable");
-        fs::rename(&lock, &unavailable_lock).expect("make publication unavailable");
+        let unavailable_lock = open_coordination_lock(&root).expect("open coordination lock");
+        unavailable_lock
+            .lock()
+            .expect("make publication unavailable");
         let started = Instant::now();
         coordinator
             .latch_incident(IncidentCause::PrimaryAndJournalUnavailable, 1, 0)
@@ -5348,7 +5571,7 @@ mod tests {
         );
         assert_eq!(blocked["payloads"]["provisional"]["unknown"], 1);
 
-        fs::rename(unavailable_lock, lock).expect("restore coordination lock");
+        File::unlock(&unavailable_lock).expect("restore coordination lock");
         coordinator.flush_incident_publications();
         let durable: Incident =
             read_checked(&root.join("incident.json")).expect("durable incident");
@@ -5385,9 +5608,10 @@ mod tests {
         let root = temp.path().join("accounting");
         AccountingCoordinator::provision(&root).expect("provision");
         let coordinator = AccountingCoordinator::start(&root, 1).expect("coordinator");
-        let lock = root.join("coordination.lock");
-        let unavailable_lock = root.join("coordination.lock.unavailable");
-        fs::rename(&lock, &unavailable_lock).expect("make publication unavailable");
+        let unavailable_lock = open_coordination_lock(&root).expect("open coordination lock");
+        unavailable_lock
+            .lock()
+            .expect("make publication unavailable");
         coordinator
             .latch_incident(IncidentCause::PrimaryAndJournalUnavailable, 1, 0)
             .expect("queue incident publication");
@@ -5399,7 +5623,7 @@ mod tests {
             !stopping.is_finished(),
             "shutdown skipped pending publication"
         );
-        fs::rename(unavailable_lock, lock).expect("restore coordination lock");
+        File::unlock(&unavailable_lock).expect("restore coordination lock");
         stopping
             .join()
             .expect("shutdown thread")
@@ -5416,9 +5640,10 @@ mod tests {
         let root = temp.path().join("accounting");
         AccountingCoordinator::provision(&root).expect("provision");
         let coordinator = AccountingCoordinator::start(&root, 1).expect("coordinator");
-        let lock = root.join("coordination.lock");
-        let unavailable_lock = root.join("coordination.lock.unavailable");
-        fs::rename(&lock, &unavailable_lock).expect("make publication unavailable");
+        let unavailable_lock = open_coordination_lock(&root).expect("open coordination lock");
+        unavailable_lock
+            .lock()
+            .expect("make publication unavailable");
         coordinator
             .latch_incident(IncidentCause::PrimaryAndJournalUnavailable, 1, 0)
             .expect("queue incident publication");
@@ -5427,32 +5652,13 @@ mod tests {
         let error = coordinator
             .begin_shutdown(Duration::from_millis(150))
             .expect_err("shutdown exceeded its unavailable publication deadline");
-        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("timed out"), "{error:#}");
         assert!(started.elapsed() < Duration::from_secs(1));
 
-        fs::rename(unavailable_lock, lock).expect("restore coordination lock");
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !coordinator
-            .incident_publisher_thread
-            .lock()
-            .expect("incident publisher")
-            .as_ref()
-            .is_some_and(thread::JoinHandle::is_finished)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "incident publisher did not recover"
-            );
-            thread::sleep(Duration::from_millis(10));
-        }
+        File::unlock(&unavailable_lock).expect("restore coordination lock");
         coordinator
-            .incident_publisher_thread
-            .lock()
-            .expect("incident publisher")
-            .take()
-            .expect("incident publisher handle")
-            .join()
-            .expect("incident publisher thread");
+            .begin_shutdown(Duration::from_secs(2))
+            .expect("shutdown resumes after publication recovery");
     }
 
     #[test]
@@ -5471,6 +5677,43 @@ mod tests {
         assert!(error.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(1));
         File::unlock(&lock).expect("release final ownership publication");
+    }
+
+    #[test]
+    fn graceful_shutdown_reports_final_journal_sync_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let coordinator = AccountingCoordinator::start(&root, 1).expect("coordinator");
+        coordinator.fail_next_final_sync();
+
+        let error = coordinator
+            .begin_shutdown(Duration::from_secs(2))
+            .expect_err("final journal sync failure must fail shutdown");
+        assert!(error.to_string().contains("final sync failed"), "{error:#}");
+        assert!(
+            coordinator
+                .journal_writer
+                .lock()
+                .expect("journal writer")
+                .is_none(),
+            "journal writer was not joined after its final sync failure"
+        );
+        assert!(
+            coordinator
+                .incident_publisher_thread
+                .lock()
+                .expect("incident publisher")
+                .is_none(),
+            "incident publisher was not joined after the journal failure"
+        );
+        let incident: Incident = read_checked(&root.join("incident.json")).expect("incident");
+        assert_eq!(incident.state, IncidentState::Blocked);
+        assert_eq!(incident.cause, Some(IncidentCause::JournalWriteFailed));
+        let state: GenerationState =
+            read_checked(&generation_state_path(&root, &coordinator.generation_id))
+                .expect("generation state");
+        assert_eq!(state.phase, GenerationPhase::Unclean);
     }
 
     #[test]
