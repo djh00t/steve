@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs, io,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -14,6 +15,7 @@ pub struct SteveProcess {
     log_path: PathBuf,
 }
 
+#[derive(Debug)]
 pub struct Listeners {
     pub inference: SocketAddr,
     pub management: SocketAddr,
@@ -25,7 +27,7 @@ impl SteveProcess {
     }
 
     pub fn start_with_database_url(database_url: &str) -> io::Result<Self> {
-        Self::start_with_options(None, None, 60, None, None, Some(database_url), None)
+        Self::start_with_options(None, None, 60, None, None, Some(database_url), None, None)
     }
 
     pub fn start_with_upstream_urls(
@@ -48,6 +50,7 @@ impl SteveProcess {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -65,6 +68,7 @@ impl SteveProcess {
             None,
             None,
             ca_bundle,
+            None,
         )
     }
 
@@ -78,9 +82,25 @@ impl SteveProcess {
             Some(history_capacity),
             None,
             None,
+            None,
         )
     }
 
+    #[allow(dead_code)]
+    pub fn start_with_accounting_root(accounting_root: &Path) -> io::Result<Self> {
+        Self::start_with_options(
+            None,
+            None,
+            60,
+            None,
+            None,
+            None,
+            None,
+            Some(accounting_root),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn start_with_options(
         openai_upstream_url: Option<&str>,
         anthropic_upstream_url: Option<&str>,
@@ -89,6 +109,7 @@ impl SteveProcess {
         history_capacity: Option<usize>,
         database_url: Option<&str>,
         ca_bundle: Option<&Path>,
+        accounting_root: Option<&Path>,
     ) -> io::Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path();
@@ -131,12 +152,32 @@ impl SteveProcess {
         let database_url = database_url
             .map(str::to_owned)
             .unwrap_or_else(|| format!("sqlite://{}?mode=rwc", db_path.display()));
+        let provision_accounting = accounting_root.is_none();
+        let accounting_root = accounting_root
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.join("accounting"));
+        if provision_accounting {
+            let output = steve_command()
+                .args([
+                    OsStr::new("accounting"),
+                    OsStr::new("provision"),
+                    OsStr::new("--root"),
+                ])
+                .arg(&accounting_root)
+                .output()?;
+            if !output.status.success() {
+                return Err(io::Error::other(format!(
+                    "accounting provision failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+        }
         let config = format!(
             "{server_config}\n[database]\nurl = {}\n\
              {object_storage}\n[queues]\naccounting_journal = {}\n{history}\
              [logging]\nlevel = \"info\"\njson = true\n",
             toml::Value::String(database_url),
-            toml::Value::String(root.join("accounting-overflow.jsonl").display().to_string()),
+            toml::Value::String(accounting_root.display().to_string()),
         );
         let config_path = root.join("config.toml");
         fs::write(&config_path, config)?;
@@ -258,8 +299,13 @@ impl Drop for SteveProcess {
 }
 
 fn clean_command(config_path: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_steve"));
+    let mut command = steve_command();
     command.arg("--config").arg(config_path).arg("serve");
+    command
+}
+
+pub fn steve_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_steve"));
     for key in std::env::vars_os().map(|(key, _)| key).filter(|key| {
         let key = key.to_string_lossy();
         key.starts_with("STEVE_") || key.starts_with("RUST_LOG")

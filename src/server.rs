@@ -871,7 +871,7 @@ pub(crate) async fn shutdown_signal() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_upstream;
+    use crate::{accounting::AccountingCoordinator, test_upstream};
     use axum::{body::HttpBody, http::Request};
     use http_body_util::BodyExt;
     use std::future::IntoFuture;
@@ -1059,11 +1059,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.database.url = "sqlite::memory:".into();
         cfg.object_storage.root = dir.path().join("objects").to_string_lossy().into_owned();
-        cfg.queues.accounting_journal = dir
-            .path()
-            .join("accounting.jsonl")
-            .to_string_lossy()
-            .into_owned();
+        let accounting_root = dir.path().join("accounting");
+        AccountingCoordinator::provision(&accounting_root).unwrap();
+        cfg.queues.accounting_journal = accounting_root.to_string_lossy().into_owned();
         let db = Database::connect(&cfg.database).await.unwrap();
         db.migrate().await.unwrap();
         let objects = ObjectStorage::from_config(&cfg.object_storage)

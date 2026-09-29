@@ -1,3 +1,4 @@
+mod accounting;
 mod config;
 mod deferred;
 mod lifecycle;
@@ -8,6 +9,7 @@ mod server;
 mod storage;
 mod test_upstream;
 
+use accounting::AccountingCoordinator;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::Config;
@@ -30,9 +32,27 @@ struct Cli {
 enum Command {
     Serve,
     Doctor,
+    Accounting {
+        #[command(subcommand)]
+        command: AccountingCommand,
+    },
     TestUpstream {
         #[arg(long, default_value = "[::]:18080")]
         listen: SocketAddr,
+    },
+}
+
+#[derive(Subcommand)]
+enum AccountingCommand {
+    Provision {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    AdoptLegacy {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        root: PathBuf,
     },
 }
 
@@ -55,6 +75,17 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Serve => serve(cfg).await,
         Command::Doctor => doctor(cfg).await,
+        Command::Accounting { command } => match command {
+            AccountingCommand::Provision { root } => {
+                AccountingCoordinator::provision(&root)?;
+                println!("accounting root provisioned: {}", root.display());
+                Ok(())
+            }
+            AccountingCommand::AdoptLegacy { source, root } => {
+                println!("{}", AccountingCoordinator::adopt_legacy(&source, &root)?);
+                Ok(())
+            }
+        },
         Command::TestUpstream { listen } => test_upstream::run(listen).await,
     }
 }

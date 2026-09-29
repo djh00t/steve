@@ -123,7 +123,7 @@ impl Default for QueueConfig {
     fn default() -> Self {
         Self {
             accounting: 4096,
-            accounting_journal: "data/accounting-overflow.jsonl".into(),
+            accounting_journal: "/var/lib/steve/accounting".into(),
             accounting_journal_queue: 1024,
             history: 2048,
             telemetry: 8192,
