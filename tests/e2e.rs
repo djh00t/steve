@@ -1,6 +1,5 @@
 #[path = "support/process.rs"]
 mod process;
-#[cfg(unix)]
 #[allow(dead_code)]
 #[path = "support/upstream.rs"]
 mod upstream;
@@ -1125,6 +1124,346 @@ async fn chat_completions_stream_forwards_first_event_before_tail() {
     })
     .await
     .expect("Chat Completions stream scenario exceeded 30 seconds");
+}
+
+#[tokio::test]
+async fn chat_nonstream_accounting() {
+    use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |axum::Json(request): axum::Json<Value>| {
+            let calls = Arc::clone(&handler_calls);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 || request["stream"] == true {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                } else {
+                    axum::Json(json!({"id": "retry-success", "choices": []})).into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local upstream");
+    let upstream_url = format!(
+        "http://{}",
+        listener.local_addr().expect("upstream address")
+    );
+
+    tokio::select! {
+        result = axum::serve(listener, app) => panic!("upstream server stopped: {result:?}"),
+        () = async {
+            let mut steve = SteveProcess::start_with_upstream_urls(Some(&upstream_url), None)
+                .expect("start Steve process");
+            let listeners = steve.wait_ready(Duration::from_secs(15)).await.expect("Steve ready");
+            let client = reqwest::Client::builder().no_proxy().build().expect("HTTP client");
+            let db_url = format!("sqlite://{}", steve.database_path().display());
+            let pool = SqlitePoolOptions::new().max_connections(1).connect(&db_url).await.expect("SQLite pool");
+            let mut blocker = pool.acquire().await.expect("SQLite connection");
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *blocker).await.expect("hold SQLite write lock");
+            let response = tokio::time::timeout(Duration::from_secs(2), client
+                .post(format!("http://{}/v1/chat/completions", listeners.inference))
+                .json(&json!({"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}))
+                .send()
+            ).await.expect("Chat response must not wait for accounting storage")
+                .expect("send Chat request");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.json::<Value>().await.expect("Chat response")["id"], "retry-success");
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "one 503 retry");
+            sqlx::query("COMMIT").execute(&mut *blocker).await.expect("release SQLite write lock");
+            drop(blocker);
+
+            let rows: Vec<EventRow> = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let rows = sqlx::query_as(
+                        "SELECT id, kind, payload, created_at FROM steve_background_events WHERE kind = 'chat.attempt.terminal.v1' ORDER BY id"
+                    ).fetch_all(&pool).await.expect("query Chat events");
+                    if rows.len() >= 2 { break rows; }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await.expect("two persisted Chat attempts");
+            assert_eq!(rows.len(), 2, "one event per terminal attempt");
+            assert_ne!(rows[0].0, rows[1].0, "distinct event IDs");
+            let payloads: Vec<Value> = rows.iter().map(|row| {
+                assert_eq!(row.1, "chat.attempt.terminal.v1");
+                uuid::Uuid::parse_str(&row.0).expect("event ID UUID");
+                chrono::DateTime::parse_from_rfc3339(&row.3).expect("event creation time");
+                serde_json::from_str(&row.2).expect("Chat payload")
+            }).collect();
+            assert_eq!(payloads[0]["request_id"], payloads[1]["request_id"]);
+            assert_eq!(payloads[0]["request_created_at"], payloads[1]["request_created_at"]);
+            uuid::Uuid::parse_str(payloads[0]["request_id"].as_str().expect("request ID")).expect("request UUID");
+            assert_ne!(payloads[0]["attempt_id"], payloads[1]["attempt_id"]);
+            for (payload, row) in payloads.iter().zip(&rows) {
+                assert_eq!(payload.as_object().expect("payload object").len(), 9);
+                assert_eq!(payload["model"], "gpt-test");
+                assert_eq!(payload["provider"], "openai");
+                assert!(payload["account"].is_null());
+                uuid::Uuid::parse_str(payload["attempt_id"].as_str().expect("attempt ID")).expect("attempt UUID");
+                let created = chrono::DateTime::parse_from_rfc3339(payload["request_created_at"].as_str().expect("request time")).expect("request time RFC 3339");
+                let started = chrono::DateTime::parse_from_rfc3339(payload["started_at"].as_str().expect("start time")).expect("start time RFC 3339");
+                let finished = chrono::DateTime::parse_from_rfc3339(payload["finished_at"].as_str().expect("finish time")).expect("finish time RFC 3339");
+                let event_created = chrono::DateTime::parse_from_rfc3339(&row.3).expect("event creation time RFC 3339");
+                assert!(created <= started && started <= finished && finished <= event_created);
+            }
+            let statuses: Vec<_> = payloads.iter().map(|payload| payload["status"].as_str().expect("status")).collect();
+            assert!(statuses.contains(&"upstream_error"));
+            assert!(statuses.contains(&"success"));
+            for row in &rows {
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM steve_background_events WHERE id = ?")
+                    .bind(&row.0).fetch_one(&pool).await.expect("count event by ID");
+                assert_eq!(count, 1);
+            }
+            let chat_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM steve_background_events WHERE kind = 'chat.attempt.terminal.v1'"
+            ).fetch_one(&pool).await.expect("count nonstream Chat events");
+            assert_eq!(chat_count, 2, "one event per nonstream attempt");
+            pool.close().await;
+        } => {}
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StreamEnd {
+    Eof,
+    Error,
+    Drop,
+}
+
+#[tokio::test]
+async fn chat_stream_terminal_accounting() {
+    use axum::{http::StatusCode, routing::post, Router};
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing upstream");
+        let upstream_url = format!(
+            "http://{}",
+            listener.local_addr().expect("failing upstream address")
+        );
+        tokio::select! {
+            result = axum::serve(listener, app) => panic!("failing upstream stopped: {result:?}"),
+            () = run_chat_stream_header_failure(&upstream_url) => {}
+        }
+
+        for (end, status) in [
+            (StreamEnd::Eof, "success"),
+            (StreamEnd::Error, "upstream_error"),
+            (StreamEnd::Drop, "cancelled"),
+        ] {
+            run_chat_stream_body_case(end, status).await;
+        }
+    })
+    .await
+    .expect("stream accounting scenarios exceeded 90 seconds");
+}
+
+async fn run_chat_stream_header_failure(upstream_url: &str) {
+    let mut steve = SteveProcess::start_with_upstream_urls(Some(upstream_url), None)
+        .expect("start Steve process");
+    let listeners = steve
+        .wait_ready(Duration::from_secs(15))
+        .await
+        .expect("Steve ready");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("HTTP client");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("sqlite://{}", steve.database_path().display()))
+        .await
+        .expect("SQLite pool");
+
+    let response = client
+        .post(format!(
+            "http://{}/v1/chat/completions",
+            listeners.inference
+        ))
+        .json(&json!({"model":"header-failure","messages":[{"role":"user","content":"hi"}],"stream":true}))
+        .send()
+        .await
+        .expect("send header-failure stream");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    accounting_barrier(&client, listeners.inference, &pool).await;
+    let rows = chat_accounting_rows(&pool).await;
+    assert_eq!(rows.len(), 1, "one before-header terminal event");
+    assert_chat_terminal_event(&rows[0], "header-failure", "upstream_error");
+    pool.close().await;
+}
+
+async fn run_chat_stream_body_case(end: StreamEnd, expected_status: &str) {
+    use tokio_stream::StreamExt;
+    use upstream::{ControlledUpstream, Tail};
+
+    let first = b"data: {\"id\":\"chatcmpl_fixture\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}] }\n\n";
+    let tail = match end {
+        StreamEnd::Error => Tail::Error("terminal body failure".into()),
+        StreamEnd::Eof | StreamEnd::Drop => Tail::Bytes(b"data: [DONE]\n\n".as_slice().into()),
+    };
+    let mut upstream = ControlledUpstream::start("/v1/chat/completions", first.as_slice(), tail)
+        .await
+        .expect("start controlled upstream");
+    let mut steve = SteveProcess::start_with_upstream_urls(Some(&upstream.url()), None)
+        .expect("start Steve process");
+    let listeners = steve
+        .wait_ready(Duration::from_secs(15))
+        .await
+        .expect("Steve ready");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .expect("HTTP client");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("sqlite://{}", steve.database_path().display()))
+        .await
+        .expect("SQLite pool");
+    let model = match end {
+        StreamEnd::Eof => "stream-eof",
+        StreamEnd::Error => "stream-error",
+        StreamEnd::Drop => "stream-drop",
+    };
+    let response = client
+        .post(format!(
+            "http://{}/v1/chat/completions",
+            listeners.inference
+        ))
+        .json(&json!({"model":model,"messages":[{"role":"user","content":"hi"}],"stream":true}))
+        .send()
+        .await
+        .expect("send Chat stream");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut body = response.bytes_stream();
+    let chunk = body
+        .next()
+        .await
+        .expect("first SSE chunk")
+        .expect("read first SSE chunk");
+    assert_eq!(chunk, first.as_slice());
+
+    accounting_barrier(&client, listeners.inference, &pool).await;
+    assert!(
+        chat_accounting_rows(&pool).await.is_empty(),
+        "pending stream must not be accounted"
+    );
+
+    match end {
+        StreamEnd::Eof => {
+            upstream.release_tail();
+            while let Some(chunk) = body.next().await {
+                chunk.expect("read successful stream tail");
+            }
+            drop(body);
+        }
+        StreamEnd::Error => {
+            upstream.release_tail();
+            assert!(
+                body.next().await.expect("body error item").is_err(),
+                "body fault must reach the client"
+            );
+            drop(body);
+        }
+        StreamEnd::Drop => {
+            drop(body);
+            upstream
+                .wait_for_body_drop(Duration::from_secs(5))
+                .await
+                .expect("upstream body dropped after client disconnect");
+        }
+    }
+
+    accounting_barrier(&client, listeners.inference, &pool).await;
+    let rows = chat_accounting_rows(&pool).await;
+    assert_eq!(rows.len(), 1, "one event on first terminal transition");
+    assert_chat_terminal_event(&rows[0], model, expected_status);
+    pool.close().await;
+}
+
+async fn accounting_barrier(
+    client: &reqwest::Client,
+    inference: std::net::SocketAddr,
+    pool: &sqlx::SqlitePool,
+) {
+    let barrier = uuid::Uuid::now_v7().to_string();
+    client
+        .post(format!("http://{inference}/api/v1/test/echo"))
+        .json(&json!({"value":{"barrier":barrier}}))
+        .send()
+        .await
+        .expect("send accounting barrier")
+        .error_for_status()
+        .expect("accounting barrier status");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM steve_background_events WHERE kind = 'test.echo' AND payload LIKE ?",
+            )
+            .bind(format!("%{barrier}%"))
+            .fetch_one(pool)
+            .await
+            .expect("query accounting barrier");
+            if count == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("accounting barrier persisted");
+}
+
+async fn chat_accounting_rows(pool: &sqlx::SqlitePool) -> Vec<EventRow> {
+    sqlx::query_as(
+        "SELECT id, kind, payload, created_at FROM steve_background_events WHERE kind = 'chat.attempt.terminal.v1' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("query Chat accounting events")
+}
+
+fn assert_chat_terminal_event(row: &EventRow, model: &str, status: &str) {
+    assert_eq!(row.1, "chat.attempt.terminal.v1");
+    uuid::Uuid::parse_str(&row.0).expect("event ID UUID");
+    let event_created =
+        chrono::DateTime::parse_from_rfc3339(&row.3).expect("event creation time RFC 3339");
+    let payload: Value = serde_json::from_str(&row.2).expect("Chat payload");
+    assert_eq!(payload.as_object().expect("payload object").len(), 9);
+    assert_eq!(payload["model"], model);
+    assert_eq!(payload["provider"], "openai");
+    assert!(payload["account"].is_null());
+    assert_eq!(payload["status"], status);
+    assert_ne!(payload["status"], "pending");
+    uuid::Uuid::parse_str(payload["request_id"].as_str().expect("request ID"))
+        .expect("request UUID");
+    uuid::Uuid::parse_str(payload["attempt_id"].as_str().expect("attempt ID"))
+        .expect("attempt UUID");
+    let created = chrono::DateTime::parse_from_rfc3339(
+        payload["request_created_at"]
+            .as_str()
+            .expect("request time"),
+    )
+    .expect("request time RFC 3339");
+    let started =
+        chrono::DateTime::parse_from_rfc3339(payload["started_at"].as_str().expect("start time"))
+            .expect("start time RFC 3339");
+    let finished =
+        chrono::DateTime::parse_from_rfc3339(payload["finished_at"].as_str().expect("finish time"))
+            .expect("finish time RFC 3339");
+    assert!(created <= started && started <= finished && finished <= event_created);
 }
 
 #[cfg(unix)]
