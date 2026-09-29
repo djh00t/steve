@@ -696,15 +696,39 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
         .as_ref()
         .map_or(0, |request| request.attempts.len());
     for attempt in &reply.attempts {
-        if attempt.finished_at.is_some() {
+        if let (Some(request), Some(model), Some(finished_at)) = (
+            reply.request.as_ref(),
+            reply.model.as_ref(),
+            attempt.finished_at.as_ref(),
+        ) {
             tracing::info!(
                 request_id = %attempt.request_id.0,
                 attempt_id = %attempt.id.0,
                 attempt_count,
                 status = ?attempt.status,
-                finished_at = ?attempt.finished_at,
+                finished_at = ?finished_at,
                 "chat completions upstream attempt finished"
             );
+            if !streaming {
+                let provider = (!attempt.provider.is_empty() && attempt.provider != "unassigned")
+                    .then_some(attempt.provider.as_str());
+                let account = (!attempt.account.is_empty() && attempt.account != "unassigned")
+                    .then_some(attempt.account.as_str());
+                state.deferred.accounting(
+                    "chat.attempt.terminal.v1",
+                    json!({
+                        "request_id": request.id,
+                        "attempt_id": attempt.id,
+                        "request_created_at": request.created_at,
+                        "model": model,
+                        "provider": provider,
+                        "account": account,
+                        "status": attempt.status,
+                        "started_at": attempt.started_at,
+                        "finished_at": finished_at,
+                    }),
+                );
+            }
         }
     }
     let response = reply.into_response();

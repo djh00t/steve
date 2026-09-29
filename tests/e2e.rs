@@ -1127,6 +1127,106 @@ async fn chat_completions_stream_forwards_first_event_before_tail() {
     .expect("Chat Completions stream scenario exceeded 30 seconds");
 }
 
+#[tokio::test]
+async fn chat_nonstream_accounting() {
+    use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let calls = Arc::clone(&handler_calls);
+            async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    StatusCode::SERVICE_UNAVAILABLE.into_response()
+                } else {
+                    axum::Json(json!({"id": "retry-success", "choices": []})).into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local upstream");
+    let upstream_url = format!(
+        "http://{}",
+        listener.local_addr().expect("upstream address")
+    );
+
+    tokio::select! {
+        result = axum::serve(listener, app) => panic!("upstream server stopped: {result:?}"),
+        () = async {
+            let mut steve = SteveProcess::start_with_upstream_urls(Some(&upstream_url), None)
+                .expect("start Steve process");
+            let listeners = steve.wait_ready(Duration::from_secs(15)).await.expect("Steve ready");
+            let client = reqwest::Client::builder().no_proxy().build().expect("HTTP client");
+            let db_url = format!("sqlite://{}", steve.database_path().display());
+            let pool = SqlitePoolOptions::new().max_connections(1).connect(&db_url).await.expect("SQLite pool");
+            let mut blocker = pool.acquire().await.expect("SQLite connection");
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *blocker).await.expect("hold SQLite write lock");
+            let response = tokio::time::timeout(Duration::from_secs(2), client
+                .post(format!("http://{}/v1/chat/completions", listeners.inference))
+                .json(&json!({"model":"gpt-test","messages":[{"role":"user","content":"hi"}]}))
+                .send()
+            ).await.expect("Chat response must not wait for accounting storage")
+                .expect("send Chat request");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.json::<Value>().await.expect("Chat response")["id"], "retry-success");
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "one 503 retry");
+            sqlx::query("COMMIT").execute(&mut *blocker).await.expect("release SQLite write lock");
+            drop(blocker);
+
+            let rows: Vec<EventRow> = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let rows = sqlx::query_as(
+                        "SELECT id, kind, payload, created_at FROM steve_background_events WHERE kind = 'chat.attempt.terminal.v1' ORDER BY id"
+                    ).fetch_all(&pool).await.expect("query Chat events");
+                    if rows.len() >= 2 { break rows; }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }).await.expect("two persisted Chat attempts");
+            assert_eq!(rows.len(), 2, "one event per terminal attempt");
+            assert_ne!(rows[0].0, rows[1].0, "distinct event IDs");
+            let payloads: Vec<Value> = rows.iter().map(|row| {
+                assert_eq!(row.1, "chat.attempt.terminal.v1");
+                uuid::Uuid::parse_str(&row.0).expect("event ID UUID");
+                chrono::DateTime::parse_from_rfc3339(&row.3).expect("event creation time");
+                serde_json::from_str(&row.2).expect("Chat payload")
+            }).collect();
+            assert_eq!(payloads[0]["request_id"], payloads[1]["request_id"]);
+            assert_eq!(payloads[0]["request_created_at"], payloads[1]["request_created_at"]);
+            uuid::Uuid::parse_str(payloads[0]["request_id"].as_str().expect("request ID")).expect("request UUID");
+            assert_ne!(payloads[0]["attempt_id"], payloads[1]["attempt_id"]);
+            for (payload, row) in payloads.iter().zip(&rows) {
+                assert_eq!(payload.as_object().expect("payload object").len(), 9);
+                assert_eq!(payload["model"], "gpt-test");
+                assert_eq!(payload["provider"], "openai");
+                assert!(payload["account"].is_null());
+                uuid::Uuid::parse_str(payload["attempt_id"].as_str().expect("attempt ID")).expect("attempt UUID");
+                let created = chrono::DateTime::parse_from_rfc3339(payload["request_created_at"].as_str().expect("request time")).expect("request time RFC 3339");
+                let started = chrono::DateTime::parse_from_rfc3339(payload["started_at"].as_str().expect("start time")).expect("start time RFC 3339");
+                let finished = chrono::DateTime::parse_from_rfc3339(payload["finished_at"].as_str().expect("finish time")).expect("finish time RFC 3339");
+                let event_created = chrono::DateTime::parse_from_rfc3339(&row.3).expect("event creation time RFC 3339");
+                assert!(created <= started && started <= finished && finished <= event_created);
+            }
+            let statuses: Vec<_> = payloads.iter().map(|payload| payload["status"].as_str().expect("status")).collect();
+            assert!(statuses.contains(&"upstream_error"));
+            assert!(statuses.contains(&"success"));
+            for row in &rows {
+                let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM steve_background_events WHERE id = ?")
+                    .bind(&row.0).fetch_one(&pool).await.expect("count event by ID");
+                assert_eq!(count, 1);
+            }
+            pool.close().await;
+        } => {}
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn chat_disconnect_no_replay() {

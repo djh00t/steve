@@ -103,6 +103,7 @@ pub(crate) struct ChatCompletionReply {
     pub(crate) status: StatusCode,
     pub(crate) body: ChatCompletionReplyBody,
     pub(crate) request: Option<Request>,
+    pub(crate) model: Option<String>,
     pub(crate) attempts: Vec<RequestAttempt>,
 }
 
@@ -125,6 +126,7 @@ pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
                 status: StatusCode::NOT_IMPLEMENTED,
                 body: ChatCompletionReplyBody::Stub(ChatCompletionStub::from(&handoff)),
                 request: Some(handoff.request),
+                model: Some(handoff.model),
                 attempts: vec![handoff.attempt],
             }
         }
@@ -132,6 +134,7 @@ pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
             status: StatusCode::BAD_REQUEST,
             body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
             request: None,
+            model: None,
             attempts: Vec::new(),
         },
     }
@@ -148,6 +151,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
                 status: StatusCode::BAD_REQUEST,
                 body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
                 request: None,
+                model: None,
                 attempts: Vec::new(),
             }
         }
@@ -178,6 +182,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
                         attempt: attempt.clone(),
                     })),
                     request: Some(handoff.request),
+                    model: Some(handoff.model),
                     attempts: vec![attempt.lock().expect("attempt lock").clone()],
                 }
             }
@@ -200,6 +205,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
                         },
                     }),
                     request: Some(handoff.request),
+                    model: Some(handoff.model),
                     attempts: vec![attempt.lock().expect("attempt lock").clone()],
                 }
             }
@@ -259,6 +265,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
         status,
         body: response,
         request: Some(handoff.request),
+        model: Some(handoff.model),
         attempts,
     }
 }
