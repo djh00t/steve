@@ -7,7 +7,7 @@ M1 has one operator acceptance point: a loopback browser walkthrough over one ex
 The browser has two separate verdicts:
 
 - **Functional run:** the local scenarios behaved as required.
-- **Release eligible:** the functional run passed, required hosted checks passed at the same SHA, and the deployment OS/filesystem/path has the required functional qualification.
+- **Release eligible:** the functional run passed, required hosted checks passed at the same SHA, and the deployment OS/filesystem/path has a matching target-qualification artifact. Missing, unreadable, pending, failed, or SHA/path-mismatched evidence makes this verdict `unknown` and the candidate ineligible.
 
 An expected conflict, timeout, or unknown outcome is a passing negative scenario when Steve retains it, reports it, and blocks admission as specified. It is not a successful accounting outcome.
 
@@ -20,6 +20,7 @@ An expected conflict, timeout, or unknown outcome is a passing negative scenario
 | Chat accounting | The separately owned #95 nonstream slice emits one `chat.attempt.terminal.v1` per terminal retry attempt. #96 emits no SSE event while pending and exactly one for EOF, upstream error, or disconnect. | #45, #94-#96 |
 | Framing and replay | Complete frames before a torn tail survive; temporary DB failure follows #86's configured per-operation bound; inserted and identical duplicates complete; conflicting or failed records remain retained. | #85-#87 |
 | Incident policy | An admitted response may finish after accounting failure; later inference gets `503 accounting_incident`; readiness is false while liveness/status remain available. Verified reconciliation returns to `clear`. Confirmed loss or irreducible uncertainty requires an auditable operator disposition and restores as redacted `acknowledged` after restart. | #84, #483, #485 |
+| Conflict recovery | Exact protected evidence is inspectable only through the local read-only audit command. Resolution is offline, selects journal or database as authoritative, verifies both sides, and cannot use loss/uncertainty acknowledgement as a bypass. | #87, #483, #485 |
 | Ownership | Fresh provisioning creates a stable installation identity and initial evidence. Revision-checked coordination and generation coverage permit replacement ready before healthy old exit, reject missing/expired evidence, and never inspect a locked live journal. Legacy flat-file adoption is explicit and offline. | #84, #484, #485 |
 | Shutdown | Management drain and process signal enter the same accounting-drain sequence under one absolute deadline. Management drain preserves its current non-terminating semantics; signal exits after the same barriers. Timeout evidence survives restart. | #84, #485 |
 | Saturation | A test-owned SQLite write lock fills capacity one; SSE progresses before release, then its stable event reconciles once. No production fault-control endpoint or flag exists. | #45, #97 |
@@ -52,6 +53,15 @@ Exact issue ownership, files, and focused selector commands are recorded in [the
 
 ## Qualification and final operator step
 
-Target qualification functionally verifies exclusive locking, publication/atomic replacement, append visibility, file and directory sync calls, revision/coverage behavior, and lock release after process death on the named OS/filesystem/path. This is process-level evidence. Linux/ext4 evidence does not qualify macOS/APFS, Windows/NTFS, network storage, or another path; OS-crash and power-loss behavior stay unknown unless separately proven.
+The fixed hosted-evidence step records the PR head and required checks with:
 
-After PR #619 is ready for review, hosted checks and mutation evidence exist at its exact head, and target functional qualification is attached, the operator reviews the single browser summary and exported JSON. The release document's earlier proposal/approval wording is updated only at this final gate. The operator accepts or rejects M1 once; the gate never merges, deploys, acknowledges an accounting incident, or records release acceptance for them.
+```sh
+gh pr view 619 --repo djh00t/steve --json headRefOid,url > target/m1-pr-head.json
+gh pr checks 619 --repo djh00t/steve --required --json name,state,bucket,link,workflow > target/m1-hosted-checks.json
+```
+
+The gate requires `headRefOid == git rev-parse HEAD` and every required check to be complete and passing. Missing `gh` authentication/network access, no reported required-check set, unreadable JSON, a pending/failed/cancelled check, or a head mismatch records hosted evidence as `unknown` or failed and makes release eligibility false.
+
+Run `make m1-target-qualification` on the deployment OS/filesystem/path. It writes `target/m1-target-qualification.json` containing candidate SHA, candidate binary SHA-256/path, resolved private accounting root, OS/kernel, filesystem and storage path, command/tool versions, timestamp, and results for exclusive locking, publication/atomic replacement, append visibility, file and directory sync calls, revision/coverage behavior, and process-death lock release. The release gate requires that artifact's SHA, binary hash and resolved path to match its own candidate. Missing, unreadable, failed, or mismatched target evidence is `unknown` and release-ineligible. This is process-level evidence. Linux/ext4 evidence does not qualify macOS/APFS, Windows/NTFS, network storage, or another path; OS-crash and power-loss behavior stay unknown unless separately proven.
+
+The gate embeds both JSON artifacts and their verdicts in `target/m1-release-gate.json`. After PR #619 is ready for review, hosted checks and mutation evidence exist at its exact head, and target functional qualification matches, the operator reviews the single browser summary and exported JSON. The release document's earlier proposal/approval wording is updated only at this final gate. The operator accepts or rejects M1 once; the gate never merges, deploys, acknowledges an accounting incident, or records release acceptance for them.

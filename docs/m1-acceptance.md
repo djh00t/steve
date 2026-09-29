@@ -50,7 +50,7 @@ Offer the event without waiting for the database worker. Queue or journal-channe
 
 ## Integrated implementation and qualification handoff
 
-All commands below are reserved selectors for `tests/e2e_accounting.rs` except #95's existing `tests/e2e.rs` selector. They are not passing evidence until the named target exists, exactly one test is selected, and the command passes on the candidate SHA.
+All commands below are reserved selectors for `tests/e2e_accounting.rs` except #95 and #96, which use `tests/e2e.rs`. They are not passing evidence until the named target exists, exactly one test is selected, and the command passes on the candidate SHA.
 
 | Owner | File and exact scenarios |
 | --- | --- |
@@ -60,9 +60,9 @@ All commands below are reserved selectors for `tests/e2e_accounting.rs` except #
 | #87 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting journal_partial_commit_replay -- --exact --nocapture`; `STEVE_TEST_POSTGRES_URL="${STEVE_TEST_POSTGRES_URL:?set isolated test Postgres DSN}" cargo test --all-features --test e2e_accounting postgres_replay_detects_conflicting_duplicate -- --exact --nocapture` |
 | #94 | This event contract only; runtime emission belongs to #95/#96. |
 | #95 | `tests/e2e.rs`: `cargo test --all-features --test e2e chat_nonstream_accounting -- --exact --nocapture` |
-| #96 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting chat_stream_terminal_accounting -- --exact --nocapture` |
+| #96 | `tests/e2e.rs`: `cargo test --all-features --test e2e chat_stream_terminal_accounting -- --exact --nocapture` |
 | #97 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting chat_accounting_does_not_delay_response -- --exact --nocapture` |
-| #483/#485 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting accounting_incident_preserves_forwarding_and_restart_evidence -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting accounting_disposition_is_auditable_and_publicly_redacted -- --exact --nocapture` |
+| #483/#485 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting accounting_incident_preserves_forwarding_and_restart_evidence -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting accounting_disposition_is_auditable_and_publicly_redacted -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting accounting_conflict_recovery_is_offline_and_verified -- --exact --nocapture` |
 | #484/#485 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting fresh_provision_and_missing_evidence_fail_closed -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting same_replica_replacement_preserves_accounting_ownership -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting legacy_journal_adoption_is_offline_and_resumable -- --exact --nocapture`. A nonempty legacy source remains staged and startup-blocking until Task 3 replay acknowledgement; an empty source may complete vacuously. |
 | #485 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting accounting_shutdown_barriers_complete -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting accounting_shutdown_timeout_survives_restart -- --exact --nocapture` |
 
