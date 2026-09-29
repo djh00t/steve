@@ -1,38 +1,41 @@
 use crate::{
+    accounting::{AccountingCoordinator, AccountingDrainCounts, AccountingEvent, IncidentCause},
     config::Config,
-    storage::{DatabasePool, ObjectStorage},
+    storage::{DatabasePool, InsertBackgroundEvent, ObjectStorage},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::{
-    fs::OpenOptions,
-    io::{BufWriter, Write},
-    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{self as std_mpsc, SyncSender},
-        Arc,
+        Arc, Mutex,
     },
-    thread,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tracing::{error, warn};
-use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct DeferredQueues {
-    accounting: mpsc::Sender<AccountingEvent>,
-    accounting_journal: SyncSender<AccountingEvent>,
-    history: mpsc::Sender<HistoryEvent>,
-    telemetry: mpsc::Sender<TelemetryEvent>,
+    accounting: Arc<Mutex<Option<mpsc::Sender<AccountingEvent>>>>,
+    accounting_worker: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    accounting_journal: AccountingCoordinator,
+    background_db: DatabasePool,
+    accounting_retry: AccountingRetryPolicy,
+    history: Arc<Mutex<Option<mpsc::Sender<HistoryEvent>>>>,
+    history_worker: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    telemetry: Arc<Mutex<Option<mpsc::Sender<TelemetryEvent>>>>,
+    telemetry_worker: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     stats: Arc<QueueStats>,
 }
 
 #[derive(Default)]
 pub struct QueueStats {
+    accounting_admitted: AtomicU64,
+    accounting_completed: AtomicU64,
+    accounting_database_committed: AtomicU64,
     pub accounting_spilled: AtomicU64,
     pub accounting_lost: AtomicU64,
     pub history_dropped: AtomicU64,
@@ -47,25 +50,6 @@ pub struct QueueSnapshot {
     pub telemetry_dropped: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct AccountingEvent {
-    id: String,
-    kind: String,
-    payload: Value,
-    created_at: String,
-}
-
-impl AccountingEvent {
-    fn new(kind: &'static str, payload: Value) -> Self {
-        Self {
-            id: Uuid::now_v7().to_string(),
-            kind: kind.to_string(),
-            payload,
-            created_at: Utc::now().to_rfc3339(),
-        }
-    }
-}
-
 #[derive(Debug)]
 struct TelemetryEvent {
     kind: &'static str,
@@ -78,20 +62,35 @@ struct HistoryEvent {
     data: Bytes,
 }
 
+#[derive(Clone, Copy)]
+struct AccountingRetryPolicy {
+    operation_timeout: Duration,
+    retry_deadline: Duration,
+    retry_interval: Duration,
+}
+
 impl DeferredQueues {
     pub async fn start(
         cfg: &Config,
         background_db: DatabasePool,
         objects: ObjectStorage,
     ) -> Result<Self> {
-        let journal_path = PathBuf::from(&cfg.queues.accounting_journal);
-        replay_accounting_journal(&journal_path, &background_db).await?;
-
         let stats = Arc::new(QueueStats::default());
-        let accounting_journal = start_accounting_journal(
-            journal_path,
+        let accounting_root = std::path::Path::new(&cfg.queues.accounting_journal);
+        let serving = AccountingCoordinator::acquire_serving(accounting_root)?;
+        AccountingCoordinator::reconcile_startup(
+            accounting_root,
+            &background_db,
+            std::time::Duration::from_millis(cfg.queues.accounting_operation_timeout_ms),
+            std::time::Duration::from_millis(cfg.queues.accounting_retry_deadline_ms),
+            std::time::Duration::from_millis(cfg.queues.accounting_retry_interval_ms),
+            true,
+        )
+        .await?;
+        let accounting_journal = AccountingCoordinator::start_with_guard(
+            accounting_root,
             cfg.queues.accounting_journal_queue,
-            stats.clone(),
+            serving,
         )?;
 
         let (accounting_tx, mut accounting_rx) =
@@ -102,29 +101,66 @@ impl DeferredQueues {
 
         let journal_for_worker = accounting_journal.clone();
         let stats_for_worker = stats.clone();
-        tokio::spawn(async move {
+        let accounting_retry = AccountingRetryPolicy {
+            operation_timeout: Duration::from_millis(cfg.queues.accounting_operation_timeout_ms),
+            retry_deadline: Duration::from_millis(cfg.queues.accounting_retry_deadline_ms),
+            retry_interval: Duration::from_millis(cfg.queues.accounting_retry_interval_ms),
+        };
+        let database_for_worker = background_db.clone();
+        let accounting_worker = tokio::spawn(async move {
             while let Some(event) = accounting_rx.recv().await {
-                let result = background_db
-                    .insert_background_event(
-                        &event.id,
-                        &event.kind,
-                        &event.payload.to_string(),
-                        &event.created_at,
-                    )
-                    .await;
-                if let Err(err) = result {
-                    error!(%err, event_id = %event.id, "background accounting write failed");
-                    spill_accounting_event(
-                        &journal_for_worker,
-                        &stats_for_worker,
-                        event,
-                        "database_write_failed",
-                    );
+                let outcome =
+                    insert_accounting_event(&database_for_worker, &event, accounting_retry).await;
+                match outcome {
+                    InsertBackgroundEvent::Inserted | InsertBackgroundEvent::DuplicateIdentical => {
+                        stats_for_worker
+                            .accounting_database_committed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    InsertBackgroundEvent::DuplicateConflict { .. } => {
+                        error!(event_id = %event.id, "background accounting content conflict");
+                        spill_accounting_event(
+                            &journal_for_worker,
+                            &stats_for_worker,
+                            event,
+                            "database_content_conflict",
+                            IncidentCause::PrimaryPersistenceFailedAndJournalUnavailable,
+                            1,
+                            0,
+                        );
+                    }
+                    InsertBackgroundEvent::Failed { error } => {
+                        error!(%error, event_id = %event.id, "background accounting write failed");
+                        spill_accounting_event(
+                            &journal_for_worker,
+                            &stats_for_worker,
+                            event,
+                            "database_write_failed",
+                            IncidentCause::PrimaryPersistenceFailedAndJournalUnavailable,
+                            1,
+                            0,
+                        );
+                    }
+                    InsertBackgroundEvent::Unknown { error } => {
+                        error!(%error, event_id = %event.id, "background accounting write outcome is unknown");
+                        spill_accounting_event(
+                            &journal_for_worker,
+                            &stats_for_worker,
+                            event,
+                            "database_write_unknown",
+                            IncidentCause::PrimaryPersistenceFailedAndJournalUnavailable,
+                            0,
+                            1,
+                        );
+                    }
                 }
+                stats_for_worker
+                    .accounting_completed
+                    .fetch_add(1, Ordering::Release);
             }
         });
 
-        tokio::spawn(async move {
+        let history_worker = tokio::spawn(async move {
             while let Some(event) = history_rx.recv().await {
                 if let Err(err) = objects.put(&event.key, event.data).await {
                     error!(%err, key = %event.key, "background history write failed");
@@ -132,24 +168,42 @@ impl DeferredQueues {
             }
         });
 
-        tokio::spawn(async move {
+        let telemetry_worker = tokio::spawn(async move {
             while let Some(event) = telemetry_rx.recv().await {
                 tracing::info!(kind = event.kind, payload = %event.payload, "deferred telemetry");
             }
         });
 
         Ok(Self {
-            accounting: accounting_tx,
+            accounting: Arc::new(Mutex::new(Some(accounting_tx))),
+            accounting_worker: Arc::new(tokio::sync::Mutex::new(Some(accounting_worker))),
             accounting_journal,
-            history: history_tx,
-            telemetry: telemetry_tx,
+            background_db,
+            accounting_retry,
+            history: Arc::new(Mutex::new(Some(history_tx))),
+            history_worker: Arc::new(tokio::sync::Mutex::new(Some(history_worker))),
+            telemetry: Arc::new(Mutex::new(Some(telemetry_tx))),
+            telemetry_worker: Arc::new(tokio::sync::Mutex::new(Some(telemetry_worker))),
             stats,
         })
     }
 
     pub fn accounting(&self, kind: &'static str, payload: Value) {
         let event = AccountingEvent::new(kind, payload);
-        match self.accounting.try_send(event) {
+        self.stats
+            .accounting_admitted
+            .fetch_add(1, Ordering::Release);
+        let sender = self
+            .accounting
+            .lock()
+            .expect("accounting producer")
+            .as_ref()
+            .cloned();
+        let result = match sender {
+            Some(sender) => sender.try_send(event),
+            None => Err(mpsc::error::TrySendError::Closed(event)),
+        };
+        match result {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(event))
             | Err(mpsc::error::TrySendError::Closed(event)) => {
@@ -158,24 +212,112 @@ impl DeferredQueues {
                     &self.stats,
                     event,
                     "primary_queue_unavailable",
+                    IncidentCause::PrimaryAndJournalUnavailable,
+                    1,
+                    0,
                 );
+                self.stats
+                    .accounting_completed
+                    .fetch_add(1, Ordering::Release);
             }
         }
     }
 
+    pub async fn prepare_shutdown(&self, deadline: Instant) -> Result<()> {
+        let coordinator = self.accounting_journal.clone();
+        let remaining = remaining(deadline, "preparing accounting shutdown")?;
+        tokio::time::timeout(
+            remaining,
+            tokio::task::spawn_blocking(move || coordinator.prepare_shutdown(deadline)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out preparing accounting shutdown"))?
+        .map_err(|error| anyhow::anyhow!("accounting shutdown task failed: {error}"))??;
+        Ok(())
+    }
+
+    pub async fn mark_unclean(&self, deadline: Instant) -> Result<()> {
+        let coordinator = self.accounting_journal.clone();
+        let counts = self.accounting_counts();
+        tokio::time::timeout(
+            remaining(deadline, "publishing conservative unclean evidence")?,
+            tokio::task::spawn_blocking(move || coordinator.mark_unclean(counts)),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out publishing conservative unclean evidence"))?
+        .map_err(|error| anyhow::anyhow!("unclean accounting evidence task failed: {error}"))??;
+        Ok(())
+    }
+
+    pub async fn shutdown(&self, deadline: Instant) -> Result<()> {
+        self.accounting.lock().expect("accounting producer").take();
+        self.history.lock().expect("history producer").take();
+        self.telemetry.lock().expect("telemetry producer").take();
+        let evidence = self.mark_unclean(deadline).await;
+        join_worker(&self.accounting_worker, deadline, "accounting").await?;
+        self.mark_unclean(deadline).await?;
+        join_worker(&self.history_worker, deadline, "history").await?;
+        join_worker(&self.telemetry_worker, deadline, "telemetry").await?;
+        let counts = self.accounting_counts();
+        let coordinator = self.accounting_journal.clone();
+        let finish =
+            tokio::task::spawn_blocking(move || coordinator.finish_shutdown(deadline, counts));
+        tokio::time::timeout(
+            remaining(deadline, "finalizing accounting ownership")?,
+            finish,
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out finalizing accounting ownership"))?
+        .map_err(|error| anyhow::anyhow!("accounting shutdown task failed: {error}"))??;
+        let remaining = remaining(deadline, "reconciling accounting shutdown")?;
+        tokio::time::timeout(
+            remaining,
+            AccountingCoordinator::reconcile_shutdown(
+                self.accounting_journal.root(),
+                &self.background_db,
+                self.accounting_retry.operation_timeout.min(remaining),
+                self.accounting_retry.retry_deadline.min(remaining),
+                self.accounting_retry.retry_interval,
+            ),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out reconciling accounting shutdown"))??;
+        evidence?;
+        Ok(())
+    }
+
+    fn accounting_counts(&self) -> AccountingDrainCounts {
+        AccountingDrainCounts {
+            admitted: self.stats.accounting_admitted.load(Ordering::Acquire),
+            worker_completed: self.stats.accounting_completed.load(Ordering::Acquire),
+            database_committed: self
+                .stats
+                .accounting_database_committed
+                .load(Ordering::Acquire),
+        }
+    }
+
     pub fn history(&self, key: String, data: Bytes) {
-        if self.history.try_send(HistoryEvent { key, data }).is_err() {
+        let sender = self
+            .history
+            .lock()
+            .expect("history producer")
+            .as_ref()
+            .cloned();
+        if sender.is_none_or(|sender| sender.try_send(HistoryEvent { key, data }).is_err()) {
             self.stats.history_dropped.fetch_add(1, Ordering::Relaxed);
             warn!("history queue saturated; payload dropped");
         }
     }
 
     pub fn telemetry(&self, kind: &'static str, payload: Value) {
-        if self
+        let sender = self
             .telemetry
-            .try_send(TelemetryEvent { kind, payload })
-            .is_err()
-        {
+            .lock()
+            .expect("telemetry producer")
+            .as_ref()
+            .cloned();
+        if sender.is_none_or(|sender| sender.try_send(TelemetryEvent { kind, payload }).is_err()) {
             self.stats.telemetry_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -188,75 +330,71 @@ impl DeferredQueues {
             telemetry_dropped: self.stats.telemetry_dropped.load(Ordering::Relaxed),
         }
     }
-}
 
-fn start_accounting_journal(
-    path: PathBuf,
-    capacity: usize,
-    stats: Arc<QueueStats>,
-) -> Result<SyncSender<AccountingEvent>> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating journal directory {}", parent.display()))?;
-        }
+    pub fn accounting_incident(&self) -> Value {
+        self.accounting_journal.public_incident()
     }
 
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("opening accounting journal {}", path.display()))?;
-    let (tx, rx) = std_mpsc::sync_channel::<AccountingEvent>(capacity.max(1));
+    pub fn with_accounting_admission<T>(&self, admit: impl FnOnce() -> T) -> Result<T, Value> {
+        self.accounting_journal.with_incident_admission(admit)
+    }
+}
 
-    thread::Builder::new()
-        .name("steve-accounting-journal".into())
-        .spawn(move || {
-            let mut writer = BufWriter::new(file);
-            while let Ok(event) = rx.recv() {
-                let write_result = serde_json::to_writer(&mut writer, &event)
-                    .and_then(|_| writer.write_all(b"\n").map_err(serde_json::Error::io))
-                    .and_then(|_| writer.flush().map_err(serde_json::Error::io));
+async fn join_worker(
+    worker: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    deadline: Instant,
+    name: &str,
+) -> Result<()> {
+    let mut worker = worker.lock().await;
+    let Some(handle) = worker.as_mut() else {
+        return Ok(());
+    };
+    tokio::time::timeout(
+        remaining(deadline, &format!("stopping {name} worker"))?,
+        handle,
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out stopping {name} worker"))?
+    .map_err(|error| anyhow::anyhow!("{name} worker failed: {error}"))?;
+    worker.take();
+    Ok(())
+}
 
-                if let Err(err) = write_result {
-                    stats.accounting_lost.fetch_add(1, Ordering::Relaxed);
-                    error!(
-                        %err,
-                        event_id = %event.id,
-                        "accounting journal write failed"
-                    );
-                }
-            }
-
-            if let Err(err) = writer.flush() {
-                error!(%err, "accounting journal final flush failed");
-            }
-        })
-        .context("spawning accounting journal writer")?;
-
-    Ok(tx)
+fn remaining(deadline: Instant, operation: &str) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        anyhow::bail!("timed out {operation}");
+    }
+    Ok(remaining)
 }
 
 fn spill_accounting_event(
-    journal: &SyncSender<AccountingEvent>,
+    journal: &AccountingCoordinator,
     stats: &QueueStats,
     event: AccountingEvent,
     reason: &'static str,
+    cause: IncidentCause,
+    lost: u64,
+    unknown: u64,
 ) {
     let event_id = event.id.clone();
-    match journal.try_send(event) {
+    match journal.offer(event) {
         Ok(()) => {
             stats.accounting_spilled.fetch_add(1, Ordering::Relaxed);
             warn!(
                 event_id = %event_id,
                 reason,
-                "accounting event spilled to durable journal"
+                "accounting event queued for durable journal"
             );
         }
-        Err(err) => {
-            stats.accounting_lost.fetch_add(1, Ordering::Relaxed);
+        Err(_event) => {
+            if lost > 0 {
+                stats.accounting_lost.fetch_add(lost, Ordering::Relaxed);
+            }
+            if let Err(err) = journal.latch_incident(cause, lost, unknown) {
+                error!(%err, event_id = %event_id, "accounting incident publication failed");
+            }
             error!(
-                %err,
                 event_id = %event_id,
                 reason,
                 "accounting event could not be queued or journaled"
@@ -265,53 +403,48 @@ fn spill_accounting_event(
     }
 }
 
-async fn replay_accounting_journal(path: &Path, db: &DatabasePool) -> Result<()> {
-    let contents = match tokio::fs::read_to_string(path).await {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("reading accounting journal {}", path.display()));
-        }
+async fn insert_accounting_event(
+    database: &DatabasePool,
+    event: &AccountingEvent,
+    policy: AccountingRetryPolicy,
+) -> InsertBackgroundEvent {
+    let Some(deadline) = Instant::now().checked_add(policy.retry_deadline) else {
+        return InsertBackgroundEvent::Unknown {
+            error: "accounting retry deadline is out of range".into(),
+        };
     };
-
-    let mut replayed = 0_u64;
-    for (index, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let event: AccountingEvent = serde_json::from_str(line).with_context(|| {
-            format!(
-                "parsing accounting journal {} line {}",
-                path.display(),
-                index + 1
-            )
-        })?;
-
-        db.insert_background_event(
-            &event.id,
-            &event.kind,
-            &event.payload.to_string(),
-            &event.created_at,
+    let payload = event.payload.to_string();
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return InsertBackgroundEvent::Unknown {
+                error: "accounting retry deadline exhausted".into(),
+            };
+        };
+        let bound = policy.operation_timeout.min(remaining);
+        let outcome = match tokio::time::timeout(
+            bound,
+            database.insert_background_event(&event.id, &event.kind, &payload, &event.created_at),
         )
-        .await?;
-        replayed += 1;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => InsertBackgroundEvent::Unknown {
+                error: format!("database operation exceeded {bound:?}"),
+            },
+        };
+        if matches!(
+            outcome,
+            InsertBackgroundEvent::Inserted
+                | InsertBackgroundEvent::DuplicateIdentical
+                | InsertBackgroundEvent::DuplicateConflict { .. }
+        ) {
+            return outcome;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return outcome;
+        };
+        tokio::time::sleep(policy.retry_interval.min(remaining)).await;
     }
-
-    if replayed > 0 {
-        tokio::fs::write(path, b"")
-            .await
-            .with_context(|| format!("truncating accounting journal {}", path.display()))?;
-        tracing::info!(
-            event = "accounting_journal_replayed",
-            entries = replayed,
-            path = %path.display(),
-            "replayed durable accounting journal"
-        );
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]

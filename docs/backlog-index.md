@@ -30,9 +30,9 @@ The settled policy remains **preserve forwarding; fail visibly and stop later in
 | --- | --- | --- |
 | [STV-M0-16 #483](https://github.com/djh00t/steve/issues/483) | Incident/admission state, exact HTTP/status fields and incident lifetime | WORKING BASELINE at PR #567 head `7d2a54b`; runtime/gate pending |
 | [STV-M0-17 #484](https://github.com/djh00t/steve/issues/484) | Journal ownership, replacement overlap and recovery boundaries | WORKING BASELINE at PR #568 head `48fc33f`; runtime/platform/gate pending |
-| [STV-M0-18 #485](https://github.com/djh00t/steve/issues/485) | Drain/replay acknowledgements and completion evidence | WORKING BASELINE; runtime and combined gate pending |
+| [STV-M0-18 #485](https://github.com/djh00t/steve/issues/485) | Drain/replay acknowledgements and completion evidence | CANDIDATE IMPLEMENTATION; final combined gate qualification pending |
 
-Replacing one leaf with three brought that snapshot to **390 active leaves**, including the buffering runner #480. Coordination parents #84 and #91 are excluded. This does not reopen the accepted M0 foundation or claim any persistence mechanism is implemented. #85/#86/#87/#94-#97 use the working baselines and exact handoff in `docs/m1-acceptance.md`; #37/#45/#98 remain open until the composed candidate passes. The operator accepts or rejects M1 once at the combined gate. No event ID can reconstruct a discarded payload, and a journal enqueue is not a durable write.
+Replacing one leaf with three brought that snapshot to **390 active leaves**, including the buffering runner #480. Coordination parents #84 and #91 are excluded. This does not reopen the accepted M0 foundation or claim final runtime or platform qualification. #85/#86/#87/#94-#97 use the working baselines and exact handoff in `docs/m1-acceptance.md`; #37/#45/#98 remain open until the composed candidate passes. The operator accepts or rejects M1 once at the combined gate. No event ID can reconstruct a discarded payload, and a journal enqueue is not a durable write.
 
 ## Provider transport contract decomposition
 
@@ -111,7 +111,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M0-05](https://github.com/djh00t/steve/issues/80) | Prove SQLite and PostgreSQL serve parity | CLOSED | #72 |
 | [STV-M0-06](https://github.com/djh00t/steve/issues/81) | Prove filesystem and S3 object-store parity | CLOSED | #72 |
 | [STV-M0-01](https://github.com/djh00t/steve/issues/84) | Coordinate accounting failure contracts | COORDINATION | #483/#484/#485 working baselines; runtime qualification and combined gate open |
-| [STV-M0-18](https://github.com/djh00t/steve/issues/485) | Define accounting drain and replay completion evidence | WORKING BASELINE | #483/#484 baselines; runtime selectors in `tests/e2e_accounting.rs` unimplemented |
+| [STV-M0-18](https://github.com/djh00t/steve/issues/485) | Define accounting drain and replay completion evidence | CANDIDATE IMPLEMENTATION | #483/#484 baselines; runtime selectors in `tests/e2e_accounting.rs` are present; final combined gate qualification remains open |
 | [STV-M0-02](https://github.com/djh00t/steve/issues/85) | Preserve journal framing and report corrupt tails | IMPLEMENTATION HANDOFF | #84 baseline, #72; owns `journal_partial_tail_recovery` in `tests/e2e_accounting.rs` |
 | [STV-M0-03](https://github.com/djh00t/steve/issues/86) | Retry accounting reconciliation without startup loss | IMPLEMENTATION HANDOFF | #84 baseline, #72; owns `accounting_reconciles_after_db_recovery` and bounded retry configuration |
 | [STV-M0-04](https://github.com/djh00t/steve/issues/87) | Prove idempotent journal replay after partial DB success | IMPLEMENTATION HANDOFF | #84 baseline, #72; owns SQLite/PostgreSQL replay selectors in `tests/e2e_accounting.rs` |
@@ -129,7 +129,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M1-03](https://github.com/djh00t/steve/issues/33) | Verify Chat disconnect cancellation and no replay | CLOSED | #39, #73 |
 | [STV-M1-04](https://github.com/djh00t/steve/issues/94) | Define the Chat accounting event contract | WORKING BASELINE | #483/#484/#485 working baselines; runtime recovery qualification remains open |
 | [STV-M1-05](https://github.com/djh00t/steve/issues/95) | Enqueue completed nonstream Chat attempts | IMPLEMENTATION HANDOFF | #94; owns `chat_nonstream_accounting` in `tests/e2e.rs` |
-| [STV-M1-06](https://github.com/djh00t/steve/issues/96) | Enqueue streamed Chat attempts at terminal state | IMPLEMENTATION HANDOFF | #94, #33, reviewed #95 integration; owns `chat_stream_terminal_accounting` in `tests/e2e_accounting.rs` |
+| [STV-M1-06](https://github.com/djh00t/steve/issues/96) | Enqueue streamed Chat attempts at terminal state | IMPLEMENTATION HANDOFF | #94, #33, reviewed #95 integration; owns `chat_stream_terminal_accounting` in `tests/e2e.rs` |
 | [STV-M1-07](https://github.com/djh00t/steve/issues/97) | Prove saturated Chat accounting does not delay SSE | BLOCKED | #96 runtime, #73, #84 runtime; owns `chat_accounting_does_not_delay_response` |
 | [STV-M1-08](https://github.com/djh00t/steve/issues/98) | Run and document the composed M1 acceptance | RELEASE GATE | #75, #33, #94-#97, #76-#79, #82, #83, #459 and exact-SHA hosted/platform evidence |
 

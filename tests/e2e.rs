@@ -1367,6 +1367,7 @@ async fn run_chat_stream_body_case(end: StreamEnd, expected_status: &str) {
             while let Some(chunk) = body.next().await {
                 chunk.expect("read successful stream tail");
             }
+            drop(body);
         }
         StreamEnd::Error => {
             upstream.release_tail();
@@ -1374,6 +1375,7 @@ async fn run_chat_stream_body_case(end: StreamEnd, expected_status: &str) {
                 body.next().await.expect("body error item").is_err(),
                 "body fault must reach the client"
             );
+            drop(body);
         }
         StreamEnd::Drop => {
             drop(body);
