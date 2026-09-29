@@ -98,6 +98,14 @@ pub struct TlsFixture {
 
 impl TlsFixture {
     pub async fn start(router: Router) -> io::Result<Self> {
+        Self::start_with_material(router, SERVER_CERT_DER, SERVER_KEY_DER).await
+    }
+
+    pub async fn start_with_material(
+        router: Router,
+        certificate_der: &[u8],
+        private_key_der: &[u8],
+    ) -> io::Result<Self> {
         let year = chrono::Utc::now().year();
         if !(2026..=2034).contains(&year) {
             return Err(io::Error::new(
@@ -111,8 +119,8 @@ impl TlsFixture {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
-                vec![CertificateDer::from(SERVER_CERT_DER.to_vec())],
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(SERVER_KEY_DER.to_vec())),
+                vec![CertificateDer::from(certificate_der.to_vec())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(private_key_der.to_vec())),
             )
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let (cancel_requests, cancel_rx) = watch::channel(false);

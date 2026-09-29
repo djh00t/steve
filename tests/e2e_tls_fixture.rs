@@ -11,7 +11,7 @@ use axum::{
 use std::{
     future::pending,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -237,4 +237,85 @@ async fn tls_fixture_accepts_while_handshake_stalls() {
         matches!(closed, Ok(0) | Err(_)),
         "idle handshake was not closed"
     );
+}
+
+#[tokio::test]
+async fn stv_prov_38_certificate_variants() {
+    async fn assert_rejected(
+        label: &str,
+        expected_cause: &str,
+        certificate: &[u8],
+        private_key: &[u8],
+    ) {
+        let captured = Arc::new(AtomicUsize::new(0));
+        let route_captured = Arc::clone(&captured);
+        let fixture = upstream_tls::TlsFixture::start_with_material(
+            Router::new().route(
+                "/variant",
+                get(move || {
+                    let captured = Arc::clone(&route_captured);
+                    async move {
+                        captured.fetch_add(1, Ordering::SeqCst);
+                        "unexpected"
+                    }
+                }),
+            ),
+            certificate,
+            private_key,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{label}: start TLS fixture: {error}"));
+        let ca =
+            reqwest::Certificate::from_pem(upstream_tls::TRUSTED_CA_PEM).expect("parse trusted CA");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(ca)
+            .build()
+            .expect("build variant client");
+        let result = client
+            .get(format!("{}/variant", fixture.url()))
+            .send()
+            .await;
+        let error = match result {
+            Ok(response) => panic!("{label}: unexpected HTTP response {response:?}"),
+            Err(error) => error,
+        };
+        assert!(error.is_connect(), "{label}: expected TLS failure: {error}");
+        let debug = format!("{error:?}");
+        assert!(
+            debug.contains(expected_cause),
+            "{label}: expected {expected_cause} in TLS error, got {debug}"
+        );
+        assert_eq!(
+            captured.load(Ordering::SeqCst),
+            0,
+            "{label}: route was reached"
+        );
+        fixture
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("{label}: fixture shutdown: {error}"));
+    }
+
+    assert_rejected(
+        "unrelated CA, current validity, right IP",
+        "UnknownIssuer",
+        include_bytes!("fixtures/tls/unrelated-server.der"),
+        include_bytes!("fixtures/tls/unrelated-server.key.der"),
+    )
+    .await;
+    assert_rejected(
+        "trusted CA, current validity, wrong IP",
+        "NotValidForName",
+        include_bytes!("fixtures/tls/wrong-ip-server.der"),
+        include_bytes!("fixtures/tls/wrong-ip-server.key.der"),
+    )
+    .await;
+    assert_rejected(
+        "trusted CA, expired, right IP",
+        "Expired",
+        include_bytes!("fixtures/tls/expired-server.der"),
+        include_bytes!("fixtures/tls/expired-server.key.der"),
+    )
+    .await;
 }
