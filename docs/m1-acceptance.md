@@ -1,6 +1,6 @@
 # STV-M1-04: Chat terminal-attempt accounting event
 
-This contract uses [STV-M0-16](contracts/stv-m0-16.md) at [PR #567 head `7d2a54b03394be8d71c2018b73286e7a08a64cd5`](https://github.com/djh00t/steve/issues/483#issuecomment-5885737021) as the owner-selected working design baseline. Final operator/release acceptance awaits the combined M1 gate. This note defines the event offered to `DeferredQueues::accounting` by [#95](https://github.com/djh00t/steve/issues/95) and [#96](https://github.com/djh00t/steve/issues/96); it does not implement emission, persistence, or the #484/#485 recovery mechanisms.
+This contract uses [STV-M0-16](contracts/stv-m0-16.md) at [PR #567 head `7d2a54b03394be8d71c2018b73286e7a08a64cd5`](https://github.com/djh00t/steve/issues/483#issuecomment-5885737021), [STV-M0-17](contracts/stv-m0-17.md) at [PR #568 head `48fc33f36d7a147db7373d30c9a5653749895f12`](https://github.com/djh00t/steve/issues/484#issuecomment-5885739296), and [STV-M0-18](contracts/stv-m0-18.md) as working design baselines. Final operator and release acceptance occurs once at the combined touchable M1 gate. This note defines the event offered to `DeferredQueues::accounting` by [#95](https://github.com/djh00t/steve/issues/95) and [#96](https://github.com/djh00t/steve/issues/96); it does not claim emission, persistence, recovery, or platform qualification is complete.
 
 ## Shape and identity
 
@@ -47,3 +47,23 @@ Offer the event without waiting for the database worker. Queue or journal-channe
 - [#95](https://github.com/djh00t/steve/issues/95) owns nonstream emission from `ChatCompletionReply::attempts` through the existing synchronous `DeferredQueues::accounting` call. Its `chat_nonstream_accounting` process test must inspect stored envelope/payload, both retry attempts, and one row per emitted event ID without waiting on storage in the response path.
 - [#96](https://github.com/djh00t/steve/issues/96) owns SSE terminal emission, including before-header upstream failure, EOF, body error and disconnect. Its `chat_stream_terminal_accounting` process test must prove no early event, one final event with the correct status, and no second event after a terminal outcome.
 - Neither consumer may claim the incident gate, replay, restart recovery, or operator disposition works until #484/#485 and their runtime qualification are complete.
+
+## Integrated implementation and qualification handoff
+
+All commands below are reserved selectors for `tests/e2e_accounting.rs` except #95's existing `tests/e2e.rs` selector. They are not passing evidence until the named target exists, exactly one test is selected, and the command passes on the candidate SHA.
+
+| Owner | File and exact scenarios |
+| --- | --- |
+| #84 | Coordination only: STV-M0-16/17/18 and the consumer handoff; no independent runtime selector. |
+| #85 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting journal_partial_tail_recovery -- --exact --nocapture` |
+| #86 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting accounting_reconciles_after_db_recovery -- --exact --nocapture`; owns configured per-operation timeout, total retry deadline, retry interval, exhaustion result, and startup/manual recovery trigger. |
+| #87 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting journal_partial_commit_replay -- --exact --nocapture`; `STEVE_TEST_POSTGRES_URL="${STEVE_TEST_POSTGRES_URL:?set isolated test Postgres DSN}" cargo test --all-features --test e2e_accounting postgres_replay_detects_conflicting_duplicate -- --exact --nocapture` |
+| #94 | This event contract only; runtime emission belongs to #95/#96. |
+| #95 | `tests/e2e.rs`: `cargo test --all-features --test e2e chat_nonstream_accounting -- --exact --nocapture` |
+| #96 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting chat_stream_terminal_accounting -- --exact --nocapture` |
+| #97 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting chat_accounting_does_not_delay_response -- --exact --nocapture` |
+| #483/#485 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting accounting_incident_preserves_forwarding_and_restart_evidence -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting accounting_disposition_is_auditable_and_publicly_redacted -- --exact --nocapture` |
+| #484/#485 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting fresh_provision_and_missing_evidence_fail_closed -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting same_replica_replacement_preserves_accounting_ownership -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting legacy_journal_adoption_is_offline_and_resumable -- --exact --nocapture`. A nonempty legacy source remains staged and startup-blocking until Task 3 replay acknowledgement; an empty source may complete vacuously. |
+| #485 | `tests/e2e_accounting.rs`: `cargo test --all-features --test e2e_accounting accounting_shutdown_barriers_complete -- --exact --nocapture`; `cargo test --all-features --test e2e_accounting accounting_shutdown_timeout_survives_restart -- --exact --nocapture` |
+
+[#45](https://github.com/djh00t/steve/issues/45) closes only after #94-#97 pass as one deferred-accounting path. [#37](https://github.com/djh00t/steve/issues/37) and [#98](https://github.com/djh00t/steve/issues/98) own the composed browser gate over those results plus the existing Chat, Responses, Messages, cancellation, models, health, official SDK, hosted CI, mutation, and target-platform evidence. They do not create another accounting implementation target or another operator approval step.
