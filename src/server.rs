@@ -251,12 +251,18 @@ pub async fn run(
         normal_builder = normal_builder.add_root_certificate(certificate.clone());
         anthropic_builder = anthropic_builder.add_root_certificate(certificate);
     }
+    let ca_source = cfg
+        .server
+        .upstream_ca_bundle
+        .as_ref()
+        .map(|path| format!(" with CA bundle {}", path.display()))
+        .unwrap_or_default();
     let normal_http = normal_builder
         .build()
-        .context("building upstream HTTP client")?;
+        .with_context(|| format!("building upstream HTTP client{ca_source}"))?;
     let anthropic_http = anthropic_builder
         .build()
-        .context("building Anthropic HTTP client")?;
+        .with_context(|| format!("building Anthropic HTTP client{ca_source}"))?;
     let openai_upstream = cfg
         .server
         .openai_upstream_url

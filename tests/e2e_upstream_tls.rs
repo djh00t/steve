@@ -85,17 +85,24 @@ async fn invalid_ca_bundles_fail_before_readiness() {
     let missing = temp.path().join("missing.pem");
     let empty = temp.path().join("empty.pem");
     let malformed = temp.path().join("malformed.pem");
+    let invalid_der = temp.path().join("invalid-der.pem");
     fs::write(&empty, b"").expect("write empty bundle");
     fs::write(
         &malformed,
         b"-----BEGIN CERTIFICATE-----\n@@@\n-----END CERTIFICATE-----\n",
     )
     .expect("write malformed bundle");
+    fs::write(
+        &invalid_der,
+        b"-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write invalid DER bundle");
 
     for (path, kind) in [
         (missing.as_path(), "reading"),
         (empty.as_path(), "empty"),
         (malformed.as_path(), "parsing"),
+        (invalid_der.as_path(), "building"),
     ] {
         assert_ca_rejected(path, kind).await;
     }
