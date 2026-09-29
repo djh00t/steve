@@ -20,7 +20,7 @@ The admission contract landed in [#466](https://github.com/djh00t/steve/pull/466
 
 Replacing one implementation leaf with three and adding the fixture produced 386 active leaf packages. The independently qualified [process shutdown helper #474](https://github.com/djh00t/steve/issues/474), required before the active-stream drain test #89, brings the inventory to **387 active leaf packages**. The bounded buffering-fault runner [STV-TST-15 #480](https://github.com/djh00t/steve/issues/480), required before mutation CI wiring #79, brings the inventory to **388 active leaf packages**. Coordination parent #91 is not counted as a leaf. The original readiness-count table remains historical; issue bodies hold current ownership and readiness. This decomposition leaves the accepted M0 foundation unchanged.
 
-The next implementation wave must use exact accepted contract revisions and runnable predecessor commands. Register each endpoint with its implementation so its HTTP acceptance can run immediately; serialize shared router, schema, configuration, fixture and CI files. Apply the same rule to clients: qualify an executable target and one working connection before adding views.
+The next implementation wave must use exact accepted or explicitly selected working-baseline revisions and runnable predecessor commands. Register each endpoint with its implementation so its HTTP acceptance can run immediately; serialize shared router, schema, configuration, fixture and CI files. Apply the same rule to clients: qualify an executable target and one working connection before adding views.
 
 ## Accounting contract decomposition
 
