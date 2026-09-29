@@ -50,6 +50,7 @@ impl SteveProcess {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -75,6 +76,7 @@ impl SteveProcess {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -94,6 +96,7 @@ impl SteveProcess {
             ca_bundle,
             None,
             None,
+            None,
         )
     }
 
@@ -105,6 +108,7 @@ impl SteveProcess {
             60,
             Some(endpoint),
             Some(history_capacity),
+            None,
             None,
             None,
             None,
@@ -123,6 +127,7 @@ impl SteveProcess {
             None,
             None,
             Some(accounting_root),
+            None,
             None,
         )
     }
@@ -145,6 +150,31 @@ impl SteveProcess {
             None,
             Some(accounting_root),
             Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn start_with_accounting_fault_fixture(
+        database_url: &str,
+        accounting_root: &Path,
+        accounting_capacity: usize,
+        journal_capacity: usize,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            None,
+            None,
+            60,
+            None,
+            None,
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            Some((accounting_capacity, journal_capacity)),
         )
     }
 
@@ -159,6 +189,7 @@ impl SteveProcess {
         ca_bundle: Option<&Path>,
         accounting_root: Option<&Path>,
         accounting_retry: Option<(u64, u64, u64)>,
+        accounting_capacity: Option<(usize, usize)>,
     ) -> io::Result<Self> {
         let startup_lock = acquire_accounting_startup_lock()?;
         let temp = tempfile::tempdir()?;
@@ -208,6 +239,11 @@ impl SteveProcess {
                 )
             })
             .unwrap_or_default();
+        let accounting_capacity = accounting_capacity
+            .map(|(primary, journal)| {
+                format!("accounting = {primary}\naccounting_journal_queue = {journal}\n")
+            })
+            .unwrap_or_default();
         let database_url = database_url
             .map(str::to_owned)
             .unwrap_or_else(|| format!("sqlite://{}?mode=rwc", db_path.display()));
@@ -234,6 +270,7 @@ impl SteveProcess {
         let config = format!(
             "{server_config}\n[database]\nurl = {}\n\
              {object_storage}\n[queues]\naccounting_journal = {}\n{history}\
+             {accounting_capacity}\
              {accounting_retry}\
              [logging]\nlevel = \"info\"\njson = true\n",
             toml::Value::String(database_url),

@@ -158,6 +158,7 @@ struct Health {
     phase: Phase,
     inflight: u64,
     admission: Admission,
+    accounting_incident: Value,
 }
 
 #[derive(Serialize)]
@@ -198,6 +199,7 @@ pub async fn run(
     deferred: DeferredQueues,
     lifecycle: Lifecycle,
 ) -> Result<()> {
+    let deferred_shutdown = deferred.clone();
     let inference_addr: SocketAddr = cfg
         .server
         .inference_bind
@@ -367,9 +369,11 @@ pub async fn run(
     )
     .await;
     let _ = shutdown_tx.send(true);
+    let accounting_shutdown = deferred_shutdown.shutdown_accounting(timeout).await;
 
     lifecycle.stopped("listeners_exited");
     result?;
+    accounting_shutdown?;
     Ok(())
 }
 
@@ -522,22 +526,26 @@ async fn live(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         phase: state.lifecycle.phase(),
         inflight: state.lifecycle.inflight(),
         admission: admission(&state),
+        accounting_incident: state.deferred.accounting_incident(),
     })
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let accounting_incident = state.deferred.accounting_incident();
+    let incident_ready = !matches!(
+        accounting_incident["state"].as_str(),
+        Some("blocked" | "unreconciled")
+    );
+    let is_ready = state.lifecycle.is_ready() && incident_ready;
     let health = Health {
-        status: if state.lifecycle.is_ready() {
-            "ready"
-        } else {
-            "not_ready"
-        },
+        status: if is_ready { "ready" } else { "not_ready" },
         phase: state.lifecycle.phase(),
         inflight: state.lifecycle.inflight(),
         admission: admission(&state),
+        accounting_incident,
     };
 
-    if state.lifecycle.is_ready() {
+    if is_ready {
         (StatusCode::OK, Json(health)).into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(health)).into_response()
@@ -567,6 +575,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
         "inference_bind": state.inference_bind,
         "management_bind": state.management_bind,
         "queues": state.deferred.snapshot(),
+        "accounting_incident": state.deferred.accounting_incident(),
     }))
 }
 
@@ -758,7 +767,31 @@ async fn admit_inference(
         return next.run(request).await;
     }
 
-    let Some(permit) = state.inference_admission.try_acquire() else {
+    let permit = match state
+        .deferred
+        .with_accounting_admission(|| state.inference_admission.try_acquire())
+    {
+        Err(incident) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    ("content-type", "application/json"),
+                    ("cache-control", "no-store"),
+                    ("retry-after", "1"),
+                ],
+                Json(json!({"error":{
+                    "type":"unavailable",
+                    "code":"accounting_incident",
+                    "message":"inference admission stopped by an unresolved accounting incident",
+                    "incident_id":incident["incident_id"],
+                    "state":incident["state"],
+                }})),
+            )
+                .into_response();
+        }
+        Ok(permit) => permit,
+    };
+    let Some(permit) = permit else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [

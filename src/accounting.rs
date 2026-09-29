@@ -10,10 +10,11 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -102,10 +103,16 @@ struct ReplayReceipt {
     database_evidence_at: Option<String>,
     conflict_snapshot_ref: Option<String>,
     conflict_snapshot_digest: Option<String>,
+    #[serde(default)]
+    resolution_ref: Option<String>,
+    #[serde(default)]
+    resolution_digest: Option<String>,
+    #[serde(default)]
+    resolved_authoritative: Option<String>,
     updated_at: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ReplayManifest {
     format_version: u64,
     installation_id: String,
@@ -138,25 +145,7 @@ struct ReplayPolicy {
     retry_interval: Duration,
 }
 
-#[derive(Debug, Serialize)]
-struct ConflictSnapshot<'a> {
-    format_version: u64,
-    installation_id: &'a str,
-    generation_id: &'a str,
-    journal_offset: u64,
-    journal_length: u64,
-    journal_record_digest: &'a str,
-    source: Value,
-    existing: Value,
-    existing_row_digest: String,
-    verification_id: &'a str,
-    backend: &'a str,
-    transaction_isolation: &'a str,
-    read_evidence: String,
-    observed_at: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct ConflictRowEvidence {
     id: String,
     kind: String,
@@ -164,7 +153,7 @@ struct ConflictRowEvidence {
     created_at: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct RecordedConflictSnapshot {
     format_version: u64,
     installation_id: String,
@@ -224,9 +213,46 @@ fn parse_journal(bytes: &[u8]) -> ParsedJournal {
 pub(crate) struct AccountingCoordinator {
     root: PathBuf,
     generation_id: String,
-    journal: SyncSender<AccountingEvent>,
+    journal: SyncSender<JournalMessage>,
+    journal_writer: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     accepting: Arc<AtomicBool>,
     state: Arc<Mutex<GenerationState>>,
+    incident: Arc<Mutex<Incident>>,
+    incident_publisher: mpsc::Sender<IncidentPublisherMessage>,
+    incident_publisher_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    incident_submitted: Arc<AtomicU64>,
+    _incident_durable: Arc<(Mutex<u64>, Condvar)>,
+    _serving: AccountingServingGuard,
+}
+
+#[derive(Clone)]
+pub(crate) struct AccountingServingGuard {
+    _file: Arc<File>,
+}
+
+pub(crate) struct AccountingOfflineGuard {
+    _file: File,
+}
+
+#[derive(Clone)]
+struct IncidentPublication {
+    sequence: u64,
+    publication_id: String,
+    based_on_revision: u64,
+    attempted: Incident,
+    cause: IncidentCause,
+    lost: u64,
+    unknown: u64,
+}
+
+enum JournalMessage {
+    Event(AccountingEvent),
+    Shutdown(SyncSender<()>),
+}
+
+enum IncidentPublisherMessage {
+    Publish(Box<IncidentPublication>),
+    Shutdown,
 }
 
 #[allow(dead_code)]
@@ -251,7 +277,7 @@ struct Installation {
     root: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Incident {
     format_version: u64,
     installation_id: String,
@@ -260,11 +286,13 @@ struct Incident {
     incident_id: Option<String>,
     first_observed_at: Option<String>,
     cause: Option<IncidentCause>,
-    disposition: Option<Value>,
+    disposition: Option<Disposition>,
     payloads: IncidentPayloads,
+    #[serde(default)]
+    publication_ids: BTreeSet<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum IncidentState {
     Clear,
@@ -273,9 +301,9 @@ enum IncidentState {
     Acknowledged,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-enum IncidentCause {
+pub(crate) enum IncidentCause {
     PrimaryAndJournalUnavailable,
     PrimaryPersistenceFailedAndJournalUnavailable,
     JournalWriteFailed,
@@ -283,28 +311,56 @@ enum IncidentCause {
     ReplayContentConflict,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct IncidentPayloads {
     pending_replay: PendingReplay,
     provisional: Provisional,
     outcome_totals: OutcomeTotals,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PendingReplay {
     volatile: Option<u64>,
     durable: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Provisional {
     unknown: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct OutcomeTotals {
     reconciled: Option<u64>,
     unrecoverable_lost: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct Disposition {
+    kind: String,
+    actor: String,
+    at: String,
+    evidence_ref: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct AuditRecord {
+    format_version: u64,
+    installation_id: String,
+    operation: String,
+    incident_id: String,
+    revision: u64,
+    previous_revision: u64,
+    coverage: Vec<Coverage>,
+    disposition: Option<Disposition>,
+    event_id: Option<String>,
+    authoritative: Option<String>,
+    evidence_ref: String,
+    conflict_snapshot_ref: Option<String>,
+    conflict_snapshot_digest: Option<String>,
+    final_row: Option<ConflictRowEvidence>,
+    actor: String,
+    at: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -320,7 +376,7 @@ struct Provisioning {
     directory_synced: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct Coordination {
     format_version: u64,
     installation_id: String,
@@ -440,7 +496,410 @@ fn clear_incident(installation_id: &str) -> Incident {
                 unrecoverable_lost: Some(0),
             },
         },
+        publication_ids: BTreeSet::new(),
     }
+}
+
+fn public_incident(incident: &Incident) -> Value {
+    let mut value = serde_json::to_value(incident).expect("incident must serialize");
+    if let Some(disposition) = value.get_mut("disposition").and_then(Value::as_object_mut) {
+        disposition.insert("actor".into(), Value::Null);
+        disposition.insert("evidence_ref".into(), Value::Null);
+    }
+    let object = value.as_object_mut().expect("incident must be an object");
+    object.remove("format_version");
+    object.remove("installation_id");
+    object.remove("revision");
+    object.remove("publication_ids");
+    value
+}
+
+fn refresh_incident(root: &Path, incident: &mut Incident) -> bool {
+    match read_checked::<Incident>(&root.join("incident.json")) {
+        Ok(persisted) => {
+            let newer_unresolved_lineage = matches!(
+                incident.state,
+                IncidentState::Clear | IncidentState::Acknowledged
+            ) && matches!(
+                persisted.state,
+                IncidentState::Blocked | IncidentState::Unreconciled
+            ) && incident.incident_id != persisted.incident_id;
+            if persisted.revision > incident.revision
+                && (newer_unresolved_lineage
+                    || incident
+                        .publication_ids
+                        .is_subset(&persisted.publication_ids))
+            {
+                *incident = persisted;
+            }
+            matches!(has_unowned_incomplete_generation(root, incident), Ok(false))
+        }
+        Err(_) => false,
+    }
+}
+
+fn has_unowned_incomplete_generation(root: &Path, incident: &Incident) -> Result<bool> {
+    let acknowledged_coverage = if incident.state == IncidentState::Acknowledged {
+        let records: Vec<AuditRecord> = read_checked(&root.join("audit.json"))?;
+        Some(
+            records
+                .into_iter()
+                .find(|record| {
+                    record.operation == "acknowledge"
+                        && Some(record.incident_id.as_str()) == incident.incident_id.as_deref()
+                        && record.revision == incident.revision
+                        && record.disposition == incident.disposition
+                })
+                .context("acknowledged incident audit is unavailable")?
+                .coverage,
+        )
+    } else {
+        None
+    };
+    let mut state_paths = BTreeMap::new();
+    let mut journals = BTreeSet::new();
+    for entry in fs::read_dir(root.join("generations"))? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(true);
+        };
+        if let Some(generation_id) = name.strip_suffix(".state.json") {
+            state_paths.insert(generation_id.to_string(), path);
+        } else if let Some(generation_id) = name.strip_suffix(".journal") {
+            journals.insert(generation_id.to_string());
+        }
+    }
+    let state_ids = state_paths.keys().cloned().collect::<BTreeSet<_>>();
+    let coordination: Coordination = read_checked(&root.join("coordination.json"))?;
+    let coverage_ids = coordination
+        .coverage
+        .iter()
+        .map(|entry| entry.generation_id.clone())
+        .collect::<BTreeSet<_>>();
+    if journals != state_ids || coverage_ids != state_ids {
+        return Ok(true);
+    }
+    for path in state_paths.values() {
+        let state: GenerationState = read_checked(path)?;
+        if !matches!(
+            state.phase,
+            GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Adopting
+        ) {
+            continue;
+        }
+        if acknowledged_coverage
+            .as_ref()
+            .is_some_and(|coverage_entries| coverage_entries.contains(&coverage(&state)))
+        {
+            continue;
+        }
+        let journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(generation_journal_path(root, &state.generation_id))?;
+        match journal.try_lock() {
+            Ok(()) => {
+                File::unlock(&journal)?;
+                return Ok(true);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("checking live accounting generation ownership")
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn fail_closed_incident(incident: &Incident) -> Value {
+    let mut unavailable = incident.clone();
+    unavailable.state = IncidentState::Unreconciled;
+    unavailable.cause = Some(IncidentCause::PriorIncidentUnreconciled);
+    unavailable.disposition = None;
+    unavailable.payloads = IncidentPayloads {
+        pending_replay: PendingReplay {
+            volatile: None,
+            durable: None,
+        },
+        provisional: Provisional { unknown: None },
+        outcome_totals: OutcomeTotals {
+            reconciled: None,
+            unrecoverable_lost: None,
+        },
+    };
+    public_incident(&unavailable)
+}
+
+fn queue_incident_publication(
+    shared: &Mutex<Incident>,
+    publisher: &mpsc::Sender<IncidentPublisherMessage>,
+    submitted: &AtomicU64,
+    cause: IncidentCause,
+    lost: u64,
+    unknown: u64,
+) -> Result<()> {
+    let mut shared = shared.lock().expect("accounting incident");
+    let based_on_revision = shared.revision;
+    let publication_id = Uuid::now_v7().to_string();
+    apply_incident_failure(&mut shared, cause, lost, unknown);
+    shared.publication_ids.insert(publication_id.clone());
+    let sequence = submitted.load(Ordering::Acquire).saturating_add(1);
+    publisher
+        .send(IncidentPublisherMessage::Publish(Box::new(
+            IncidentPublication {
+                sequence,
+                publication_id,
+                based_on_revision,
+                attempted: shared.clone(),
+                cause,
+                lost,
+                unknown,
+            },
+        )))
+        .context("queueing durable accounting incident publication")?;
+    submitted.store(sequence, Ordering::Release);
+    Ok(())
+}
+
+fn persist_incident_publication(
+    root: &Path,
+    publication: &IncidentPublication,
+) -> Result<Incident> {
+    let lock = open_coordination_lock(root)?;
+    lock_with_timeout(&lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(root)?;
+    let persisted: Incident = read_checked(&root.join("incident.json"))?;
+    if persisted
+        .publication_ids
+        .contains(&publication.publication_id)
+    {
+        File::unlock(&lock).context("unlocking accounting coordination")?;
+        return Ok(persisted);
+    }
+    if persisted.revision < publication.based_on_revision {
+        bail!("durable accounting incident revision moved backwards");
+    }
+    let candidate = if persisted.revision == publication.based_on_revision {
+        publication.attempted.clone()
+    } else {
+        let mut candidate = persisted;
+        apply_incident_failure(
+            &mut candidate,
+            publication.cause,
+            publication.lost,
+            publication.unknown,
+        );
+        candidate
+            .publication_ids
+            .insert(publication.publication_id.clone());
+        candidate
+    };
+    write_checked(&root.join("incident.json"), &candidate)?;
+    File::unlock(&lock).context("unlocking accounting coordination")?;
+    Ok(candidate)
+}
+
+fn start_incident_publisher(
+    root: PathBuf,
+    receiver: mpsc::Receiver<IncidentPublisherMessage>,
+    shared: Arc<Mutex<Incident>>,
+    durable: Arc<(Mutex<u64>, Condvar)>,
+) -> Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("steve-accounting-incident".into())
+        .spawn(move || {
+            while let Ok(message) = receiver.recv() {
+                let IncidentPublisherMessage::Publish(publication) = message else {
+                    break;
+                };
+                let persisted = loop {
+                    match persist_incident_publication(&root, &publication) {
+                        Ok(persisted) => break persisted,
+                        Err(error) => {
+                            tracing::warn!(%error, "retrying durable accounting incident publication");
+                            thread::sleep(LOCK_POLL);
+                        }
+                    }
+                };
+                let mut current = shared.lock().expect("accounting incident");
+                if persisted.revision > current.revision
+                    && current
+                        .publication_ids
+                        .is_subset(&persisted.publication_ids)
+                {
+                    *current = persisted;
+                }
+                drop(current);
+                let (completed, changed) = &*durable;
+                let mut completed = completed.lock().expect("incident publication progress");
+                *completed = (*completed).max(publication.sequence);
+                changed.notify_all();
+            }
+        })
+        .context("spawning accounting incident publisher")
+}
+
+fn apply_incident_failure(incident: &mut Incident, cause: IncidentCause, lost: u64, unknown: u64) {
+    if matches!(
+        incident.state,
+        IncidentState::Clear | IncidentState::Acknowledged
+    ) {
+        incident.publication_ids.clear();
+        incident.incident_id = Some(Uuid::now_v7().to_string());
+        incident.first_observed_at = Some(Utc::now().to_rfc3339());
+        incident.cause = Some(cause);
+        incident.disposition = None;
+        incident.payloads.pending_replay = PendingReplay {
+            volatile: Some(0),
+            durable: Some(0),
+        };
+        incident.payloads.provisional = Provisional { unknown: Some(0) };
+        incident.payloads.outcome_totals = OutcomeTotals {
+            reconciled: Some(0),
+            unrecoverable_lost: Some(0),
+        };
+    }
+    incident.state = IncidentState::Blocked;
+    incident.revision = incident.revision.saturating_add(1);
+    incident.payloads.provisional.unknown = incident
+        .payloads
+        .provisional
+        .unknown
+        .map(|value| value.saturating_add(unknown));
+    incident.payloads.outcome_totals.unrecoverable_lost = incident
+        .payloads
+        .outcome_totals
+        .unrecoverable_lost
+        .map(|value| value.saturating_add(lost));
+}
+
+fn latch_replay_conflict(root: &Path, installation: &Installation) -> Result<()> {
+    let lock = open_coordination_lock(root)?;
+    lock_with_timeout(&lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(root)?;
+    let mut incident: Incident = read_checked(&root.join("incident.json"))?;
+    if incident.installation_id != installation.installation_id {
+        bail!("replay conflict incident identity changed");
+    }
+    let opening = matches!(
+        incident.state,
+        IncidentState::Clear | IncidentState::Acknowledged
+    );
+    if opening {
+        incident.publication_ids.clear();
+        incident.incident_id = Some(Uuid::now_v7().to_string());
+        incident.first_observed_at = Some(Utc::now().to_rfc3339());
+        incident.cause = Some(IncidentCause::ReplayContentConflict);
+        incident.disposition = None;
+        incident.payloads = IncidentPayloads {
+            pending_replay: PendingReplay {
+                volatile: Some(0),
+                durable: Some(0),
+            },
+            provisional: Provisional { unknown: Some(0) },
+            outcome_totals: OutcomeTotals {
+                reconciled: Some(0),
+                unrecoverable_lost: Some(0),
+            },
+        };
+    }
+    let unresolved = unresolved_conflict_count(root)?;
+    if opening || incident.payloads.pending_replay.durable != Some(unresolved) {
+        incident.revision = incident.revision.saturating_add(1);
+        if opening {
+            incident.state = IncidentState::Blocked;
+        }
+        incident.payloads.pending_replay.durable = Some(unresolved);
+        write_checked(&root.join("incident.json"), &incident)?;
+    }
+    File::unlock(&lock).context("unlocking accounting coordination")?;
+    Ok(())
+}
+
+fn unresolved_conflict_count(root: &Path) -> Result<u64> {
+    let mut count = 0;
+    for entry in fs::read_dir(root.join("generations"))? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".replay.json"))
+        {
+            continue;
+        }
+        let manifest: ReplayManifest = read_checked(&path)?;
+        count += manifest
+            .receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.outcome == ReplayOutcome::DuplicateConflict
+                    && receipt.resolution_ref.is_none()
+            })
+            .count() as u64;
+    }
+    Ok(count)
+}
+
+fn publish_unreconciled(root: &Path) -> Result<()> {
+    let lock = open_coordination_lock(root)?;
+    lock_with_timeout(&lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(root)?;
+    let mut incident: Incident = read_checked(&root.join("incident.json"))?;
+    incident.revision = incident.revision.saturating_add(1);
+    incident.state = IncidentState::Unreconciled;
+    incident.incident_id = None;
+    incident.first_observed_at = None;
+    incident.cause = Some(IncidentCause::PriorIncidentUnreconciled);
+    incident.disposition = None;
+    incident.payloads = IncidentPayloads {
+        pending_replay: PendingReplay {
+            volatile: None,
+            durable: None,
+        },
+        provisional: Provisional { unknown: None },
+        outcome_totals: OutcomeTotals {
+            reconciled: None,
+            unrecoverable_lost: None,
+        },
+    };
+    write_checked(&root.join("incident.json"), &incident)?;
+    File::unlock(&lock).context("unlocking accounting coordination")
+}
+
+fn publish_abandoned_active(root: &Path, state: &GenerationState) -> Result<()> {
+    let lock = open_coordination_lock(root)?;
+    lock_with_timeout(&lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(root)?;
+    let mut incident: Incident = read_checked(&root.join("incident.json"))?;
+    let publication_id = format!(
+        "abandoned:{}:{}:{}",
+        state.generation_id, state.revision, state.journal_evidence_digest
+    );
+    if incident.publication_ids.contains(&publication_id) {
+        File::unlock(&lock).context("unlocking accounting coordination")?;
+        return Ok(());
+    }
+    if incident.state != IncidentState::Acknowledged {
+        if incident.state == IncidentState::Clear {
+            incident.publication_ids.clear();
+            incident.incident_id = Some(Uuid::now_v7().to_string());
+            incident.first_observed_at = Some(Utc::now().to_rfc3339());
+            incident.payloads.outcome_totals.unrecoverable_lost = Some(0);
+        }
+        incident.revision = incident.revision.saturating_add(1);
+        incident.state = IncidentState::Unreconciled;
+        incident.cause = Some(IncidentCause::PriorIncidentUnreconciled);
+        incident.disposition = None;
+        incident.payloads.pending_replay = PendingReplay {
+            volatile: None,
+            durable: None,
+        };
+        incident.payloads.provisional.unknown = None;
+        incident.payloads.outcome_totals.reconciled = None;
+        incident.publication_ids.insert(publication_id);
+        write_checked(&root.join("incident.json"), &incident)?;
+    }
+    File::unlock(&lock).context("unlocking accounting coordination")
 }
 
 impl AccountingCoordinator {
@@ -456,12 +915,65 @@ impl AccountingCoordinator {
         adopt_legacy(source, root, maintenance_assertion)
     }
 
+    pub(crate) fn acknowledge(
+        root: &Path,
+        incident_id: &str,
+        revision: u64,
+        kind: &str,
+        evidence_ref: &str,
+    ) -> Result<Value> {
+        acknowledge_incident(root, incident_id, revision, kind, evidence_ref)
+    }
+
+    pub(crate) fn ensure_offline(root: &Path) -> Result<AccountingOfflineGuard> {
+        ensure_offline(root)
+    }
+
+    pub(crate) fn acquire_serving(root: &Path) -> Result<AccountingServingGuard> {
+        let root = resolve_accounting_root(root)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("maintenance.lock"))?;
+        file.lock_shared()
+            .context("locking accounting serving lease")?;
+        Ok(AccountingServingGuard {
+            _file: Arc::new(file),
+        })
+    }
+
+    pub(crate) fn audit(root: &Path, incident_id: &str, revision: u64) -> Result<Value> {
+        audit_incident(root, incident_id, revision)
+    }
+
+    pub(crate) async fn resolve_conflict(
+        root: &Path,
+        database: &DatabasePool,
+        incident_id: &str,
+        revision: u64,
+        event_id: &str,
+        authoritative: &str,
+        evidence_ref: &str,
+    ) -> Result<Value> {
+        resolve_conflict(
+            root,
+            database,
+            incident_id,
+            revision,
+            event_id,
+            authoritative,
+            evidence_ref,
+        )
+        .await
+    }
+
     pub(crate) async fn reconcile_startup(
         root: &Path,
         database: &DatabasePool,
         operation_timeout: Duration,
         retry_deadline: Duration,
         retry_interval: Duration,
+        restore_prior_incident: bool,
     ) -> Result<()> {
         reconcile_startup(
             root,
@@ -469,31 +981,49 @@ impl AccountingCoordinator {
             operation_timeout,
             retry_deadline,
             retry_interval,
+            restore_prior_incident,
         )
         .await
     }
 
+    #[cfg(test)]
     pub(crate) fn start(root: &Path, capacity: usize) -> Result<Self> {
+        let serving = Self::acquire_serving(root)?;
+        Self::start_with_guard(root, capacity, serving)
+    }
+
+    pub(crate) fn start_with_guard(
+        root: &Path,
+        capacity: usize,
+        serving: AccountingServingGuard,
+    ) -> Result<Self> {
         let root = resolve_accounting_root(root)?;
         let coordination_lock = open_coordination_lock(&root)?;
         lock_with_timeout(&coordination_lock, LOCK_TIMEOUT)?;
-        let started = Instant::now();
         recover_checked_publications(&root)?;
         let installation = load_provisioned_root_locked(&root)?;
+        let incident: Incident = read_checked(&root.join("incident.json"))?;
         if root.join("adoption.json").exists() {
             let adoption: Adoption = read_checked(&root.join("adoption.json"))?;
-            if adoption.state != "complete" {
+            if adoption.state != "complete" && incident.state == IncidentState::Clear {
                 bail!(
                     "legacy accounting adoption is {}; pending reconciliation",
                     adoption.state
                 );
             }
-            validate_complete_adoption(&root, &installation, &adoption)?;
+            if adoption.state == "complete" {
+                validate_complete_adoption(&root, &installation, &adoption)?;
+            }
         }
 
         cleanup_empty_staging(&root)?;
         let mut coordination: Coordination = read_checked(&root.join("coordination.json"))?;
-        let states = verify_generations(&root, &installation, &coordination)?;
+        let states = verify_generations_with_adoption(
+            &root,
+            &installation,
+            &coordination,
+            incident.state != IncidentState::Clear,
+        )?;
         let generation_id = Uuid::now_v7().to_string();
         let journal_path = generation_journal_path(&root, &generation_id);
         let staging_path = journal_path.with_extension("journal.staging");
@@ -513,20 +1043,28 @@ impl AccountingCoordinator {
         })?;
         sync_directory(&root.join("generations"))?;
 
+        let read_only = matches!(
+            incident.state,
+            IncidentState::Blocked | IncidentState::Unreconciled
+        );
         let state = GenerationState {
             format_version: FORMAT_VERSION,
             installation_id: installation.installation_id.clone(),
             generation_id: generation_id.clone(),
             revision: 1,
-            phase: GenerationPhase::Active,
+            phase: if read_only {
+                GenerationPhase::Reconciled
+            } else {
+                GenerationPhase::Active
+            },
             journal: journal_path.display().to_string(),
             journal_length: 0,
             journal_evidence_digest: digest(&[]),
-            admitted_count: None,
-            worker_completed_count: None,
-            journal_synced_count: None,
-            database_committed_count: None,
-            last_complete_record_boundary: None,
+            admitted_count: read_only.then_some(0),
+            worker_completed_count: read_only.then_some(0),
+            journal_synced_count: read_only.then_some(0),
+            database_committed_count: read_only.then_some(0),
+            last_complete_record_boundary: read_only.then_some(0),
             replay_manifest: None,
             replay_manifest_digest: None,
             updated_at: Utc::now().to_rfc3339(),
@@ -537,6 +1075,7 @@ impl AccountingCoordinator {
         coordination.coverage.push(coverage(&state));
         sort_coverage(&mut coordination.coverage);
         write_checked(&root.join("coordination.json"), &coordination)?;
+        let started = Instant::now();
         let published_coordination: Coordination = read_checked(&root.join("coordination.json"))?;
         let published_state: GenerationState =
             read_checked(&generation_state_path(&root, &generation_id))?;
@@ -552,14 +1091,45 @@ impl AccountingCoordinator {
         File::unlock(&coordination_lock).context("unlocking accounting coordination")?;
 
         let state = Arc::new(Mutex::new(state));
-        let (journal, receiver) = mpsc::sync_channel::<AccountingEvent>(capacity.max(1));
-        start_writer(root.clone(), journal_file, receiver, state.clone())?;
+        let incident = Arc::new(Mutex::new(incident));
+        let incident_submitted = Arc::new(AtomicU64::new(0));
+        let incident_durable = Arc::new((Mutex::new(0), Condvar::new()));
+        let (incident_publisher, incident_publications) = mpsc::channel();
+        let incident_publisher_thread = start_incident_publisher(
+            root.clone(),
+            incident_publications,
+            incident.clone(),
+            incident_durable.clone(),
+        )?;
+        let (journal, receiver) = mpsc::sync_channel::<JournalMessage>(capacity.max(1));
+        let journal_writer = if read_only {
+            drop(receiver);
+            drop(journal_file);
+            None
+        } else {
+            Some(start_writer(
+                root.clone(),
+                journal_file,
+                receiver,
+                state.clone(),
+                incident.clone(),
+                incident_publisher.clone(),
+                incident_submitted.clone(),
+            )?)
+        };
         Ok(Self {
             root,
             generation_id,
             journal,
-            accepting: Arc::new(AtomicBool::new(true)),
+            journal_writer: Arc::new(Mutex::new(journal_writer)),
+            accepting: Arc::new(AtomicBool::new(!read_only)),
             state,
+            incident,
+            incident_publisher,
+            incident_publisher_thread: Arc::new(Mutex::new(Some(incident_publisher_thread))),
+            incident_submitted,
+            _incident_durable: incident_durable,
+            _serving: serving,
         })
     }
 
@@ -567,10 +1137,58 @@ impl AccountingCoordinator {
         if !self.accepting.load(Ordering::Acquire) {
             return Err(event);
         }
-        match self.journal.try_send(event) {
+        match self.journal.try_send(JournalMessage::Event(event)) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(event) | TrySendError::Disconnected(event)) => Err(event),
+            Err(
+                TrySendError::Full(JournalMessage::Event(event))
+                | TrySendError::Disconnected(JournalMessage::Event(event)),
+            ) => Err(event),
+            Err(
+                TrySendError::Full(JournalMessage::Shutdown(_))
+                | TrySendError::Disconnected(JournalMessage::Shutdown(_)),
+            ) => {
+                unreachable!("offer sends only journal events")
+            }
         }
+    }
+
+    pub(crate) fn latch_incident(
+        &self,
+        cause: IncidentCause,
+        lost: u64,
+        unknown: u64,
+    ) -> Result<()> {
+        queue_incident_publication(
+            &self.incident,
+            &self.incident_publisher,
+            &self.incident_submitted,
+            cause,
+            lost,
+            unknown,
+        )
+    }
+
+    pub(crate) fn public_incident(&self) -> Value {
+        let mut incident = self.incident.lock().expect("accounting incident");
+        if refresh_incident(&self.root, &mut incident) {
+            public_incident(&incident)
+        } else {
+            fail_closed_incident(&incident)
+        }
+    }
+
+    pub(crate) fn with_incident_admission<T>(&self, admit: impl FnOnce() -> T) -> Result<T, Value> {
+        let mut incident = self.incident.lock().expect("accounting incident");
+        if !refresh_incident(&self.root, &mut incident) {
+            return Err(fail_closed_incident(&incident));
+        }
+        if matches!(
+            incident.state,
+            IncidentState::Blocked | IncidentState::Unreconciled
+        ) {
+            return Err(public_incident(&incident));
+        }
+        Ok(admit())
     }
 
     #[allow(dead_code)]
@@ -578,14 +1196,30 @@ impl AccountingCoordinator {
         load_snapshot(&self.root)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn begin_shutdown(&self) -> Result<AccountingSnapshot> {
+    pub(crate) fn begin_shutdown(&self, timeout: Duration) -> Result<AccountingSnapshot> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("accounting shutdown deadline is out of range")?;
         self.accepting.store(false, Ordering::Release);
+        self.stop_journal_writer(deadline)?;
+        self.stop_incident_publisher(deadline)?;
         let lock = open_coordination_lock(&self.root)?;
-        lock_with_timeout(&lock, LOCK_TIMEOUT)?;
+        lock_with_timeout(
+            &lock,
+            shutdown_remaining(deadline, "locking final accounting ownership")?.min(LOCK_TIMEOUT),
+        )?;
         recover_checked_publications(&self.root)?;
+        shutdown_remaining(deadline, "recovering final accounting publications")?;
         let mut coordination: Coordination = read_checked(&self.root.join("coordination.json"))?;
         let mut state = self.state.lock().expect("accounting generation state");
+        if state.generation_id == self.generation_id && state.phase == GenerationPhase::Reconciled {
+            File::unlock(&lock).context("unlocking accounting coordination")?;
+            return Ok(AccountingSnapshot {
+                installation_id: coordination.installation_id,
+                revision: coordination.revision,
+                coverage: coordination.coverage,
+            });
+        }
         if state.generation_id != self.generation_id || state.phase != GenerationPhase::Active {
             bail!("accounting generation is not active");
         }
@@ -601,9 +1235,11 @@ impl AccountingCoordinator {
             &generation_state_path(&self.root, &self.generation_id),
             &*state,
         )?;
+        shutdown_remaining(deadline, "publishing final accounting generation state")?;
         coordination.revision += 1;
         replace_coverage(&mut coordination.coverage, coverage(&state));
         write_checked(&self.root.join("coordination.json"), &coordination)?;
+        shutdown_remaining(deadline, "publishing final accounting coordination")?;
         File::unlock(&lock).context("unlocking accounting coordination")?;
         Ok(AccountingSnapshot {
             installation_id: coordination.installation_id,
@@ -611,6 +1247,1004 @@ impl AccountingCoordinator {
             coverage: coordination.coverage,
         })
     }
+
+    #[cfg(test)]
+    fn flush_incident_publications(&self) {
+        let target = {
+            let _incident = self.incident.lock().expect("accounting incident");
+            self.incident_submitted.load(Ordering::Acquire)
+        };
+        let (completed, changed) = &*self._incident_durable;
+        let mut completed = completed.lock().expect("incident publication progress");
+        while *completed < target {
+            completed = changed
+                .wait(completed)
+                .expect("incident publication progress");
+        }
+    }
+
+    fn stop_journal_writer(&self, deadline: Instant) -> Result<()> {
+        if self
+            .journal_writer
+            .lock()
+            .expect("accounting journal writer")
+            .is_none()
+        {
+            return Ok(());
+        }
+        let (completed, receiver) = mpsc::sync_channel(0);
+        let mut message = JournalMessage::Shutdown(completed);
+        loop {
+            match self.journal.try_send(message) {
+                Ok(()) => break,
+                Err(TrySendError::Full(returned)) => {
+                    message = returned;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        bail!("timed out stopping accounting journal writer");
+                    }
+                    thread::sleep(LOCK_POLL.min(remaining));
+                }
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .context("waiting for accounting journal writer shutdown")?;
+        if let Some(handle) = self
+            .journal_writer
+            .lock()
+            .expect("accounting journal writer")
+            .take()
+        {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("accounting journal writer panicked"))?;
+        }
+        Ok(())
+    }
+
+    fn stop_incident_publisher(&self, deadline: Instant) -> Result<()> {
+        self.incident_publisher
+            .send(IncidentPublisherMessage::Shutdown)
+            .context("stopping accounting incident publisher")?;
+        loop {
+            let finished = self
+                .incident_publisher_thread
+                .lock()
+                .expect("accounting incident publisher")
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timed out stopping accounting incident publisher");
+            }
+            thread::sleep(LOCK_POLL.min(remaining));
+        }
+        if let Some(handle) = self
+            .incident_publisher_thread
+            .lock()
+            .expect("accounting incident publisher")
+            .take()
+        {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("accounting incident publisher panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+fn shutdown_remaining(deadline: Instant, operation: &str) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("timed out {operation}");
+    }
+    Ok(remaining)
+}
+
+fn ensure_offline(root: &Path) -> Result<AccountingOfflineGuard> {
+    let root = resolve_accounting_root(root)?;
+    let maintenance = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.join("maintenance.lock"))?;
+    lock_with_timeout(&maintenance, LOCK_TIMEOUT)
+        .context("locking accounting offline maintenance lease")?;
+    let lock = open_coordination_lock(&root)?;
+    lock_with_timeout(&lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(&root)?;
+    let installation = load_provisioned_root_locked(&root)?;
+    let coordination: Coordination = read_checked(&root.join("coordination.json"))?;
+    let states = verify_generations_with_adoption(&root, &installation, &coordination, true)?;
+    ensure_generations_offline(&root, states.values())?;
+    File::unlock(&lock).context("unlocking accounting coordination")?;
+    Ok(AccountingOfflineGuard { _file: maintenance })
+}
+
+fn acknowledge_incident(
+    root: &Path,
+    incident_id: &str,
+    revision: u64,
+    kind: &str,
+    evidence_ref: &str,
+) -> Result<Value> {
+    if evidence_ref.trim().is_empty() {
+        bail!("accounting disposition evidence reference must not be empty");
+    }
+    if !matches!(
+        kind,
+        "accepted_loss" | "accepted_uncertainty" | "accepted_loss_and_uncertainty"
+    ) {
+        bail!("unsupported accounting disposition kind {kind}");
+    }
+    let root = resolve_accounting_root(root)?;
+    let lock = open_coordination_lock(&root)?;
+    lock_with_timeout(&lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(&root)?;
+    let installation = load_provisioned_root_locked(&root)?;
+    let mut coordination: Coordination = read_checked(&root.join("coordination.json"))?;
+    recover_reconciled_coverage_gaps(&root, &mut coordination)?;
+    recover_unresolved_coverage_gaps(&root, &mut coordination)?;
+    let states = verify_generations_with_adoption(&root, &installation, &coordination, true)?;
+    ensure_generations_offline(&root, states.values())?;
+    let mut incident: Incident = read_checked(&root.join("incident.json"))?;
+    let audit: Vec<AuditRecord> = read_checked(&root.join("audit.json"))?;
+    let existing = audit.iter().find(|record| {
+        record.operation == "acknowledge"
+            && record.incident_id == incident_id
+            && record.previous_revision == revision
+    });
+    if existing
+        .filter(|record| {
+            incident.state == IncidentState::Acknowledged
+                && incident.revision == record.revision
+                && incident.disposition == record.disposition
+                && record.disposition.as_ref().is_some_and(|disposition| {
+                    disposition.kind == kind && disposition.evidence_ref == evidence_ref
+                })
+        })
+        .is_some()
+    {
+        File::unlock(&lock).context("unlocking accounting coordination")?;
+        return Ok(serde_json::to_value(&incident)?);
+    }
+    if incident.incident_id.as_deref() != Some(incident_id) || incident.revision != revision {
+        bail!("accounting incident id or revision changed");
+    }
+    if !matches!(
+        incident.state,
+        IncidentState::Blocked | IncidentState::Unreconciled
+    ) {
+        bail!("accounting incident is not awaiting disposition");
+    }
+    if has_unresolved_conflict(&root)? {
+        bail!("replay content conflicts require verified offline resolution");
+    }
+    let abandoned_active = abandoned_active_uncertainty(&incident);
+    ensure_retained_work_replayed(&root, states.values())?;
+    if !abandoned_active
+        && (incident.payloads.pending_replay.volatile != Some(0)
+            || incident.payloads.pending_replay.durable != Some(0))
+    {
+        bail!("accounting incident still has pending replay work");
+    }
+    let lost = incident.payloads.outcome_totals.unrecoverable_lost;
+    let unknown = incident.payloads.provisional.unknown;
+    let kind_matches = if abandoned_active {
+        match lost {
+            Some(0) => kind == "accepted_uncertainty",
+            Some(_) => kind == "accepted_loss_and_uncertainty",
+            None => false,
+        }
+    } else {
+        disposition_matches(kind, lost, unknown)
+    };
+    if !kind_matches {
+        bail!("accounting disposition kind does not match retained loss and uncertainty");
+    }
+
+    if let Some(record) = existing {
+        let disposition = record
+            .disposition
+            .as_ref()
+            .context("existing acknowledgement audit lacks its disposition")?;
+        if record.coverage != coordination.coverage
+            || disposition.kind != kind
+            || disposition.evidence_ref != evidence_ref
+        {
+            bail!("existing acknowledgement audit does not match the requested disposition");
+        }
+        incident.revision = record.revision;
+        incident.state = IncidentState::Acknowledged;
+        incident.disposition = Some(disposition.clone());
+        write_checked(&root.join("incident.json"), &incident)?;
+        File::unlock(&lock).context("unlocking accounting coordination")?;
+        return Ok(serde_json::to_value(incident)?);
+    }
+
+    let actor = effective_actor_identity()?;
+    let at = Utc::now().to_rfc3339();
+    let disposition = Disposition {
+        kind: kind.to_string(),
+        actor: actor.clone(),
+        at: at.clone(),
+        evidence_ref: evidence_ref.to_string(),
+    };
+    if abandoned_active {
+        incident.payloads.pending_replay = PendingReplay {
+            volatile: Some(0),
+            durable: Some(0),
+        };
+    }
+    incident.revision = incident.revision.saturating_add(1);
+    incident.state = IncidentState::Acknowledged;
+    incident.disposition = Some(disposition.clone());
+    let record = AuditRecord {
+        format_version: FORMAT_VERSION,
+        installation_id: installation.installation_id,
+        operation: "acknowledge".into(),
+        incident_id: incident_id.to_string(),
+        revision: incident.revision,
+        previous_revision: revision,
+        coverage: coordination.coverage,
+        disposition: Some(disposition),
+        event_id: None,
+        authoritative: None,
+        evidence_ref: evidence_ref.to_string(),
+        conflict_snapshot_ref: None,
+        conflict_snapshot_digest: None,
+        final_row: None,
+        actor,
+        at,
+    };
+    append_audit(&root, record)?;
+    write_checked(&root.join("incident.json"), &incident)?;
+    File::unlock(&lock).context("unlocking accounting coordination")?;
+    Ok(serde_json::to_value(incident)?)
+}
+
+fn disposition_matches(kind: &str, lost: Option<u64>, unknown: Option<u64>) -> bool {
+    match kind {
+        "accepted_loss" => lost.is_some_and(|value| value > 0) && unknown == Some(0),
+        "accepted_uncertainty" => lost == Some(0) && unknown.is_some_and(|value| value > 0),
+        "accepted_loss_and_uncertainty" => {
+            lost.is_some_and(|value| value > 0) && unknown.is_some_and(|value| value > 0)
+        }
+        _ => false,
+    }
+}
+
+fn abandoned_active_uncertainty(incident: &Incident) -> bool {
+    incident.state == IncidentState::Unreconciled
+        && incident.cause == Some(IncidentCause::PriorIncidentUnreconciled)
+        && incident.payloads.pending_replay.volatile.is_none()
+        && incident.payloads.pending_replay.durable.is_none()
+        && incident.payloads.provisional.unknown.is_none()
+        && incident
+            .payloads
+            .outcome_totals
+            .unrecoverable_lost
+            .is_some()
+}
+
+fn disposition_matches_incident(kind: &str, incident: &Incident) -> bool {
+    let abandoned_kind = match incident.payloads.outcome_totals.unrecoverable_lost {
+        Some(0) => "accepted_uncertainty",
+        Some(_) => "accepted_loss_and_uncertainty",
+        None => "",
+    };
+    (incident.cause == Some(IncidentCause::PriorIncidentUnreconciled)
+        && incident.payloads.provisional.unknown.is_none()
+        && kind == abandoned_kind)
+        || disposition_matches(
+            kind,
+            incident.payloads.outcome_totals.unrecoverable_lost,
+            incident.payloads.provisional.unknown,
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_conflict(
+    root: &Path,
+    database: &DatabasePool,
+    incident_id: &str,
+    revision: u64,
+    event_id: &str,
+    authoritative: &str,
+    evidence_ref: &str,
+) -> Result<Value> {
+    if !matches!(authoritative, "journal" | "database") {
+        bail!("conflict authority must be journal or database");
+    }
+    if evidence_ref.trim().is_empty() {
+        bail!("conflict resolution evidence reference must not be empty");
+    }
+    let root = resolve_accounting_root(root)?;
+    let lock = open_coordination_lock(&root)?;
+    lock_with_timeout(&lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(&root)?;
+    let installation = load_provisioned_root_locked(&root)?;
+    let mut coordination: Coordination = read_checked(&root.join("coordination.json"))?;
+    recover_reconciled_coverage_gaps(&root, &mut coordination)?;
+    recover_unresolved_coverage_gaps(&root, &mut coordination)?;
+    let states = verify_generations_with_adoption(&root, &installation, &coordination, true)?;
+    ensure_generations_offline(&root, states.values())?;
+    let mut incident: Incident = read_checked(&root.join("incident.json"))?;
+    if incident.incident_id.as_deref() != Some(incident_id) || incident.revision != revision {
+        bail!("accounting incident id or revision changed");
+    }
+    if !matches!(
+        incident.state,
+        IncidentState::Blocked | IncidentState::Unreconciled
+    ) {
+        bail!("accounting incident is not awaiting conflict resolution");
+    }
+    let audits: Vec<AuditRecord> = read_checked(&root.join("audit.json"))?;
+
+    let mut selected: Option<(PathBuf, ReplayManifest, usize, RecordedConflictSnapshot)> = None;
+    let mut journal_authority_sides: Option<(ConflictRowEvidence, ConflictRowEvidence)> = None;
+    let mut database_authority_row: Option<ConflictRowEvidence> = None;
+    for entry in fs::read_dir(root.join("generations"))? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            bail!("generation evidence filename is not valid UTF-8");
+        };
+        if !name.ends_with(".replay.json") {
+            continue;
+        }
+        let manifest: ReplayManifest = read_checked(&path)?;
+        for (index, receipt) in manifest.receipts.iter().enumerate() {
+            if receipt.event_id != event_id || receipt.outcome != ReplayOutcome::DuplicateConflict {
+                continue;
+            }
+            let resumable_publication = receipt.resolution_ref.is_some()
+                && audits.iter().any(|record| {
+                    record.operation == "resolve_conflict"
+                        && record.incident_id == incident_id
+                        && record.previous_revision == revision
+                        && record.event_id.as_deref() == Some(event_id)
+                        && receipt.resolution_digest.as_deref()
+                            == Some(
+                                digest(&serde_json::to_vec(record).unwrap_or_default()).as_str(),
+                            )
+                });
+            if receipt.resolution_ref.is_some() && !resumable_publication {
+                continue;
+            }
+            let snapshot_path = PathBuf::from(
+                receipt
+                    .conflict_snapshot_ref
+                    .as_deref()
+                    .context("conflict receipt is missing its protected snapshot")?,
+            );
+            let snapshot: RecordedConflictSnapshot = read_checked(&snapshot_path)?;
+            if receipt.conflict_snapshot_digest.as_deref()
+                != Some(digest(&fs::read(&snapshot_path)?).as_str())
+                || snapshot.installation_id != installation.installation_id
+                || snapshot.generation_id != receipt.generation_id
+                || snapshot.journal_offset != receipt.offset
+                || snapshot.journal_length != receipt.length
+                || snapshot.journal_record_digest != receipt.record_digest
+                || snapshot.source.id != event_id
+                || snapshot.existing.id != event_id
+            {
+                bail!("protected conflict evidence does not match its replay receipt");
+            }
+            validate_same_id_conflict_sides(
+                authoritative,
+                &snapshot,
+                &mut journal_authority_sides,
+                &mut database_authority_row,
+            )?;
+            let replace =
+                selected
+                    .as_ref()
+                    .is_none_or(|(_, selected_manifest, selected_index, _)| {
+                        let selected_receipt = &selected_manifest.receipts[*selected_index];
+                        (
+                            !resumable_publication,
+                            receipt.generation_id.as_str(),
+                            receipt.offset,
+                        ) < (
+                            selected_receipt.resolution_ref.is_none(),
+                            selected_receipt.generation_id.as_str(),
+                            selected_receipt.offset,
+                        )
+                    });
+            if replace {
+                selected = Some((path.clone(), manifest.clone(), index, snapshot));
+            }
+        }
+    }
+    let (manifest_path, mut manifest, receipt_index, snapshot) =
+        selected.context("unresolved conflict receipt was not found")?;
+    let journal_bytes = fs::read(generation_journal_path(&root, &snapshot.generation_id))?;
+    let parsed = parse_journal(&journal_bytes);
+    let frame = parsed
+        .frames
+        .iter()
+        .find(|frame| frame.offset == snapshot.journal_offset)
+        .context("protected conflict no longer has its journal frame")?;
+    let source_payload: Value = serde_json::from_str(&snapshot.source.payload)
+        .context("conflict source payload changed")?;
+    if frame.length != snapshot.journal_length
+        || frame.digest != snapshot.journal_record_digest
+        || frame.event.id != snapshot.source.id
+        || frame.event.kind != snapshot.source.kind
+        || frame.event.payload != source_payload
+        || frame.event.created_at != snapshot.source.created_at
+    {
+        bail!("protected conflict journal side changed");
+    }
+
+    let current = read_background_row(database, event_id).await?;
+    let final_row = if authoritative == "journal" {
+        if current != snapshot.existing && current != snapshot.source {
+            bail!("database conflict side changed before resolution");
+        }
+        snapshot.source.clone()
+    } else {
+        if current != snapshot.existing {
+            bail!("database conflict side changed before resolution");
+        }
+        snapshot.existing.clone()
+    };
+
+    let next_revision = incident.revision.saturating_add(1);
+    let mut resolved_state = states
+        .get(&manifest.generation_id)
+        .cloned()
+        .context("conflict generation state is missing")?;
+    let state_already_published = resolved_state.phase == GenerationPhase::Reconciled
+        && resolved_state.revision == manifest.source_generation_revision.saturating_add(1);
+    if (!state_already_published
+        && (resolved_state.phase != GenerationPhase::Adopting
+            || resolved_state.revision != manifest.source_generation_revision))
+        || manifest.parser_result != "complete"
+        || manifest.complete_record_count != manifest.receipts.len() as u64
+    {
+        bail!("conflict generation is not a complete offline adoption snapshot");
+    }
+    let generation_resolved = manifest
+        .receipts
+        .iter()
+        .enumerate()
+        .all(|(index, receipt)| {
+            index == receipt_index
+                || receipt.outcome.acknowledges()
+                || (receipt.outcome == ReplayOutcome::DuplicateConflict
+                    && receipt.resolution_ref.is_some()
+                    && receipt.resolution_digest.is_some()
+                    && receipt.resolved_authoritative.is_some())
+        });
+    let mut resolved_coordination = coordination.clone();
+    if generation_resolved && !state_already_published {
+        resolved_state.revision = resolved_state.revision.saturating_add(1);
+        resolved_state.phase = GenerationPhase::Reconciled;
+        resolved_state.last_complete_record_boundary = Some(manifest.complete_boundary);
+        resolved_state.admitted_count = Some(0);
+        resolved_state.worker_completed_count = Some(0);
+        resolved_state.journal_synced_count = Some(manifest.complete_record_count);
+        resolved_state.database_committed_count = Some(manifest.complete_record_count);
+        resolved_state.replay_manifest = Some(manifest_path.display().to_string());
+        resolved_state.updated_at = Utc::now().to_rfc3339();
+        resolved_coordination.revision = resolved_coordination.revision.saturating_add(1);
+        replace_coverage(
+            &mut resolved_coordination.coverage,
+            coverage(&resolved_state),
+        );
+    }
+    let conflict_snapshot_ref = manifest.receipts[receipt_index]
+        .conflict_snapshot_ref
+        .clone();
+    let conflict_snapshot_digest = manifest.receipts[receipt_index]
+        .conflict_snapshot_digest
+        .clone();
+    let prepared = audits.iter().find(|record| {
+        record.operation == "prepare_conflict_resolution"
+            && record.incident_id == incident_id
+            && record.previous_revision == revision
+            && record.event_id.as_deref() == Some(event_id)
+    });
+    let completed = audits.iter().find(|record| {
+        record.operation == "resolve_conflict"
+            && record.incident_id == incident_id
+            && record.previous_revision == revision
+            && record.event_id.as_deref() == Some(event_id)
+    });
+    let validate_record = |record: &AuditRecord| -> Result<()> {
+        if record.revision != next_revision
+            || record.coverage != resolved_coordination.coverage
+            || record.authoritative.as_deref() != Some(authoritative)
+            || record.evidence_ref != evidence_ref
+            || record.conflict_snapshot_ref != conflict_snapshot_ref
+            || record.conflict_snapshot_digest != conflict_snapshot_digest
+            || record.final_row.as_ref() != Some(&final_row)
+        {
+            bail!("existing conflict resolution audit does not match the requested recovery");
+        }
+        Ok(())
+    };
+    let prepared_record = if let Some(record) = prepared {
+        validate_record(record)?;
+        record.clone()
+    } else {
+        AuditRecord {
+            format_version: FORMAT_VERSION,
+            installation_id: installation.installation_id.clone(),
+            operation: "prepare_conflict_resolution".into(),
+            incident_id: incident_id.to_string(),
+            revision: next_revision,
+            previous_revision: revision,
+            coverage: resolved_coordination.coverage.clone(),
+            disposition: None,
+            event_id: Some(event_id.to_string()),
+            authoritative: Some(authoritative.to_string()),
+            evidence_ref: evidence_ref.to_string(),
+            conflict_snapshot_ref: conflict_snapshot_ref.clone(),
+            conflict_snapshot_digest: conflict_snapshot_digest.clone(),
+            final_row: Some(final_row.clone()),
+            actor: effective_actor_identity()?,
+            at: Utc::now().to_rfc3339(),
+        }
+    };
+    if prepared.is_none() {
+        append_audit(&root, prepared_record.clone())?;
+    }
+
+    if authoritative == "journal" && current == snapshot.existing {
+        replace_background_row(database, &snapshot.existing, &snapshot.source).await?;
+    }
+    if read_background_row(database, event_id).await? != final_row {
+        bail!("database conflict resolution did not verify after mutation");
+    }
+
+    let record = if let Some(record) = completed {
+        validate_record(record)?;
+        record.clone()
+    } else {
+        let mut record = prepared_record;
+        record.operation = "resolve_conflict".into();
+        append_audit(&root, record.clone())?;
+        record
+    };
+    let resolution_digest = digest(&serde_json::to_vec(&record)?);
+    let receipt = &mut manifest.receipts[receipt_index];
+    let resolution_ref =
+        format!("audit.json#incident={incident_id}&revision={next_revision}&event={event_id}");
+    let receipt_already_published = receipt.resolution_ref.is_some();
+    if receipt_already_published {
+        if receipt.resolution_ref.as_deref() != Some(resolution_ref.as_str())
+            || receipt.resolution_digest.as_deref() != Some(resolution_digest.as_str())
+            || receipt.resolved_authoritative.as_deref() != Some(authoritative)
+        {
+            bail!("published conflict resolution receipt does not match its audit");
+        }
+    } else {
+        receipt.resolution_ref = Some(resolution_ref);
+        receipt.resolution_digest = Some(resolution_digest);
+        receipt.resolved_authoritative = Some(authoritative.to_string());
+        receipt.updated_at = Utc::now().to_rfc3339();
+        persist_replay_manifest(&manifest_path, &mut manifest)?;
+    }
+    if generation_resolved && !state_already_published {
+        resolved_state.replay_manifest_digest = Some(digest(&fs::read(&manifest_path)?));
+        write_checked(
+            &generation_state_path(&root, &resolved_state.generation_id),
+            &resolved_state,
+        )?;
+        write_checked(&root.join("coordination.json"), &resolved_coordination)?;
+    }
+    if generation_resolved {
+        let adoption_path = root.join("adoption.json");
+        if adoption_path.exists() {
+            let mut adoption: Adoption = read_checked(&adoption_path)?;
+            if adoption.state != "complete"
+                && adoption.generation_id == resolved_state.generation_id
+            {
+                finish_reconciled_adoption(&root, &mut adoption, &resolved_state, &manifest_path)?;
+            }
+        }
+    }
+    incident.revision = next_revision;
+    incident.payloads.pending_replay.durable = incident
+        .payloads
+        .pending_replay
+        .durable
+        .map(|pending| pending.saturating_sub(1));
+    let clear = all_replay_work_resolved(database, &root).await?
+        && incident.payloads.pending_replay.volatile == Some(0)
+        && incident.payloads.pending_replay.durable == Some(0)
+        && incident.payloads.provisional.unknown == Some(0)
+        && incident.payloads.outcome_totals.unrecoverable_lost == Some(0);
+    if clear {
+        incident.state = IncidentState::Clear;
+        incident.incident_id = None;
+        incident.first_observed_at = None;
+        incident.cause = None;
+        incident.disposition = None;
+        incident.payloads = clear_incident(&incident.installation_id).payloads;
+        incident.publication_ids.clear();
+    }
+    write_checked(&root.join("incident.json"), &incident)?;
+    File::unlock(&lock).context("unlocking accounting coordination")?;
+    Ok(serde_json::json!({
+        "state":match incident.state {
+            IncidentState::Clear => "clear",
+            IncidentState::Blocked => "blocked",
+            IncidentState::Unreconciled => "unreconciled",
+            IncidentState::Acknowledged => "acknowledged",
+        },
+        "revision":next_revision,
+        "authoritative":authoritative,
+        "event_id":event_id,
+    }))
+}
+
+fn validate_same_id_conflict_sides(
+    authoritative: &str,
+    snapshot: &RecordedConflictSnapshot,
+    journal_sides: &mut Option<(ConflictRowEvidence, ConflictRowEvidence)>,
+    database_row: &mut Option<ConflictRowEvidence>,
+) -> Result<()> {
+    if authoritative == "journal" {
+        if let Some((source, existing)) = journal_sides.as_ref() {
+            if source != &snapshot.source || existing != &snapshot.existing {
+                bail!(
+                    "same event id has distinct protected conflict sides; journal authority requires disambiguation before mutation"
+                );
+            }
+        } else {
+            *journal_sides = Some((snapshot.source.clone(), snapshot.existing.clone()));
+        }
+    } else if let Some(existing) = database_row.as_ref() {
+        if existing != &snapshot.existing {
+            bail!(
+                "same event id has distinct captured database rows; database authority requires disambiguation before mutation"
+            );
+        }
+    } else {
+        *database_row = Some(snapshot.existing.clone());
+    }
+    Ok(())
+}
+
+async fn read_background_row(
+    database: &DatabasePool,
+    event_id: &str,
+) -> Result<ConflictRowEvidence> {
+    let row: Option<(String, String, String, String)> =
+        match database {
+            DatabasePool::Sqlite(pool) => sqlx::query_as(
+                "SELECT id, kind, payload, created_at FROM steve_background_events WHERE id = ?",
+            )
+            .bind(event_id)
+            .fetch_optional(pool)
+            .await?,
+            DatabasePool::Postgres(pool) => sqlx::query_as(
+                "SELECT id, kind, payload, created_at FROM steve_background_events WHERE id = $1",
+            )
+            .bind(event_id)
+            .fetch_optional(pool)
+            .await?,
+        };
+    let (id, kind, payload, created_at) = row.context("conflicting database row is missing")?;
+    Ok(ConflictRowEvidence {
+        id,
+        kind,
+        payload,
+        created_at,
+    })
+}
+
+async fn replace_background_row(
+    database: &DatabasePool,
+    expected: &ConflictRowEvidence,
+    replacement: &ConflictRowEvidence,
+) -> Result<()> {
+    let affected = match database {
+        DatabasePool::Sqlite(pool) => sqlx::query(
+            "UPDATE steve_background_events SET kind = ?, payload = ?, created_at = ?
+             WHERE id = ? AND kind = ? AND payload = ? AND created_at = ?",
+        )
+        .bind(&replacement.kind)
+        .bind(&replacement.payload)
+        .bind(&replacement.created_at)
+        .bind(&expected.id)
+        .bind(&expected.kind)
+        .bind(&expected.payload)
+        .bind(&expected.created_at)
+        .execute(pool)
+        .await?
+        .rows_affected(),
+        DatabasePool::Postgres(pool) => sqlx::query(
+            "UPDATE steve_background_events SET kind = $1, payload = $2, created_at = $3
+             WHERE id = $4 AND kind = $5 AND payload = $6 AND created_at = $7",
+        )
+        .bind(&replacement.kind)
+        .bind(&replacement.payload)
+        .bind(&replacement.created_at)
+        .bind(&expected.id)
+        .bind(&expected.kind)
+        .bind(&expected.payload)
+        .bind(&expected.created_at)
+        .execute(pool)
+        .await?
+        .rows_affected(),
+    };
+    if affected != 1 {
+        bail!("database conflict side changed during conditional resolution");
+    }
+    Ok(())
+}
+
+async fn all_replay_work_resolved(database: &DatabasePool, root: &Path) -> Result<bool> {
+    for entry in fs::read_dir(root.join("generations"))? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".state.json"))
+        {
+            continue;
+        }
+        let state: GenerationState = read_checked(&path)?;
+        let journal = fs::read(generation_journal_path(root, &state.generation_id))?;
+        if state.phase != GenerationPhase::Reconciled
+            || journal.len() as u64 != state.journal_length
+            || digest(&journal) != state.journal_evidence_digest
+        {
+            return Ok(false);
+        }
+        if state.journal_length == 0
+            && state.admitted_count == Some(0)
+            && state.worker_completed_count == Some(0)
+            && state.journal_synced_count == Some(0)
+            && state.database_committed_count == Some(0)
+        {
+            continue;
+        }
+        let manifest_path = replay_manifest_path(root, &state.generation_id);
+        let manifest: ReplayManifest = read_checked(&manifest_path)?;
+        let manifest_bytes = fs::read(&manifest_path)?;
+        let expected_manifest_path = manifest_path.to_string_lossy();
+        let parsed = parse_journal(&journal);
+        validate_manifest_summary(&manifest)?;
+        if state.replay_manifest.as_deref() != Some(expected_manifest_path.as_ref())
+            || state.replay_manifest_digest.as_deref() != Some(digest(&manifest_bytes).as_str())
+            || manifest.generation_id != state.generation_id
+            || manifest.journal_length != state.journal_length
+            || manifest.journal_evidence_digest != state.journal_evidence_digest
+            || manifest.parser_result != "complete"
+            || manifest.retry_exhausted
+            || !parsed.malformed.is_empty()
+            || parsed.torn_tail.is_some()
+            || parsed.complete_boundary != manifest.complete_boundary
+            || parsed.frames.len() as u64 != manifest.complete_record_count
+            || manifest.receipts.len() as u64 != manifest.complete_record_count
+        {
+            return Ok(false);
+        }
+        for frame in &parsed.frames {
+            let Some(receipt) = manifest
+                .receipts
+                .iter()
+                .find(|receipt| receipt.offset == frame.offset)
+            else {
+                return Ok(false);
+            };
+            if receipt.length != frame.length
+                || receipt.record_digest != frame.digest
+                || receipt.event_id != frame.event.id
+            {
+                return Ok(false);
+            }
+            if receipt.outcome.acknowledges() {
+                continue;
+            }
+            if receipt.outcome != ReplayOutcome::DuplicateConflict
+                || receipt.resolution_ref.is_none()
+                || receipt.resolution_digest.is_none()
+                || receipt.resolved_authoritative.is_none()
+            {
+                return Ok(false);
+            }
+            verify_conflict_resolution(database, root, receipt).await?;
+        }
+    }
+    Ok(true)
+}
+
+async fn verify_conflict_resolution(
+    database: &DatabasePool,
+    root: &Path,
+    receipt: &ReplayReceipt,
+) -> Result<()> {
+    let final_row = verify_conflict_resolution_evidence(root, receipt)?;
+    if read_background_row(database, &receipt.event_id).await? != final_row {
+        bail!("database conflict resolution no longer matches protected audit evidence");
+    }
+    Ok(())
+}
+
+fn verify_conflict_resolution_evidence(
+    root: &Path,
+    receipt: &ReplayReceipt,
+) -> Result<ConflictRowEvidence> {
+    let expected_digest = receipt
+        .resolution_digest
+        .as_deref()
+        .context("conflict resolution digest is missing")?;
+    let expected_authority = receipt
+        .resolved_authoritative
+        .as_deref()
+        .context("conflict resolution authority is missing")?;
+    let records: Vec<AuditRecord> = read_checked(&root.join("audit.json"))?;
+    let mut matched = None;
+    for record in &records {
+        if record.operation == "resolve_conflict"
+            && record.event_id.as_deref() == Some(receipt.event_id.as_str())
+            && record.authoritative.as_deref() == Some(expected_authority)
+            && digest(&serde_json::to_vec(record)?) == expected_digest
+        {
+            matched = Some(record);
+            break;
+        }
+    }
+    let record = matched.context("conflict resolution audit record is missing or changed")?;
+    let expected_ref = format!(
+        "audit.json#incident={}&revision={}&event={}",
+        record.incident_id, record.revision, receipt.event_id
+    );
+    if receipt.resolution_ref.as_deref() != Some(expected_ref.as_str()) {
+        bail!("conflict resolution reference does not match its audit");
+    }
+    if record.conflict_snapshot_ref != receipt.conflict_snapshot_ref
+        || record.conflict_snapshot_digest != receipt.conflict_snapshot_digest
+    {
+        bail!("conflict resolution audit does not match protected conflict evidence");
+    }
+    let final_row = record
+        .final_row
+        .as_ref()
+        .context("conflict resolution audit lacks final database evidence")?;
+    Ok(final_row.clone())
+}
+
+fn audit_incident(root: &Path, incident_id: &str, revision: u64) -> Result<Value> {
+    let root = resolve_accounting_root(root)?;
+    let lock = open_coordination_lock(&root)?;
+    lock_with_timeout(&lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(&root)?;
+    let _installation = load_provisioned_root_locked(&root)?;
+    let records: Vec<AuditRecord> = read_checked(&root.join("audit.json"))?;
+    let record = records
+        .into_iter()
+        .find(|record| {
+            record.incident_id == incident_id
+                && record.revision == revision
+                && record.operation != "prepare_conflict_resolution"
+        })
+        .context("accounting audit record was not found")?;
+    File::unlock(&lock).context("unlocking accounting coordination")?;
+    Ok(serde_json::to_value(record)?)
+}
+
+fn append_audit(root: &Path, record: AuditRecord) -> Result<()> {
+    let path = root.join("audit.json");
+    let mut records: Vec<AuditRecord> = read_checked(&path)?;
+    if records.iter().any(|existing| {
+        existing.incident_id == record.incident_id
+            && existing.revision == record.revision
+            && existing.operation == record.operation
+    }) {
+        bail!("accounting audit revision already exists");
+    }
+    records.push(record);
+    write_checked(&path, &records)
+}
+
+fn ensure_generations_offline<'a>(
+    root: &Path,
+    states: impl Iterator<Item = &'a GenerationState>,
+) -> Result<()> {
+    for state in states {
+        let journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(generation_journal_path(root, &state.generation_id))?;
+        match journal.try_lock() {
+            Ok(()) => File::unlock(&journal)?,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                bail!(
+                    "accounting generation {} is still serving",
+                    state.generation_id
+                )
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("checking offline accounting generation")
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_unresolved_conflict(root: &Path) -> Result<bool> {
+    Ok(unresolved_conflict_count(root)? > 0)
+}
+
+fn ensure_retained_work_replayed<'a>(
+    root: &Path,
+    states: impl Iterator<Item = &'a GenerationState>,
+) -> Result<()> {
+    for state in states {
+        if state.phase == GenerationPhase::Reconciled
+            && state.journal_length == 0
+            && state.admitted_count == Some(0)
+            && state.worker_completed_count == Some(0)
+            && state.journal_synced_count == Some(0)
+            && state.database_committed_count == Some(0)
+        {
+            continue;
+        }
+        let manifest: ReplayManifest =
+            read_checked(&replay_manifest_path(root, &state.generation_id)).with_context(|| {
+                format!(
+                    "generation {} has no verified replay evidence",
+                    state.generation_id
+                )
+            })?;
+        let bytes = fs::read(generation_journal_path(root, &state.generation_id))?;
+        let parsed = parse_journal(&bytes);
+        validate_manifest_summary(&manifest)?;
+        let revision_matches = if state.phase == GenerationPhase::Reconciled {
+            manifest.source_generation_revision.saturating_add(1) == state.revision
+        } else {
+            manifest.source_generation_revision == state.revision
+        };
+        if !revision_matches
+            || manifest.generation_id != state.generation_id
+            || manifest.journal_length != state.journal_length
+            || manifest.journal_evidence_digest != state.journal_evidence_digest
+            || manifest.parser_result != "complete"
+            || manifest.retry_exhausted
+            || !parsed.malformed.is_empty()
+            || parsed.torn_tail.is_some()
+            || parsed.complete_boundary != manifest.complete_boundary
+            || parsed.frames.len() as u64 != manifest.complete_record_count
+        {
+            bail!(
+                "generation {} replay remains unresolved",
+                state.generation_id
+            );
+        }
+        for frame in &parsed.frames {
+            let receipt = manifest
+                .receipts
+                .iter()
+                .find(|receipt| receipt.offset == frame.offset)
+                .context("replay manifest is missing a retained frame receipt")?;
+            if receipt.length != frame.length
+                || receipt.record_digest != frame.digest
+                || receipt.event_id != frame.event.id
+                || (!receipt.outcome.acknowledges()
+                    && !(receipt.outcome == ReplayOutcome::DuplicateConflict
+                        && receipt.resolution_ref.is_some()
+                        && receipt.resolution_digest.is_some()
+                        && receipt.resolved_authoritative.is_some()))
+            {
+                bail!(
+                    "generation {} replay remains unresolved",
+                    state.generation_id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn provision_root(root: &Path, adoption: Option<AdoptionSeed>) -> Result<()> {
@@ -625,6 +2259,13 @@ fn provision_root(root: &Path, adoption: Option<AdoptionSeed>) -> Result<()> {
     fs::create_dir_all(&generations)
         .with_context(|| format!("creating {}", generations.display()))?;
     set_private_directory(&generations)?;
+    OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("maintenance.lock"))
+        .context("opening accounting maintenance lock")?;
 
     let coordination_lock = OpenOptions::new()
         .create(true)
@@ -690,6 +2331,19 @@ fn provision_root(root: &Path, adoption: Option<AdoptionSeed>) -> Result<()> {
         validate_incident(&incident)?;
     } else {
         write_checked(&incident_path, &clear_incident(installation_id))?;
+    }
+
+    let audit_path = root.join("audit.json");
+    if audit_path.exists() {
+        let records: Vec<AuditRecord> = read_checked(&audit_path)?;
+        if records
+            .iter()
+            .any(|record| record.installation_id != *installation_id)
+        {
+            bail!("interrupted provisioning audit identity is inconsistent");
+        }
+    } else {
+        write_checked(&audit_path, &Vec::<AuditRecord>::new())?;
     }
 
     let coordination_path = root.join("coordination.json");
@@ -977,6 +2631,7 @@ async fn reconcile_startup(
     operation_timeout: Duration,
     retry_deadline: Duration,
     retry_interval: Duration,
+    restore_prior_incident: bool,
 ) -> Result<()> {
     let policy = ReplayPolicy {
         operation_timeout,
@@ -989,9 +2644,36 @@ async fn reconcile_startup(
     lock_with_timeout(&coordination_lock, LOCK_TIMEOUT)?;
     recover_checked_publications(&root)?;
     let installation = load_provisioned_root_locked(&root)?;
+    let mut incident: Incident = read_checked(&root.join("incident.json"))?;
+    let mut acknowledgement = None;
+    if incident.state == IncidentState::Acknowledged {
+        let audit: Vec<AuditRecord> = read_checked(&root.join("audit.json"))?;
+        acknowledgement = audit.into_iter().find(|record| {
+            record.operation == "acknowledge"
+                && Some(record.incident_id.as_str()) == incident.incident_id.as_deref()
+                && record.revision == incident.revision
+                && record.disposition == incident.disposition
+        });
+        if acknowledgement.is_none() {
+            incident.revision = incident.revision.saturating_add(1);
+            incident.state = IncidentState::Unreconciled;
+            incident.cause = Some(IncidentCause::PriorIncidentUnreconciled);
+            incident.disposition = None;
+            write_checked(&root.join("incident.json"), &incident)?;
+        }
+    }
+    if restore_prior_incident && incident.state == IncidentState::Blocked {
+        incident.revision = incident.revision.saturating_add(1);
+        incident.state = IncidentState::Unreconciled;
+        incident.cause = Some(IncidentCause::PriorIncidentUnreconciled);
+        write_checked(&root.join("incident.json"), &incident)?;
+    }
     cleanup_empty_staging(&root)?;
     let mut coordination: Coordination = read_checked(&root.join("coordination.json"))?;
     recover_reconciled_coverage_gaps(&root, &mut coordination)?;
+    if incident.state != IncidentState::Clear {
+        recover_unresolved_coverage_gaps(&root, &mut coordination)?;
+    }
 
     let adoption_path = root.join("adoption.json");
     let adoption_record = adoption_path
@@ -1006,6 +2688,16 @@ async fn reconcile_startup(
     }
     let mut adoption = adoption_record.filter(|adoption| adoption.state != "complete");
     let states = verify_generations_with_adoption(&root, &installation, &coordination, true)?;
+    if let Some(record) = acknowledgement.as_ref() {
+        if validate_acknowledgement_binding(&root, record, &incident, &states).is_err() {
+            incident.revision = incident.revision.saturating_add(1);
+            incident.state = IncidentState::Unreconciled;
+            incident.cause = Some(IncidentCause::PriorIncidentUnreconciled);
+            incident.disposition = None;
+            write_checked(&root.join("incident.json"), &incident)?;
+            acknowledgement = None;
+        }
+    }
     if let Some(pending) = adoption.as_mut() {
         let state = states
             .get(&pending.generation_id)
@@ -1024,9 +2716,32 @@ async fn reconcile_startup(
     File::unlock(&coordination_lock).context("unlocking accounting coordination")?;
 
     for state in states.values() {
+        if state.phase == GenerationPhase::Reconciled {
+            if let Some(path) = state.replay_manifest.as_deref() {
+                let manifest: ReplayManifest = read_checked(Path::new(path))?;
+                let mut invalid = false;
+                for receipt in manifest
+                    .receipts
+                    .iter()
+                    .filter(|receipt| receipt.resolution_ref.is_some())
+                {
+                    if verify_conflict_resolution(database, &root, receipt)
+                        .await
+                        .is_err()
+                    {
+                        invalid = true;
+                        break;
+                    }
+                }
+                if invalid {
+                    publish_unreconciled(&root)?;
+                }
+            }
+            continue;
+        }
         if !matches!(
             state.phase,
-            GenerationPhase::Active | GenerationPhase::Adopting
+            GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Adopting
         ) {
             continue;
         }
@@ -1036,7 +2751,7 @@ async fn reconcile_startup(
         if state.phase == GenerationPhase::Adopting && adoption_for_generation.is_none() {
             bail!("adopting generation has no pending adoption evidence");
         }
-        reconcile_generation(
+        let result = reconcile_generation(
             &root,
             database,
             &installation,
@@ -1045,7 +2760,35 @@ async fn reconcile_startup(
             policy,
             adoption_for_generation,
         )
-        .await?;
+        .await;
+        if let Err(error) = result {
+            let current_incident: Incident = read_checked(&root.join("incident.json"))?;
+            if state.phase == GenerationPhase::Active
+                && current_incident.state != IncidentState::Acknowledged
+            {
+                publish_abandoned_active(&root, state)?;
+                tracing::warn!(%error, generation_id = %state.generation_id, "converted abandoned active generation into an operator-disposable uncertainty incident");
+                continue;
+            }
+            let accepted_coverage = acknowledgement.as_ref().is_some_and(|record| {
+                current_incident.state == IncidentState::Acknowledged
+                    && record.coverage.contains(&coverage(state))
+            });
+            if current_incident.state == IncidentState::Acknowledged && !accepted_coverage {
+                publish_unreconciled(&root)?;
+                tracing::warn!(%error, generation_id = %state.generation_id, "new unresolved generation is outside acknowledged accounting coverage");
+                continue;
+            }
+            if matches!(
+                current_incident.state,
+                IncidentState::Blocked | IncidentState::Unreconciled
+            ) || accepted_coverage
+            {
+                tracing::warn!(%error, generation_id = %state.generation_id, "retaining unresolved incident generation for offline recovery");
+                continue;
+            }
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -1138,7 +2881,12 @@ async fn reconcile_generation(
                 .iter()
                 .find(|receipt| receipt.offset == frame.offset)
                 .is_some_and(|receipt| {
-                    receipt.record_digest == frame.digest && receipt.outcome.acknowledges()
+                    receipt.record_digest == frame.digest
+                        && (receipt.outcome.acknowledges()
+                            || (receipt.outcome == ReplayOutcome::DuplicateConflict
+                                && receipt.resolution_ref.is_some()
+                                && receipt.resolution_digest.is_some()
+                                && receipt.resolved_authoritative.is_some()))
                 })
         });
     if !complete {
@@ -1389,6 +3137,9 @@ fn recover_conflict_receipts(
             database_evidence_at: Some(snapshot.observed_at.clone()),
             conflict_snapshot_ref: Some(path.display().to_string()),
             conflict_snapshot_digest: Some(snapshot_digest),
+            resolution_ref: None,
+            resolution_digest: None,
+            resolved_authoritative: None,
             updated_at: snapshot.observed_at,
         };
         if recovered.insert(frame.offset, receipt).is_some() {
@@ -1473,14 +3224,24 @@ async fn replay_frames(
                     database_evidence_at: None,
                     conflict_snapshot_ref: None,
                     conflict_snapshot_digest: None,
+                    resolution_ref: None,
+                    resolution_digest: None,
+                    resolved_authoritative: None,
                     updated_at: Utc::now().to_rfc3339(),
                 });
                 manifest.receipts.len() - 1
             }
         };
-        if manifest.receipts[receipt_index].outcome.acknowledges()
-            || manifest.receipts[receipt_index].outcome == ReplayOutcome::DuplicateConflict
-        {
+        if manifest.receipts[receipt_index].outcome.acknowledges() {
+            continue;
+        }
+        if manifest.receipts[receipt_index].outcome == ReplayOutcome::DuplicateConflict {
+            if manifest.receipts[receipt_index].resolution_ref.is_some() {
+                verify_conflict_resolution(database, root, &manifest.receipts[receipt_index])
+                    .await?;
+            } else {
+                latch_replay_conflict(root, installation)?;
+            }
             continue;
         }
 
@@ -1563,6 +3324,9 @@ async fn replay_frames(
             let conflict = receipt.outcome == ReplayOutcome::DuplicateConflict;
             manifest.receipts[receipt_index] = receipt;
             publish_replay_manifest(root, manifest_path, manifest)?;
+            if conflict {
+                latch_replay_conflict(root, installation)?;
+            }
             if acknowledged || conflict {
                 break;
             }
@@ -1608,6 +3372,9 @@ fn successful_receipt(
         database_evidence_at: Some(Utc::now().to_rfc3339()),
         conflict_snapshot_ref: None,
         conflict_snapshot_digest: None,
+        resolution_ref: None,
+        resolution_digest: None,
+        resolved_authoritative: None,
         updated_at: Utc::now().to_rfc3339(),
     })
 }
@@ -1633,6 +3400,9 @@ fn unresolved_receipt(
         database_evidence_at: None,
         conflict_snapshot_ref: None,
         conflict_snapshot_digest: None,
+        resolution_ref: None,
+        resolution_digest: None,
+        resolved_authoritative: None,
         updated_at: Utc::now().to_rfc3339(),
     })
 }
@@ -1664,25 +3434,24 @@ fn conflict_receipt(
         created_at: existing.created_at,
     };
     let existing_row_digest = digest(&serde_json::to_vec(&existing)?);
-    let existing = serde_json::to_value(existing)?;
-    let snapshot = ConflictSnapshot {
+    let snapshot = RecordedConflictSnapshot {
         format_version: FORMAT_VERSION,
-        installation_id: &installation.installation_id,
-        generation_id,
+        installation_id: installation.installation_id.clone(),
+        generation_id: generation_id.clone(),
         journal_offset: frame.offset,
         journal_length: frame.length,
-        journal_record_digest: &frame.digest,
-        source: serde_json::json!({
-            "id": frame.event.id,
-            "kind": frame.event.kind,
-            "payload": frame.event.payload.to_string(),
-            "created_at": frame.event.created_at,
-        }),
+        journal_record_digest: frame.digest.clone(),
+        source: ConflictRowEvidence {
+            id: frame.event.id.clone(),
+            kind: frame.event.kind.clone(),
+            payload: frame.event.payload.to_string(),
+            created_at: frame.event.created_at.clone(),
+        },
         existing,
         existing_row_digest,
-        verification_id,
-        backend,
-        transaction_isolation,
+        verification_id: verification_id.to_string(),
+        backend: backend.to_string(),
+        transaction_isolation: transaction_isolation.to_string(),
         read_evidence: format!("{backend}:{transaction_isolation}:{verification_id}"),
         observed_at: Utc::now().to_rfc3339(),
     };
@@ -1728,9 +3497,12 @@ fn conflict_receipt(
         attempts,
         error: None,
         database_evidence_ref: Some(verification_id.to_string()),
-        database_evidence_at: Some(snapshot.observed_at),
+        database_evidence_at: Some(snapshot.observed_at.clone()),
         conflict_snapshot_ref: Some(path.display().to_string()),
         conflict_snapshot_digest: Some(snapshot_digest),
+        resolution_ref: None,
+        resolution_digest: None,
+        resolved_authoritative: None,
         updated_at: Utc::now().to_rfc3339(),
     })
 }
@@ -1760,7 +3532,7 @@ fn verify_replay_publication_snapshot(root: &Path, manifest: &ReplayManifest) ->
         || state.revision != manifest.source_generation_revision
         || !matches!(
             state.phase,
-            GenerationPhase::Active | GenerationPhase::Adopting
+            GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Adopting
         )
         || coordination
             .coverage
@@ -1935,8 +3707,16 @@ fn validate_complete_adoption(
     }
     let manifest: ReplayManifest = read_checked(&manifest_path)?;
     validate_manifest_summary(&manifest)?;
-    let database_committed =
-        manifest.outcome_counts["inserted"] + manifest.outcome_counts["duplicate_identical"];
+    let database_committed = manifest.outcome_counts["inserted"]
+        + manifest.outcome_counts["duplicate_identical"]
+        + manifest
+            .receipts
+            .iter()
+            .filter(|receipt| {
+                receipt.outcome == ReplayOutcome::DuplicateConflict
+                    && receipt.resolution_ref.is_some()
+            })
+            .count() as u64;
     if manifest.format_version != FORMAT_VERSION
         || manifest.installation_id != installation.installation_id
         || manifest.generation_id != adoption.generation_id
@@ -2049,26 +3829,45 @@ fn recover_reconciled_coverage_gap(
         .context("reconciled generation is missing replay manifest")?;
     let manifest: ReplayManifest = read_checked(manifest_path)?;
     let manifest_digest = digest(&fs::read(manifest_path)?);
-    if prior.generation_state_revision + 1 != state.revision
-        || prior.journal_evidence_digest != state.journal_evidence_digest
-        || manifest_path != replay_manifest_path(root, &state.generation_id)
-        || state.replay_manifest_digest.as_deref() != Some(manifest_digest.as_str())
-        || manifest.source_coordination_revision != coordination.revision
-        || manifest.source_generation_revision != prior.generation_state_revision
+    for receipt in &manifest.receipts {
+        if receipt.outcome.acknowledges() {
+            continue;
+        }
+        if receipt.outcome != ReplayOutcome::DuplicateConflict {
+            bail!("reconciled generation retains an unresolved replay receipt");
+        }
+        verify_conflict_resolution_evidence(root, receipt)
+            .context("reconciled conflict receipt lacks verified resolution evidence")?;
+    }
+    if prior.generation_state_revision + 1 != state.revision {
+        bail!("reconciled state revision does not continue prior coverage");
+    }
+    if prior.journal_evidence_digest != state.journal_evidence_digest
         || manifest.journal_length != state.journal_length
         || manifest.journal_evidence_digest != state.journal_evidence_digest
-        || state.last_complete_record_boundary != Some(state.journal_length)
+        || digest(&fs::read(&state.journal)?) != state.journal_evidence_digest
+    {
+        bail!("reconciled journal does not match prior coverage and manifest evidence");
+    }
+    if manifest_path != replay_manifest_path(root, &state.generation_id) {
+        bail!("reconciled manifest path is not canonical");
+    }
+    if state.replay_manifest_digest.as_deref() != Some(manifest_digest.as_str()) {
+        bail!("reconciled state does not bind the final manifest digest");
+    }
+    if manifest.source_coordination_revision > coordination.revision {
+        bail!("reconciled manifest refers to a future coordination revision");
+    }
+    if manifest.source_generation_revision != prior.generation_state_revision {
+        bail!("reconciled manifest does not bind prior generation revision");
+    }
+    if state.last_complete_record_boundary != Some(state.journal_length)
         || manifest.complete_boundary != state.journal_length
         || manifest.receipts.len() as u64 != manifest.complete_record_count
         || !manifest.malformed_frames.is_empty()
         || manifest.torn_tail_length != 0
-        || digest(&fs::read(&state.journal)?) != state.journal_evidence_digest
-        || manifest
-            .receipts
-            .iter()
-            .any(|receipt| !receipt.outcome.acknowledges())
     {
-        bail!("reconciled generation coverage gap is not recoverable");
+        bail!("reconciled manifest does not prove a complete replay boundary");
     }
     coordination.revision += 1;
     replace_coverage(&mut coordination.coverage, coverage(state));
@@ -2080,6 +3879,37 @@ fn recover_reconciled_coverage_gaps(root: &Path, coordination: &mut Coordination
         let state: GenerationState =
             read_checked(&generation_state_path(root, &entry.generation_id))?;
         recover_reconciled_coverage_gap(root, coordination, &state)?;
+    }
+    Ok(())
+}
+
+fn recover_unresolved_coverage_gaps(root: &Path, coordination: &mut Coordination) -> Result<()> {
+    let mut changed = false;
+    for prior in coordination.coverage.clone() {
+        let state: GenerationState =
+            read_checked(&generation_state_path(root, &prior.generation_id))?;
+        if coverage(&state) == prior {
+            continue;
+        }
+        if !matches!(
+            state.phase,
+            GenerationPhase::Active | GenerationPhase::Draining
+        ) || state.revision <= prior.generation_state_revision
+        {
+            bail!("unresolved generation coverage gap is not recoverable");
+        }
+        let journal = fs::read(generation_journal_path(root, &state.generation_id))?;
+        if journal.len() as u64 != state.journal_length
+            || digest(&journal) != state.journal_evidence_digest
+        {
+            bail!("unresolved generation journal does not match checked state");
+        }
+        replace_coverage(&mut coordination.coverage, coverage(&state));
+        changed = true;
+    }
+    if changed {
+        coordination.revision = coordination.revision.saturating_add(1);
+        write_checked(&root.join("coordination.json"), coordination)?;
     }
     Ok(())
 }
@@ -2173,24 +4003,53 @@ fn canonicalize_missing_path(path: &Path) -> Result<PathBuf> {
 fn start_writer(
     root: PathBuf,
     mut journal: File,
-    receiver: mpsc::Receiver<AccountingEvent>,
+    receiver: mpsc::Receiver<JournalMessage>,
     state: Arc<Mutex<GenerationState>>,
-) -> Result<()> {
+    incident: Arc<Mutex<Incident>>,
+    incident_publisher: mpsc::Sender<IncidentPublisherMessage>,
+    incident_submitted: Arc<AtomicU64>,
+) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("steve-accounting-journal".into())
         .spawn(move || {
             let mut hasher = Sha256::new();
-            while let Ok(event) = receiver.recv() {
+            while let Ok(message) = receiver.recv() {
+                let event = match message {
+                    JournalMessage::Event(event) => event,
+                    JournalMessage::Shutdown(completed) => {
+                        if let Err(err) = journal.sync_all() {
+                            tracing::error!(%err, "accounting journal final sync failed");
+                            if let Err(latch_error) = queue_incident_publication(
+                                &incident,
+                                &incident_publisher,
+                                &incident_submitted,
+                                IncidentCause::JournalWriteFailed,
+                                0,
+                                1,
+                            ) {
+                                tracing::error!(%latch_error, "accounting incident publication failed");
+                            }
+                        }
+                        let _ = completed.send(());
+                        return;
+                    }
+                };
                 if let Err(err) = append_event(&root, &mut journal, &mut hasher, &state, &event) {
                     tracing::error!(%err, event_id = %event.id, "accounting journal write failed");
+                    if let Err(latch_error) = queue_incident_publication(
+                        &incident,
+                        &incident_publisher,
+                        &incident_submitted,
+                        IncidentCause::JournalWriteFailed,
+                        0,
+                        1,
+                    ) {
+                        tracing::error!(%latch_error, "accounting incident publication failed");
+                    }
                 }
             }
-            if let Err(err) = journal.sync_all() {
-                tracing::error!(%err, "accounting journal final sync failed");
-            }
         })
-        .context("spawning accounting journal writer")?;
-    Ok(())
+        .context("spawning accounting journal writer")
 }
 
 fn append_event(
@@ -2258,6 +4117,7 @@ fn load_provisioned_root_locked(root: &Path) -> Result<Installation> {
     verify_root_inventory(root)?;
     let installation: Installation = read_checked(&root.join("installation.json"))?;
     let incident: Incident = read_checked(&root.join("incident.json"))?;
+    let audit: Vec<AuditRecord> = read_checked(&root.join("audit.json"))?;
     let provisioning: Provisioning = read_checked(&root.join("provisioning.json"))?;
     let coordination: Coordination = read_checked(&root.join("coordination.json"))?;
     if installation.format_version != FORMAT_VERSION
@@ -2283,7 +4143,13 @@ fn load_provisioned_root_locked(root: &Path) -> Result<Installation> {
     {
         bail!("accounting ownership evidence has mismatched installation identities");
     }
-    if !root.join("coordination.lock").is_file() || !root.join("generations").is_dir() {
+    for record in &audit {
+        validate_audit_record(record, &installation.installation_id)?;
+    }
+    if !root.join("coordination.lock").is_file()
+        || !root.join("maintenance.lock").is_file()
+        || !root.join("generations").is_dir()
+    {
         bail!("accounting ownership evidence is incomplete");
     }
     validate_incident(&incident)?;
@@ -2291,18 +4157,216 @@ fn load_provisioned_root_locked(root: &Path) -> Result<Installation> {
 }
 
 fn validate_incident(incident: &Incident) -> Result<()> {
-    if incident.state == IncidentState::Clear
-        && (incident.incident_id.is_some()
-            || incident.first_observed_at.is_some()
-            || incident.cause.is_some()
-            || incident.disposition.is_some()
-            || incident.payloads.pending_replay.volatile != Some(0)
-            || incident.payloads.pending_replay.durable != Some(0)
-            || incident.payloads.provisional.unknown != Some(0)
-            || incident.payloads.outcome_totals.reconciled != Some(0)
-            || incident.payloads.outcome_totals.unrecoverable_lost != Some(0))
+    match incident.state {
+        IncidentState::Clear => {
+            if incident.incident_id.is_some()
+                || incident.first_observed_at.is_some()
+                || incident.cause.is_some()
+                || incident.disposition.is_some()
+                || incident.payloads.pending_replay.volatile != Some(0)
+                || incident.payloads.pending_replay.durable != Some(0)
+                || incident.payloads.provisional.unknown != Some(0)
+                || incident.payloads.outcome_totals.reconciled != Some(0)
+                || incident.payloads.outcome_totals.unrecoverable_lost != Some(0)
+            {
+                bail!("clear accounting incident evidence is inconsistent");
+            }
+        }
+        IncidentState::Blocked => {
+            if incident.incident_id.as_deref().is_none_or(str::is_empty)
+                || incident
+                    .first_observed_at
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || incident.cause.is_none()
+                || incident.disposition.is_some()
+            {
+                bail!("blocked accounting incident evidence is incomplete");
+            }
+        }
+        IncidentState::Unreconciled => {
+            if incident.cause.is_none() || incident.disposition.is_some() {
+                bail!("unreconciled accounting incident evidence is inconsistent");
+            }
+        }
+        IncidentState::Acknowledged => {
+            let disposition = incident
+                .disposition
+                .as_ref()
+                .context("acknowledged incident lacks disposition")?;
+            if incident.incident_id.as_deref().is_none_or(str::is_empty)
+                || incident
+                    .first_observed_at
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || incident.cause.is_none()
+                || incident.payloads.pending_replay.volatile != Some(0)
+                || incident.payloads.pending_replay.durable != Some(0)
+                || !disposition_matches_incident(&disposition.kind, incident)
+            {
+                bail!("acknowledged accounting incident evidence is inconsistent");
+            }
+            validate_disposition(disposition)?;
+        }
+    }
+    if let Some(observed) = incident.first_observed_at.as_deref() {
+        chrono::DateTime::parse_from_rfc3339(observed)
+            .context("accounting incident first_observed_at is not RFC3339")?;
+    }
+    Ok(())
+}
+
+fn validate_disposition(disposition: &Disposition) -> Result<()> {
+    if !matches!(
+        disposition.kind.as_str(),
+        "accepted_loss" | "accepted_uncertainty" | "accepted_loss_and_uncertainty"
+    ) || disposition.actor.trim().is_empty()
+        || disposition.evidence_ref.trim().is_empty()
     {
-        bail!("clear accounting incident evidence is inconsistent");
+        bail!("accounting disposition identity or evidence reference is empty");
+    }
+    chrono::DateTime::parse_from_rfc3339(&disposition.at)
+        .context("accounting disposition time is not RFC3339")?;
+    Ok(())
+}
+
+fn validate_audit_record(record: &AuditRecord, installation_id: &str) -> Result<()> {
+    if record.format_version != FORMAT_VERSION || record.installation_id != installation_id {
+        bail!("unsupported or mismatched accounting audit evidence");
+    }
+    if record.incident_id.trim().is_empty()
+        || record.evidence_ref.trim().is_empty()
+        || record.actor.trim().is_empty()
+        || record.revision != record.previous_revision.saturating_add(1)
+    {
+        bail!("accounting audit evidence is incomplete");
+    }
+    chrono::DateTime::parse_from_rfc3339(&record.at)
+        .context("accounting audit time is not RFC3339")?;
+    let mut coverage = record.coverage.clone();
+    sort_coverage(&mut coverage);
+    if coverage != record.coverage
+        || coverage
+            .windows(2)
+            .any(|pair| pair[0].generation_id == pair[1].generation_id)
+    {
+        bail!("accounting audit coverage is not canonical");
+    }
+    match record.operation.as_str() {
+        "acknowledge" => {
+            let disposition = record
+                .disposition
+                .as_ref()
+                .context("acknowledgement audit lacks disposition")?;
+            validate_disposition(disposition)?;
+            if record.event_id.is_some()
+                || record.authoritative.is_some()
+                || record.conflict_snapshot_ref.is_some()
+                || record.conflict_snapshot_digest.is_some()
+                || record.final_row.is_some()
+            {
+                bail!("acknowledgement audit contains conflict fields");
+            }
+        }
+        "prepare_conflict_resolution" | "resolve_conflict" => {
+            if record.disposition.is_some()
+                || record.event_id.as_deref().is_none_or(str::is_empty)
+                || !matches!(
+                    record.authoritative.as_deref(),
+                    Some("journal" | "database")
+                )
+                || record
+                    .conflict_snapshot_ref
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || record
+                    .conflict_snapshot_digest
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                || record.final_row.is_none()
+            {
+                bail!("conflict resolution audit is incomplete");
+            }
+        }
+        _ => bail!("unsupported accounting audit operation"),
+    }
+    Ok(())
+}
+
+fn validate_acknowledgement_binding(
+    root: &Path,
+    record: &AuditRecord,
+    incident: &Incident,
+    states: &BTreeMap<String, GenerationState>,
+) -> Result<()> {
+    if record.operation != "acknowledge"
+        || record.incident_id != incident.incident_id.as_deref().unwrap_or_default()
+        || record.revision != incident.revision
+        || record.disposition != incident.disposition
+        || incident.payloads.pending_replay.volatile != Some(0)
+        || incident.payloads.pending_replay.durable != Some(0)
+    {
+        bail!("acknowledged incident does not match its audit evidence");
+    }
+    let disposition = incident
+        .disposition
+        .as_ref()
+        .context("acknowledged incident lacks disposition")?;
+    if record.actor != disposition.actor
+        || record.at != disposition.at
+        || record.evidence_ref != disposition.evidence_ref
+    {
+        bail!("acknowledgement audit identity does not match its disposition");
+    }
+    for state in states.values() {
+        if record
+            .coverage
+            .iter()
+            .any(|accepted| accepted.generation_id == state.generation_id)
+        {
+            continue;
+        }
+        if state.phase != GenerationPhase::Active {
+            bail!("acknowledgement audit omits non-live generation coverage");
+        }
+        let journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(generation_journal_path(root, &state.generation_id))?;
+        match journal.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Ok(()) => {
+                File::unlock(&journal)?;
+                bail!("acknowledgement audit omits unlocked generation coverage");
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("checking omitted acknowledgement generation")
+            }
+        }
+    }
+    for accepted in &record.coverage {
+        let current = states
+            .get(&accepted.generation_id)
+            .context("acknowledgement coverage generation is missing")?;
+        if coverage(current) == *accepted {
+            continue;
+        }
+        let manifest_path = current
+            .replay_manifest
+            .as_deref()
+            .map(Path::new)
+            .context("acknowledgement coverage changed without replay evidence")?;
+        let manifest: ReplayManifest = read_checked(manifest_path)?;
+        if current.phase != GenerationPhase::Reconciled
+            || current.revision != accepted.generation_state_revision.saturating_add(1)
+            || current.journal_evidence_digest != accepted.journal_evidence_digest
+            || manifest.source_generation_revision != accepted.generation_state_revision
+            || manifest.journal_evidence_digest != accepted.journal_evidence_digest
+            || manifest.parser_result != "complete"
+            || manifest.retry_exhausted
+        {
+            bail!("acknowledgement coverage no longer matches generation evidence");
+        }
     }
     Ok(())
 }
@@ -2422,11 +4486,10 @@ fn verify_generations_with_adoption(
         match file.try_lock() {
             Ok(()) => {
                 File::unlock(&file)?;
-                if state.phase == GenerationPhase::Draining
-                    || (matches!(
-                        state.phase,
-                        GenerationPhase::Active | GenerationPhase::Adopting
-                    ) && !allow_unlocked_replayable)
+                if matches!(
+                    state.phase,
+                    GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Adopting
+                ) && !allow_unlocked_replayable
                 {
                     bail!(
                         "generation {} has unresolved {:?} evidence",
@@ -2686,6 +4749,8 @@ fn write_or_verify_backup(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn verify_root_inventory(root: &Path) -> Result<()> {
     let mut allowed = BTreeSet::from([
+        "audit.json".to_string(),
+        "audit.json.sha256".to_string(),
         "coordination.lock".to_string(),
         "coordination.json".to_string(),
         "coordination.json.sha256".to_string(),
@@ -2694,6 +4759,7 @@ fn verify_root_inventory(root: &Path) -> Result<()> {
         "incident.json.sha256".to_string(),
         "installation.json".to_string(),
         "installation.json.sha256".to_string(),
+        "maintenance.lock".to_string(),
         "provisioning.json".to_string(),
         "provisioning.json.sha256".to_string(),
     ]);
@@ -2880,7 +4946,8 @@ fn checked_target_allowed(name: &str, generations: bool) -> bool {
     }
     matches!(
         name,
-        "installation.json"
+        "audit.json"
+            | "installation.json"
             | "incident.json"
             | "coordination.json"
             | "provisioning.json"
@@ -2988,6 +5055,36 @@ fn operator_identity() -> Result<String> {
 }
 
 #[cfg(unix)]
+fn effective_actor_identity() -> Result<String> {
+    let id = ["/usr/bin/id", "/bin/id"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .context("qualified system id executable is unavailable")?;
+    let uid = Command::new(id)
+        .arg("-u")
+        .output()
+        .context("reading effective operator uid")?;
+    let account = Command::new(id)
+        .arg("-un")
+        .output()
+        .context("reading effective operator account")?;
+    if !uid.status.success() || !account.status.success() {
+        bail!("could not derive effective operator identity");
+    }
+    let uid = String::from_utf8(uid.stdout)?.trim().to_string();
+    let account = String::from_utf8(account.stdout)?.trim().to_string();
+    if uid.is_empty() || account.is_empty() {
+        bail!("effective operator identity is empty");
+    }
+    Ok(format!("uid:{uid}:account:{account}"))
+}
+
+#[cfg(not(unix))]
+fn effective_actor_identity() -> Result<String> {
+    bail!("accounting disposition identity is unsupported on this platform until qualified")
+}
+
+#[cfg(unix)]
 fn ensure_platform_supported() -> Result<()> {
     Ok(())
 }
@@ -3035,6 +5132,346 @@ fn set_readonly_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disposition_kinds_match_exact_loss_and_uncertainty_classes() {
+        assert!(disposition_matches("accepted_loss", Some(1), Some(0)));
+        assert!(disposition_matches(
+            "accepted_uncertainty",
+            Some(0),
+            Some(1)
+        ));
+        assert!(disposition_matches(
+            "accepted_loss_and_uncertainty",
+            Some(1),
+            Some(1)
+        ));
+        assert!(!disposition_matches("accepted_loss", Some(1), None));
+        assert!(!disposition_matches("accepted_uncertainty", Some(1), None));
+        assert!(!disposition_matches("accepted_uncertainty", Some(0), None));
+
+        let mut uncertain = clear_incident("fixture");
+        apply_incident_failure(
+            &mut uncertain,
+            IncidentCause::PrimaryPersistenceFailedAndJournalUnavailable,
+            0,
+            1,
+        );
+        assert_eq!(uncertain.payloads.provisional.unknown, Some(1));
+        assert_eq!(
+            uncertain.payloads.outcome_totals.unrecoverable_lost,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn verified_new_incident_boundary_discards_prior_publication_ids() {
+        let mut incident = clear_incident("fixture");
+        incident.state = IncidentState::Acknowledged;
+        incident.publication_ids.insert("prior-publication".into());
+
+        apply_incident_failure(
+            &mut incident,
+            IncidentCause::PrimaryAndJournalUnavailable,
+            1,
+            0,
+        );
+
+        assert!(incident.publication_ids.is_empty());
+        assert_eq!(incident.state, IncidentState::Blocked);
+    }
+
+    #[test]
+    fn acknowledged_sibling_adopts_a_new_incident_lineage() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let installation: Installation =
+            read_checked(&root.join("installation.json")).expect("installation");
+
+        let disposition = Disposition {
+            kind: "accepted_loss".into(),
+            actor: "uid:501:account:test".into(),
+            at: "2026-09-30T00:00:00Z".into(),
+            evidence_ref: "ticket://prior-incident".into(),
+        };
+        let mut acknowledged = clear_incident(&installation.installation_id);
+        acknowledged.revision = 2;
+        acknowledged.state = IncidentState::Acknowledged;
+        acknowledged.incident_id = Some("prior-incident".into());
+        acknowledged.first_observed_at = Some("2026-09-29T00:00:00Z".into());
+        acknowledged.cause = Some(IncidentCause::PrimaryAndJournalUnavailable);
+        acknowledged.disposition = Some(disposition.clone());
+        acknowledged.payloads.outcome_totals.unrecoverable_lost = Some(1);
+        acknowledged
+            .publication_ids
+            .insert("prior-publication".into());
+        write_checked(&root.join("incident.json"), &acknowledged).expect("acknowledged incident");
+        let audit = vec![AuditRecord {
+            format_version: FORMAT_VERSION,
+            installation_id: installation.installation_id,
+            operation: "acknowledge".into(),
+            incident_id: "prior-incident".into(),
+            revision: 2,
+            previous_revision: 1,
+            coverage: Vec::new(),
+            disposition: Some(disposition.clone()),
+            event_id: None,
+            authoritative: None,
+            evidence_ref: disposition.evidence_ref.clone(),
+            conflict_snapshot_ref: None,
+            conflict_snapshot_digest: None,
+            final_row: None,
+            actor: disposition.actor.clone(),
+            at: disposition.at.clone(),
+        }];
+        write_checked(&root.join("audit.json"), &audit).expect("acknowledgement audit");
+
+        let first = AccountingCoordinator::start(&root, 1).expect("first coordinator");
+        let second = AccountingCoordinator::start(&root, 1).expect("second coordinator");
+        first
+            .latch_incident(IncidentCause::PrimaryAndJournalUnavailable, 1, 0)
+            .expect("new incident publication");
+        first.flush_incident_publications();
+        let durable: Incident =
+            read_checked(&root.join("incident.json")).expect("durable new incident");
+
+        let rejected = second
+            .with_incident_admission(|| true)
+            .expect_err("sibling admitted after durable new incident");
+        assert_eq!(rejected["incident_id"], durable.incident_id.unwrap());
+        assert_eq!(rejected["state"], "blocked");
+    }
+
+    #[test]
+    fn acknowledgement_binding_rejects_identity_mismatch_and_clock_skewed_omission() {
+        let disposition = Disposition {
+            kind: "accepted_loss".into(),
+            actor: "uid:501".into(),
+            at: "2026-09-29T00:00:00Z".into(),
+            evidence_ref: "ticket://accepted-loss".into(),
+        };
+        let mut incident = clear_incident("installation");
+        incident.state = IncidentState::Acknowledged;
+        incident.incident_id = Some("incident".into());
+        incident.first_observed_at = Some("2026-09-28T00:00:00Z".into());
+        incident.cause = Some(IncidentCause::PrimaryAndJournalUnavailable);
+        incident.disposition = Some(disposition.clone());
+        incident.payloads.outcome_totals.unrecoverable_lost = Some(1);
+        let state = GenerationState {
+            format_version: FORMAT_VERSION,
+            installation_id: "installation".into(),
+            generation_id: "generation".into(),
+            revision: 2,
+            phase: GenerationPhase::Reconciled,
+            journal: "/unused/generation.journal".into(),
+            journal_length: 0,
+            journal_evidence_digest: digest(&[]),
+            admitted_count: Some(0),
+            worker_completed_count: Some(0),
+            journal_synced_count: Some(0),
+            database_committed_count: Some(0),
+            last_complete_record_boundary: Some(0),
+            replay_manifest: None,
+            replay_manifest_digest: None,
+            updated_at: "2099-01-01T00:00:00Z".into(),
+        };
+        let mut states = BTreeMap::new();
+        states.insert(state.generation_id.clone(), state.clone());
+        let mut record = AuditRecord {
+            format_version: FORMAT_VERSION,
+            installation_id: "installation".into(),
+            operation: "acknowledge".into(),
+            incident_id: "incident".into(),
+            revision: incident.revision,
+            previous_revision: incident.revision.saturating_sub(1),
+            coverage: vec![coverage(&state)],
+            disposition: Some(disposition.clone()),
+            event_id: None,
+            authoritative: None,
+            evidence_ref: disposition.evidence_ref.clone(),
+            conflict_snapshot_ref: None,
+            conflict_snapshot_digest: None,
+            final_row: None,
+            actor: "different-actor".into(),
+            at: disposition.at.clone(),
+        };
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            validate_acknowledgement_binding(temp.path(), &record, &incident, &states)
+                .expect_err("mismatched top-level audit actor")
+                .to_string()
+                .contains("identity")
+        );
+
+        record.actor = disposition.actor;
+        record.coverage.clear();
+        assert!(
+            validate_acknowledgement_binding(temp.path(), &record, &incident, &states)
+                .expect_err("clock-skewed omitted reconciled generation")
+                .to_string()
+                .contains("omits non-live")
+        );
+    }
+
+    #[test]
+    fn failed_incident_publication_still_blocks_local_admission() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let coordinator = AccountingCoordinator::start(&root, 1).expect("start coordinator");
+        let lock = root.join("coordination.lock");
+        let unavailable_lock = root.join("coordination.lock.unavailable");
+        fs::rename(&lock, &unavailable_lock).expect("make publication unavailable");
+        let started = Instant::now();
+        coordinator
+            .latch_incident(IncidentCause::PrimaryAndJournalUnavailable, 1, 0)
+            .expect("queue lost incident publication");
+        coordinator
+            .latch_incident(
+                IncidentCause::PrimaryPersistenceFailedAndJournalUnavailable,
+                0,
+                1,
+            )
+            .expect("queue uncertain incident publication");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "request path waited for unavailable durable publication"
+        );
+        let blocked = coordinator
+            .with_incident_admission(|| true)
+            .expect_err("local admission reopened during durable publication retry");
+        assert_eq!(blocked["state"], "blocked");
+        assert_eq!(
+            blocked["payloads"]["outcome_totals"]["unrecoverable_lost"],
+            1
+        );
+        assert_eq!(blocked["payloads"]["provisional"]["unknown"], 1);
+
+        fs::rename(unavailable_lock, lock).expect("restore coordination lock");
+        coordinator.flush_incident_publications();
+        let durable: Incident =
+            read_checked(&root.join("incident.json")).expect("durable incident");
+        assert_eq!(durable.payloads.outcome_totals.unrecoverable_lost, Some(1));
+        assert_eq!(durable.payloads.provisional.unknown, Some(1));
+    }
+
+    #[test]
+    fn same_base_cross_replica_failures_are_deduplicated_by_publication_identity() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let first = AccountingCoordinator::start(&root, 1).expect("first coordinator");
+        let second = AccountingCoordinator::start(&root, 1).expect("second coordinator");
+
+        first
+            .latch_incident(IncidentCause::PrimaryAndJournalUnavailable, 1, 0)
+            .expect("first publication");
+        second
+            .latch_incident(IncidentCause::PrimaryAndJournalUnavailable, 1, 0)
+            .expect("second publication");
+        first.flush_incident_publications();
+        second.flush_incident_publications();
+
+        let durable: Incident =
+            read_checked(&root.join("incident.json")).expect("durable incident");
+        assert_eq!(durable.payloads.outcome_totals.unrecoverable_lost, Some(2));
+        assert_eq!(durable.publication_ids.len(), 2);
+    }
+
+    #[test]
+    fn graceful_shutdown_waits_for_pending_incident_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let coordinator = AccountingCoordinator::start(&root, 1).expect("coordinator");
+        let lock = root.join("coordination.lock");
+        let unavailable_lock = root.join("coordination.lock.unavailable");
+        fs::rename(&lock, &unavailable_lock).expect("make publication unavailable");
+        coordinator
+            .latch_incident(IncidentCause::PrimaryAndJournalUnavailable, 1, 0)
+            .expect("queue incident publication");
+
+        let shutdown = coordinator.clone();
+        let stopping = thread::spawn(move || shutdown.begin_shutdown(Duration::from_secs(2)));
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            !stopping.is_finished(),
+            "shutdown skipped pending publication"
+        );
+        fs::rename(unavailable_lock, lock).expect("restore coordination lock");
+        stopping
+            .join()
+            .expect("shutdown thread")
+            .expect("shutdown completed after publication recovery");
+
+        let durable: Incident =
+            read_checked(&root.join("incident.json")).expect("durable incident");
+        assert_eq!(durable.payloads.outcome_totals.unrecoverable_lost, Some(1));
+    }
+
+    #[test]
+    fn graceful_shutdown_bounds_unavailable_incident_publication() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let coordinator = AccountingCoordinator::start(&root, 1).expect("coordinator");
+        let lock = root.join("coordination.lock");
+        let unavailable_lock = root.join("coordination.lock.unavailable");
+        fs::rename(&lock, &unavailable_lock).expect("make publication unavailable");
+        coordinator
+            .latch_incident(IncidentCause::PrimaryAndJournalUnavailable, 1, 0)
+            .expect("queue incident publication");
+
+        let started = Instant::now();
+        let error = coordinator
+            .begin_shutdown(Duration::from_millis(150))
+            .expect_err("shutdown exceeded its unavailable publication deadline");
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        fs::rename(unavailable_lock, lock).expect("restore coordination lock");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !coordinator
+            .incident_publisher_thread
+            .lock()
+            .expect("incident publisher")
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "incident publisher did not recover"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        coordinator
+            .incident_publisher_thread
+            .lock()
+            .expect("incident publisher")
+            .take()
+            .expect("incident publisher handle")
+            .join()
+            .expect("incident publisher thread");
+    }
+
+    #[test]
+    fn graceful_shutdown_bounds_final_ownership_contention() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let coordinator = AccountingCoordinator::start(&root, 1).expect("coordinator");
+        let lock = open_coordination_lock(&root).expect("coordination lock");
+        lock.lock().expect("hold final ownership publication");
+
+        let started = Instant::now();
+        let error = coordinator
+            .begin_shutdown(Duration::from_millis(150))
+            .expect_err("shutdown exceeded final ownership deadline");
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        File::unlock(&lock).expect("release final ownership publication");
+    }
 
     #[test]
     fn journal_parser_replays_complete_frames_and_retains_unresolved_bytes() {
@@ -3150,6 +5587,18 @@ mod tests {
             recovered.receipts[0].outcome,
             ReplayOutcome::DuplicateConflict
         );
+        assert_eq!(
+            read_checked::<Incident>(&root.join("incident.json"))
+                .expect("incident before recovered latch")
+                .state,
+            IncidentState::Clear
+        );
+        latch_replay_conflict(&root, &installation).expect("recover conflict incident latch");
+        latch_replay_conflict(&root, &installation).expect("repeat recovered conflict latch");
+        let incident: Incident =
+            read_checked(&root.join("incident.json")).expect("recovered conflict incident");
+        assert_eq!(incident.state, IncidentState::Blocked);
+        assert_eq!(incident.payloads.pending_replay.durable, Some(1));
     }
 
     #[test]
@@ -3177,6 +5626,61 @@ mod tests {
         );
 
         assert_ne!(first, second, "frame position must be part of identity");
+    }
+
+    #[test]
+    fn database_authority_rejects_distinct_captured_rows_before_mutation() {
+        let source = ConflictRowEvidence {
+            id: "same-event".into(),
+            kind: "fixture".into(),
+            payload: "{\"value\":1}".into(),
+            created_at: "2026-09-29T00:00:00Z".into(),
+        };
+        let first_existing = ConflictRowEvidence {
+            payload: "{\"value\":2}".into(),
+            ..source.clone()
+        };
+        let second_existing = ConflictRowEvidence {
+            payload: "{\"value\":3}".into(),
+            ..source.clone()
+        };
+        let snapshot = |existing: ConflictRowEvidence| RecordedConflictSnapshot {
+            format_version: FORMAT_VERSION,
+            installation_id: "installation".into(),
+            generation_id: "generation".into(),
+            journal_offset: 0,
+            journal_length: 1,
+            journal_record_digest: "journal".into(),
+            source: source.clone(),
+            existing_row_digest: digest(&serde_json::to_vec(&existing).expect("row JSON")),
+            existing,
+            verification_id: "verification".into(),
+            backend: "sqlite".into(),
+            transaction_isolation: "serializable".into(),
+            read_evidence: "read".into(),
+            observed_at: "2026-09-29T00:00:00Z".into(),
+        };
+        let mut journal_sides = None;
+        let mut database_row = None;
+        validate_same_id_conflict_sides(
+            "database",
+            &snapshot(first_existing.clone()),
+            &mut journal_sides,
+            &mut database_row,
+        )
+        .expect("first protected database side");
+        let rejected = validate_same_id_conflict_sides(
+            "database",
+            &snapshot(second_existing),
+            &mut journal_sides,
+            &mut database_row,
+        )
+        .expect_err("distinct protected database side");
+
+        assert!(rejected
+            .to_string()
+            .contains("distinct captured database rows"));
+        assert_eq!(database_row, Some(first_existing));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::{
-    accounting::{AccountingCoordinator, AccountingEvent},
+    accounting::{AccountingCoordinator, AccountingEvent, IncidentCause},
     config::Config,
     storage::{DatabasePool, InsertBackgroundEvent, ObjectStorage},
 };
@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -19,7 +19,8 @@ use tracing::{error, warn};
 
 #[derive(Clone)]
 pub struct DeferredQueues {
-    accounting: mpsc::Sender<AccountingEvent>,
+    accounting: Arc<Mutex<Option<mpsc::Sender<AccountingEvent>>>>,
+    accounting_worker: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     accounting_journal: AccountingCoordinator,
     history: mpsc::Sender<HistoryEvent>,
     telemetry: mpsc::Sender<TelemetryEvent>,
@@ -68,17 +69,21 @@ impl DeferredQueues {
         objects: ObjectStorage,
     ) -> Result<Self> {
         let stats = Arc::new(QueueStats::default());
+        let accounting_root = std::path::Path::new(&cfg.queues.accounting_journal);
+        let serving = AccountingCoordinator::acquire_serving(accounting_root)?;
         AccountingCoordinator::reconcile_startup(
-            std::path::Path::new(&cfg.queues.accounting_journal),
+            accounting_root,
             &background_db,
             std::time::Duration::from_millis(cfg.queues.accounting_operation_timeout_ms),
             std::time::Duration::from_millis(cfg.queues.accounting_retry_deadline_ms),
             std::time::Duration::from_millis(cfg.queues.accounting_retry_interval_ms),
+            true,
         )
         .await?;
-        let accounting_journal = AccountingCoordinator::start(
-            std::path::Path::new(&cfg.queues.accounting_journal),
+        let accounting_journal = AccountingCoordinator::start_with_guard(
+            accounting_root,
             cfg.queues.accounting_journal_queue,
+            serving,
         )?;
 
         let (accounting_tx, mut accounting_rx) =
@@ -94,7 +99,7 @@ impl DeferredQueues {
             retry_deadline: Duration::from_millis(cfg.queues.accounting_retry_deadline_ms),
             retry_interval: Duration::from_millis(cfg.queues.accounting_retry_interval_ms),
         };
-        tokio::spawn(async move {
+        let accounting_worker = tokio::spawn(async move {
             while let Some(event) = accounting_rx.recv().await {
                 let outcome =
                     insert_accounting_event(&background_db, &event, accounting_retry).await;
@@ -108,16 +113,33 @@ impl DeferredQueues {
                             &stats_for_worker,
                             event,
                             "database_content_conflict",
+                            IncidentCause::PrimaryPersistenceFailedAndJournalUnavailable,
+                            1,
+                            0,
                         );
                     }
-                    InsertBackgroundEvent::Failed { error }
-                    | InsertBackgroundEvent::Unknown { error } => {
+                    InsertBackgroundEvent::Failed { error } => {
                         error!(%error, event_id = %event.id, "background accounting write failed");
                         spill_accounting_event(
                             &journal_for_worker,
                             &stats_for_worker,
                             event,
                             "database_write_failed",
+                            IncidentCause::PrimaryPersistenceFailedAndJournalUnavailable,
+                            1,
+                            0,
+                        );
+                    }
+                    InsertBackgroundEvent::Unknown { error } => {
+                        error!(%error, event_id = %event.id, "background accounting write outcome is unknown");
+                        spill_accounting_event(
+                            &journal_for_worker,
+                            &stats_for_worker,
+                            event,
+                            "database_write_unknown",
+                            IncidentCause::PrimaryPersistenceFailedAndJournalUnavailable,
+                            0,
+                            1,
                         );
                     }
                 }
@@ -139,7 +161,8 @@ impl DeferredQueues {
         });
 
         Ok(Self {
-            accounting: accounting_tx,
+            accounting: Arc::new(Mutex::new(Some(accounting_tx))),
+            accounting_worker: Arc::new(tokio::sync::Mutex::new(Some(accounting_worker))),
             accounting_journal,
             history: history_tx,
             telemetry: telemetry_tx,
@@ -149,7 +172,17 @@ impl DeferredQueues {
 
     pub fn accounting(&self, kind: &'static str, payload: Value) {
         let event = AccountingEvent::new(kind, payload);
-        match self.accounting.try_send(event) {
+        let sender = self
+            .accounting
+            .lock()
+            .expect("accounting producer")
+            .as_ref()
+            .cloned();
+        let result = match sender {
+            Some(sender) => sender.try_send(event),
+            None => Err(mpsc::error::TrySendError::Closed(event)),
+        };
+        match result {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(event))
             | Err(mpsc::error::TrySendError::Closed(event)) => {
@@ -158,9 +191,34 @@ impl DeferredQueues {
                     &self.stats,
                     event,
                     "primary_queue_unavailable",
+                    IncidentCause::PrimaryAndJournalUnavailable,
+                    1,
+                    0,
                 );
             }
         }
+    }
+
+    pub async fn shutdown_accounting(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow::anyhow!("accounting shutdown deadline is out of range"))?;
+        self.accounting.lock().expect("accounting producer").take();
+        if let Some(worker) = self.accounting_worker.lock().await.take() {
+            tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), worker)
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out stopping accounting worker"))?
+                .map_err(|error| anyhow::anyhow!("accounting worker failed: {error}"))?;
+        }
+        let coordinator = self.accounting_journal.clone();
+        let shutdown = tokio::task::spawn_blocking(move || {
+            coordinator.begin_shutdown(deadline.saturating_duration_since(Instant::now()))
+        });
+        tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), shutdown)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out finalizing accounting ownership"))?
+            .map_err(|error| anyhow::anyhow!("accounting shutdown task failed: {error}"))??;
+        Ok(())
     }
 
     pub fn history(&self, key: String, data: Bytes) {
@@ -188,6 +246,14 @@ impl DeferredQueues {
             telemetry_dropped: self.stats.telemetry_dropped.load(Ordering::Relaxed),
         }
     }
+
+    pub fn accounting_incident(&self) -> Value {
+        self.accounting_journal.public_incident()
+    }
+
+    pub fn with_accounting_admission<T>(&self, admit: impl FnOnce() -> T) -> Result<T, Value> {
+        self.accounting_journal.with_incident_admission(admit)
+    }
 }
 
 fn spill_accounting_event(
@@ -195,6 +261,9 @@ fn spill_accounting_event(
     stats: &QueueStats,
     event: AccountingEvent,
     reason: &'static str,
+    cause: IncidentCause,
+    lost: u64,
+    unknown: u64,
 ) {
     let event_id = event.id.clone();
     match journal.offer(event) {
@@ -207,7 +276,12 @@ fn spill_accounting_event(
             );
         }
         Err(_event) => {
-            stats.accounting_lost.fetch_add(1, Ordering::Relaxed);
+            if lost > 0 {
+                stats.accounting_lost.fetch_add(lost, Ordering::Relaxed);
+            }
+            if let Err(err) = journal.latch_incident(cause, lost, unknown) {
+                error!(%err, event_id = %event_id, "accounting incident publication failed");
+            }
             error!(
                 event_id = %event_id,
                 reason,
