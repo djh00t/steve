@@ -91,6 +91,7 @@ async fn invalid_ca_bundles_fail_before_readiness() {
     let empty = temp.path().join("empty.pem");
     let malformed = temp.path().join("malformed.pem");
     let invalid_der = temp.path().join("invalid-der.pem");
+    let indented = temp.path().join("indented.pem");
     let mixed = temp.path().join("mixed.pem");
     fs::write(&empty, b"").expect("write empty bundle");
     fs::write(
@@ -103,6 +104,11 @@ async fn invalid_ca_bundles_fail_before_readiness() {
         b"-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n",
     )
     .expect("write invalid DER bundle");
+    fs::write(
+        &indented,
+        b" -----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write indented bundle");
     let mut mixed_pem = fs::read("tests/fixtures/tls/ca.pem").expect("read valid CA");
     mixed_pem.extend_from_slice(
         b"-----BEGIN PRIVATE KEY-----\nU0VDUkVUX0tFWV9CWVRFUw==\n-----END PRIVATE KEY-----\n",
@@ -114,6 +120,7 @@ async fn invalid_ca_bundles_fail_before_readiness() {
         (empty.as_path(), "empty"),
         (malformed.as_path(), "parsing"),
         (invalid_der.as_path(), "building"),
+        (indented.as_path(), "parsing"),
         (mixed.as_path(), "parsing"),
     ] {
         assert_ca_rejected(path, kind).await;

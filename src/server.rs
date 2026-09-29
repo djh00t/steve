@@ -238,7 +238,8 @@ pub async fn run(
         let mut start = None;
         let mut offset = 0;
         for line in pem.split_inclusive(|byte| *byte == b'\n') {
-            let content = line.trim_ascii();
+            let content = line.strip_suffix(b"\n").unwrap_or(line);
+            let content = content.strip_suffix(b"\r").unwrap_or(content);
             match (start, content) {
                 (None, b"") => {}
                 (None, b"-----BEGIN CERTIFICATE-----") => start = Some(offset),
