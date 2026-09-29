@@ -92,6 +92,77 @@ jobs:
           path: target/m1-release-gate.json
           if-no-files-found: error
 
+  windows-ntfs-process-semantics:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      M1_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PYTHONOPTIMIZE: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check exact candidate and runner tests
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne $env:M1_EXPECTED_SHA) { throw "candidate SHA mismatch" }
+          python -B -m unittest discover -s scripts -p test_m1_release_gate.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build exact Windows candidate
+        if: always()
+        run: cargo build --locked --all-features
+      - name: Probe runner NTFS process semantics
+        if: always()
+        shell: pwsh
+        run: |
+          $parent = Join-Path $env:RUNNER_TEMP "steve-m1-ntfs"
+          New-Item -ItemType Directory -Path $parent -ErrorAction Stop | Out-Null
+          $deployment = Join-Path $parent "unused-accounting-root"
+          $evidence = Join-Path $env:RUNNER_TEMP "m1-windows-ntfs-ci-process-semantics.json"
+          python -B scripts/m1_release_gate.py --qualify-target $parent --deployment-path $deployment --candidate-binary target/debug/steve.exe --expected-sha $env:M1_EXPECTED_SHA --evidence-scope ci-runner-process-semantics --output $evidence
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify runner evidence binding and release rejection
+        if: always()
+        shell: bash
+        run: |
+          python -B - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, "scripts")
+          import m1_release_gate as gate
+
+          artifact = Path(os.environ["RUNNER_TEMP"]) / "m1-windows-ntfs-ci-process-semantics.json"
+          evidence = json.loads(artifact.read_text(encoding="utf-8"))
+          gate.require(evidence.get("source_sha") == os.environ["M1_EXPECTED_SHA"], "CI evidence SHA mismatch")
+          gate.require(evidence.get("binary_sha256") == gate.sha256(Path("target/debug/steve.exe")), "CI binary hash mismatch")
+          gate.require(evidence.get("evidence_scope") == "ci-runner-process-semantics", "CI evidence scope mismatch")
+          gate.require(evidence.get("filesystem") == "ntfs", "CI runner filesystem is not NTFS")
+          volume = evidence.get("target_volume", {})
+          gate.require(volume.get("filesystem", "").upper() == "NTFS" and volume.get("guid") and volume.get("root"), "CI volume identity missing")
+          gate.require(volume.get("drive_type") in {2, 3, 6}, "CI volume is not local")
+          try:
+              gate.load_target_qualification(artifact, os.environ["M1_EXPECTED_SHA"], evidence["binary_sha256"], Path(evidence["deployment_path"]))
+          except RuntimeError as error:
+              gate.require("scope" in str(error), f"CI artifact rejection did not use scope: {error}")
+          else:
+              raise RuntimeError("CI artifact was accepted as deployment evidence")
+          gate.require(evidence.get("status") == "PASS", f"CI process probe failed: {evidence.get('error')}")
+          gate.require(evidence.get("checks") == {name: "PASS" for name in gate.TARGET_CHECKS}, "CI process checks incomplete")
+          gate.require(evidence.get("target_volume") == evidence.get("intended_volume") == evidence.get("probe_volume"), "CI volume identity mismatch")
+          PY
+      - name: Upload Windows runner process evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-windows-ntfs-ci-process-semantics
+          path: ${{ runner.temp }}/m1-windows-ntfs-ci-process-semantics.json
+          if-no-files-found: warn
+
   cross-platform:
     strategy:
       matrix:

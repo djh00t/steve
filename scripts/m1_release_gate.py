@@ -2,6 +2,8 @@
 """Run Steve's fixed M1 evidence set in a browser or headlessly."""
 
 import argparse
+import ctypes
+from ctypes import wintypes
 from datetime import datetime, timezone
 import hashlib
 import importlib.metadata
@@ -317,6 +319,261 @@ def hosted_qualification(repo, source_sha, env=None, owner=None):
     }
 
 
+class WindowsProbe:
+    """Native handles used only by the Windows qualification probe."""
+
+    def __init__(self):
+        self.api = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class Overlapped(ctypes.Structure):
+            _fields_ = [
+                ("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+                ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+                ("hEvent", wintypes.HANDLE),
+            ]
+
+        self.overlapped = Overlapped
+        handle, dword, boolean = wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL
+        pointer, wide = ctypes.c_void_p, wintypes.LPCWSTR
+        signatures = {
+            "CreateFileW": ([wide, dword, dword, pointer, dword, dword, handle], handle),
+            "CloseHandle": ([handle], boolean),
+            "FlushFileBuffers": ([handle], boolean),
+            "LockFileEx": ([handle, dword, dword, dword, dword, pointer], boolean),
+            "UnlockFileEx": ([handle, dword, dword, dword, pointer], boolean),
+            "WriteFile": ([handle, pointer, dword, pointer, pointer], boolean),
+            "MoveFileExW": ([wide, wide, dword], boolean),
+            "ReplaceFileW": ([wide, wide, wide, dword, pointer, pointer], boolean),
+            "GetVolumePathNameW": ([wide, wintypes.LPWSTR, dword], boolean),
+            "GetVolumeNameForVolumeMountPointW": ([wide, wintypes.LPWSTR, dword], boolean),
+            "GetVolumeInformationW": (
+                [wide, wintypes.LPWSTR, dword, pointer, pointer, pointer, wintypes.LPWSTR, dword],
+                boolean,
+            ),
+            "GetDriveTypeW": ([wide], wintypes.UINT),
+        }
+        for name, (arguments, result) in signatures.items():
+            function = getattr(self.api, name)
+            function.argtypes, function.restype = arguments, result
+
+    def checked(self, name, *arguments, context=""):
+        result = getattr(self.api, name)(*arguments)
+        if not result:
+            error = ctypes.WinError(ctypes.get_last_error())
+            error.strerror = f"{name} {context}: {error.strerror}"
+            raise error
+        return result
+
+    def open(self, path, create=False, directory=False):
+        # Share deletion so a locked staging handle can survive publication.
+        handle = self.api.CreateFileW(
+            str(path), 0xC0000000, 7, None, 2 if create else 3,
+            0x02000000 if directory else 0x80, None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            error = ctypes.WinError(ctypes.get_last_error())
+            error.strerror = f"CreateFileW {path}: {error.strerror}"
+            raise error
+        return handle
+
+    def lock(self, handle):
+        overlapped = self.overlapped()
+        if self.api.LockFileEx(handle, 3, 0, 0xFFFFFFFF, 0, ctypes.byref(overlapped)):
+            return True
+        code = ctypes.get_last_error()
+        if code == 33:  # ERROR_LOCK_VIOLATION is the only accepted contention result.
+            return False
+        error = ctypes.WinError(code)
+        error.strerror = f"LockFileEx: {error.strerror}"
+        raise error
+
+    def unlock(self, handle):
+        self.checked("UnlockFileEx", handle, 0, 0xFFFFFFFF, 0, ctypes.byref(self.overlapped()))
+
+    def append(self, handle, data):
+        written = wintypes.DWORD()
+        self.checked("WriteFile", handle, data, len(data), ctypes.byref(written), None)
+        require(written.value == len(data), "native probe write was incomplete")
+        self.checked("FlushFileBuffers", handle, context="file sync")
+
+    def write_synced(self, path, data):
+        handle = self.open(path, create=True)
+        try:
+            self.append(handle, data)
+        finally:
+            self.checked("CloseHandle", handle)
+
+    def sync_directory(self, path):
+        try:
+            handle = self.open(path, directory=True)
+            try:
+                self.checked("FlushFileBuffers", handle, context="directory sync")
+            finally:
+                self.checked("CloseHandle", handle)
+        except OSError as error:
+            error.strerror = f"directory sync {path}: {error.strerror}"
+            raise
+
+
+def windows_volume(path):
+    native = WindowsProbe()
+    root, guid, filesystem = (ctypes.create_unicode_buffer(32768) for _ in range(3))
+    serial, maximum, flags = (wintypes.DWORD() for _ in range(3))
+    native.checked("GetVolumePathNameW", str(path), root, len(root))
+    native.checked("GetVolumeNameForVolumeMountPointW", root.value, guid, len(guid))
+    native.checked(
+        "GetVolumeInformationW", root.value, None, 0, ctypes.byref(serial),
+        ctypes.byref(maximum), ctypes.byref(flags), filesystem, len(filesystem),
+    )
+    drive_type = native.checked("GetDriveTypeW", root.value)
+    require(drive_type in {2, 3, 6}, "Windows volume is unidentified or network storage")
+    require(filesystem.value.upper() == "NTFS", f"Windows filesystem must be NTFS: {filesystem.value}")
+    require(root.value and guid.value, "Windows volume identity is incomplete")
+    return {
+        "root": root.value, "guid": guid.value, "serial": serial.value,
+        "filesystem": filesystem.value, "flags": flags.value, "drive_type": drive_type,
+    }
+
+
+def wait_probe_marker(path, child=None):
+    deadline = time.monotonic() + 5
+    while not path.exists():
+        if child is not None and child.poll() is not None:
+            output, _ = child.communicate(timeout=2)
+            raise RuntimeError(f"Windows probe child exited before {path.name}: {output}")
+        require(time.monotonic() < deadline, f"Windows probe timed out waiting for {path.name}")
+        time.sleep(0.02)
+
+
+def windows_probe_child(action, path):
+    path = Path(path)
+    native = WindowsProbe()
+    if action == "read":
+        require(path.read_bytes() == b"frame-1\nframe-2\n", "append was not visible across processes")
+        return
+    handle = native.open(path, create=action == "publish")
+    try:
+        locked = native.lock(handle)
+        if action == "acquire":
+            deadline = time.monotonic() + 5
+            while not locked:
+                require(time.monotonic() < deadline, "Windows lock acquisition timed out")
+                time.sleep(0.02)
+                locked = native.lock(handle)
+        if action in {"blocked", "acquire"}:
+            require(locked == (action == "acquire"), f"Windows contender {action} result is wrong")
+            if locked:
+                native.unlock(handle)
+            return
+        require(locked, "Windows holder could not acquire exclusive lock")
+        path.with_suffix(".ready").write_text("ready", encoding="utf-8")
+        if action == "hold":
+            time.sleep(60)
+            raise RuntimeError("Windows death holder was not terminated")
+        require(action == "publish", "unknown Windows probe child action")
+        native.append(handle, b"frame-1\n")
+        wait_probe_marker(path.parent / "publish.signal")
+        journal = path.parent / "journal"
+        native.checked("MoveFileExW", str(path), str(journal), 8)
+        published = path.parent / "state.json"
+        initial = path.parent / "state.tmp"
+        native.write_synced(initial, b'{"revision":1,"coverage":[["generation-1",1,"digest-1"]]}')
+        native.checked("MoveFileExW", str(initial), str(published), 8)
+        (path.parent / "published.ready").write_text("ready", encoding="utf-8")
+        wait_probe_marker(path.parent / "replace.signal")
+        replacement = path.parent / "state.next"
+        native.write_synced(replacement, b'{"revision":2,"coverage":[["generation-1",2,"digest-2"]]}')
+        native.checked("ReplaceFileW", str(published), str(replacement), None, 0, None, None)
+        native.append(handle, b"frame-2\n")
+        (path.parent / "replaced.ready").write_text("ready", encoding="utf-8")
+        wait_probe_marker(path.parent / "release.signal")
+        native.unlock(handle)
+        (path.parent / "released.ready").write_text("ready", encoding="utf-8")
+        # Keep the handle and holder alive until a different process reacquires.
+        wait_probe_marker(path.parent / "done.signal")
+    finally:
+        native.checked("CloseHandle", handle)
+
+
+def windows_process_checks(probe):
+    """Exercise locking/publication with children; directory durability is checked by the caller."""
+    checks, processes = {}, {}
+    children = []
+
+    def start(action, path):
+        child = subprocess.Popen(
+            [sys.executable, "-B", "-c",
+             "import sys; sys.path.insert(0,sys.argv[1]); import m1_release_gate as g; "
+             "g.windows_probe_child(sys.argv[2],sys.argv[3])",
+             str(Path(__file__).resolve().parent), action, str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        children.append(child)
+        return child
+
+    def finish(child, name, terminated=False):
+        output, _ = child.communicate(timeout=5)
+        require(terminated or child.returncode == 0, f"Windows probe {name} failed: {output}")
+        processes[name] = {
+            "status": "PASS", "pid": child.pid, "exit_code": child.returncode,
+            "terminated_by_probe": terminated,
+        }
+
+    def contender(action, path, name):
+        finish(start(action, path), name)
+
+    staging, journal = probe / "journal.staging", probe / "journal"
+    try:
+        holder = start("publish", staging)
+        wait_probe_marker(staging.with_suffix(".ready"), holder)
+        contender("blocked", staging, "staging_contender")
+        (probe / "publish.signal").write_text("publish", encoding="utf-8")
+        wait_probe_marker(probe / "published.ready", holder)
+        contender("blocked", journal, "published_contender")
+        require(holder.poll() is None, "Windows holder exited during publication")
+        checks.update(exclusive_lock="PASS", atomic_publication="PASS", file_sync="PASS")
+        require(not staging.exists(), "locked staging journal was not published")
+        stale = json.loads((probe / "state.json").read_text(encoding="utf-8"))
+        require(stale == {"revision": 1, "coverage": [["generation-1", 1, "digest-1"]]},
+                "initial revision/coverage publication failed")
+        (probe / "replace.signal").write_text("replace", encoding="utf-8")
+        wait_probe_marker(probe / "replaced.ready", holder)
+        contender("blocked", journal, "replacement_contender")
+        require(holder.poll() is None, "Windows holder exited during replacement")
+        current = json.loads((probe / "state.json").read_text(encoding="utf-8"))
+        require(current == {"revision": 2, "coverage": [["generation-1", 2, "digest-2"]]},
+                "revision/coverage replacement failed")
+        checks["revisioned_publication"] = "PASS"
+        (probe / "release.signal").write_text("release", encoding="utf-8")
+        wait_probe_marker(probe / "released.ready", holder)
+        contender("acquire", journal, "explicit_release_contender")
+        require(holder.poll() is None, "holder closed before explicit release was demonstrated")
+        contender("read", journal, "append_reader")
+        checks["append_visibility"] = "PASS"
+        (probe / "done.signal").write_text("done", encoding="utf-8")
+        finish(holder, "publication_holder")
+
+        ready = journal.with_suffix(".ready")
+        ready.unlink()
+        death_holder = start("hold", journal)
+        wait_probe_marker(ready, death_holder)
+        contender("blocked", journal, "death_contender")
+        death_holder.kill()
+        finish(death_holder, "lock_holder_process_death", terminated=True)
+        contender("acquire", journal, "death_successor")
+        checks["process_death_lock_release"] = "PASS"
+        return checks, processes
+    finally:
+        cleanup_errors = []
+        for child in children:
+            try:
+                stop_process_group(child)
+                child.communicate(timeout=2)
+            except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+                cleanup_errors.append(str(error))
+        require(not cleanup_errors, f"Windows child cleanup failed: {cleanup_errors}")
+
+
 def filesystem_type(path):
     if sys.platform == "darwin":
         device = path.stat().st_dev
@@ -355,7 +612,65 @@ def normalized_deployment_path(deployment_parent, deployment_path):
     return normalized
 
 
-def qualify_target(deployment_parent, deployment_path, source_sha, binary):
+def qualify_target_windows(deployment_parent, deployment_path, source_sha, binary, evidence_scope):
+    require(deployment_parent.is_absolute(), "target deployment parent must be absolute")
+    requested_parent = Path(os.path.normpath(str(deployment_parent)))
+    deployment_path = normalized_deployment_path(requested_parent, deployment_path)
+    parent = requested_parent.resolve(strict=True)
+    require(parent.is_dir(), f"target deployment parent is not a directory: {parent}")
+    require(binary.is_file(), f"candidate binary is missing: {binary}")
+    volume = windows_volume(parent)
+    relative = deployment_path.relative_to(requested_parent)
+    current = parent
+    for part in relative.parts:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        require(not metadata.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                f"intended deployment path contains reparse point: {current}")
+        require(stat.S_ISDIR(metadata.st_mode), f"intended deployment path component is not a directory: {current}")
+        require(windows_volume(current) == volume, "intended deployment path crosses Windows volumes")
+    with tempfile.TemporaryDirectory(prefix="steve-m1-target-probe-", dir=parent) as temp:
+        probe = Path(temp)
+        require(probe != deployment_path, "probe path must differ from intended deployment path")
+        require(not any(probe.iterdir()), "target probe directory must start empty")
+        probe_volume = windows_volume(probe)
+        require(probe_volume == volume, "probe is on a different Windows volume")
+        checks, processes = windows_process_checks(probe)
+        WindowsProbe().sync_directory(probe)
+        checks["directory_sync"] = "PASS"
+        probe_device = probe.stat().st_dev
+    require(set(checks) == TARGET_CHECKS, "target probe did not execute every check")
+    device = parent.stat().st_dev
+    return {
+        "probe": TARGET_PROBE, "evidence_scope": evidence_scope, "status": "PASS",
+        "source_sha": source_sha, "binary_path": str(binary.resolve()),
+        "binary_sha256": sha256(binary), "deployment_path": str(deployment_path),
+        "canonical_deployment_path": str(parent / relative),
+        "requested_target_parent": str(requested_parent), "target_parent": str(parent),
+        "probe_path": str(probe), "observed_at": datetime.now(timezone.utc).isoformat(),
+        "platform": platform.platform(), "filesystem": volume["filesystem"].lower(),
+        "target_device": device, "intended_device": device, "probe_device": probe_device,
+        "target_volume": volume, "intended_volume": volume, "probe_volume": probe_volume,
+        "tool_versions": {
+            "python": sys.version, "rustc": command_output(["rustc", "-Vv"], parent),
+            "cargo": command_output([os.environ.get("CARGO", "cargo"), "--version"], parent),
+        },
+        "processes": processes, "checks": checks,
+    }
+
+
+def qualify_target(
+    deployment_parent, deployment_path, source_sha, binary, evidence_scope="deployment-target"
+):
+    require(
+        evidence_scope in {"deployment-target", "ci-runner-process-semantics"},
+        "unknown target evidence scope",
+    )
+    if os.name == "nt":
+        return qualify_target_windows(deployment_parent, deployment_path, source_sha, binary, evidence_scope)
     require(deployment_parent.is_absolute(), "target deployment parent must be absolute")
     requested_parent = Path(os.path.normpath(str(deployment_parent)))
     deployment_path = normalized_deployment_path(requested_parent, deployment_path)
@@ -476,6 +791,7 @@ def qualify_target(deployment_parent, deployment_path, source_sha, binary):
     require(set(checks) == TARGET_CHECKS, "target probe did not execute every check")
     return {
         "probe": TARGET_PROBE,
+        "evidence_scope": evidence_scope,
         "status": "PASS",
         "source_sha": source_sha,
         "binary_path": str(binary.resolve()),
@@ -508,6 +824,8 @@ def load_target_qualification(path, source_sha, binary_hash, deployment_path):
         value = json.load(source)
     require(isinstance(value, dict), f"qualification must be an object: {path}")
     require(value.get("probe") == TARGET_PROBE, "target qualification probe is missing or unknown")
+    require(value.get("evidence_scope") == "deployment-target",
+            "target qualification evidence scope must be deployment-target")
     for name in ("source_sha", "binary_sha256", "binary_path", "deployment_path",
                  "canonical_deployment_path", "requested_target_parent", "target_parent",
                  "probe_path", "platform", "filesystem"):
@@ -534,6 +852,18 @@ def load_target_qualification(path, source_sha, binary_hash, deployment_path):
         == value.get("probe_device"),
         "target qualification probe is on a different filesystem",
     )
+    if str(value.get("platform", "")).startswith("Windows") or value.get("filesystem") == "ntfs":
+        volume = value.get("target_volume")
+        require(
+            isinstance(volume, dict)
+            and volume == value.get("intended_volume") == value.get("probe_volume")
+            and all(isinstance(volume.get(key), str) and volume[key] for key in ("root", "guid", "filesystem"))
+            and volume["filesystem"].upper() == "NTFS"
+            and value.get("filesystem") == "ntfs"
+            and all(type(volume.get(key)) is int and 0 <= volume[key] <= 0xFFFFFFFF for key in ("serial", "flags"))
+            and volume.get("drive_type") in {2, 3, 6},
+            "target qualification Windows volume identity is incomplete or unsupported",
+        )
     require(
         value.get("probe_path") not in {str(deployment_path), value.get("canonical_deployment_path"), value.get("target_parent")},
         "target qualification used the deployment path as its probe",
@@ -1142,6 +1472,10 @@ def parse_args():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--candidate-binary", type=Path)
     parser.add_argument(
+        "--evidence-scope", choices=("deployment-target", "ci-runner-process-semantics"),
+        default="deployment-target",
+    )
+    parser.add_argument(
         "--deployment-path",
         type=Path,
         default=os.environ.get("M1_DEPLOYMENT_PATH"),
@@ -1211,17 +1545,29 @@ def main():
                 args.deployment_path,
                 args.expected_sha,
                 args.candidate_binary.resolve(),
+                evidence_scope=args.evidence_scope,
             )
         except Exception as error:
             result = {
                 "source_sha": args.expected_sha,
+                "probe": TARGET_PROBE,
                 "deployment_path": str(args.deployment_path),
+                "evidence_scope": args.evidence_scope,
                 "status": "FAIL",
                 "functional": "FAIL",
                 "release_eligible": False,
                 "observed_at": datetime.now(timezone.utc).isoformat(),
                 "error": str(error),
             }
+            if args.candidate_binary and args.candidate_binary.is_file():
+                result["binary_path"] = str(args.candidate_binary.resolve())
+                result["binary_sha256"] = sha256(args.candidate_binary)
+            if os.name == "nt":
+                try:
+                    result["target_volume"] = windows_volume(args.qualify_target.resolve(strict=True))
+                    result["filesystem"] = result["target_volume"]["filesystem"].lower()
+                except (OSError, RuntimeError):
+                    pass
             write_evidence(args.output.resolve(), result)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 1

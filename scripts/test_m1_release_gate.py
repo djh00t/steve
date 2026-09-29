@@ -638,6 +638,7 @@ class ReleaseGateTests(unittest.TestCase):
             binary = parent / "steve"
             binary.write_bytes(b"candidate")
             evidence = gate.qualify_target(parent, deployment, "abc", binary)
+            self.assertEqual(evidence.get("evidence_scope"), "deployment-target")
             self.assertEqual(evidence["status"], "PASS")
             self.assertEqual(evidence["source_sha"], "abc")
             self.assertEqual(evidence["target_parent"], str(parent))
@@ -737,6 +738,122 @@ class ReleaseGateTests(unittest.TestCase):
             (parent / "escape").symlink_to("/dev", target_is_directory=True)
             with self.assertRaisesRegex(RuntimeError, "symlink"):
                 gate.qualify_target(parent, parent / "escape", "abc", binary)
+
+    def test_target_evidence_requires_deployment_scope_even_when_ci_file_is_renamed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp).resolve()
+            deployment = parent / "accounting"
+            path = parent / "m1-target-qualification.json"
+            binary_hash = "0" * 64
+            evidence = {
+                "probe": "steve-m1-target-v1", "status": "PASS",
+                "source_sha": "abc", "binary_sha256": binary_hash,
+                "binary_path": str(parent / "steve"),
+                "deployment_path": str(deployment),
+                "canonical_deployment_path": str(deployment),
+                "target_parent": str(parent), "requested_target_parent": str(parent),
+                "target_device": 1, "intended_device": 1, "probe_device": 1,
+                "probe_path": str(parent / "probe"),
+                "platform": "Linux-test", "filesystem": "ext4",
+                "observed_at": "2026-09-30T00:00:00+00:00",
+                "tool_versions": {"python": "3", "rustc": "1", "cargo": "1"},
+                "processes": {"lock_holder_process_death": {"status": "PASS"}},
+                "checks": {name: "PASS" for name in gate.TARGET_CHECKS},
+            }
+            for scope in (None, "ci-runner-process-semantics", "unknown"):
+                with self.subTest(scope=scope):
+                    evidence["evidence_scope"] = scope
+                    path.write_text(json.dumps(evidence), encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "scope"):
+                        gate.load_target_qualification(path, "abc", binary_hash, deployment)
+            evidence["evidence_scope"] = "deployment-target"
+            path.write_text(json.dumps(evidence), encoding="utf-8")
+            self.assertEqual(
+                gate.load_target_qualification(path, "abc", binary_hash, deployment)["status"],
+                "PASS",
+            )
+            evidence["platform"] = "Windows-11"
+            evidence["filesystem"] = "ntfs"
+            volume = {
+                "root": "C:\\", "guid": "\\\\?\\Volume{test}\\", "serial": 1,
+                "filesystem": "NTFS", "flags": 3, "drive_type": 3,
+            }
+            evidence.update(target_volume=volume, intended_volume=volume, probe_volume=volume)
+            path.write_text(json.dumps(evidence), encoding="utf-8")
+            self.assertEqual(gate.load_target_qualification(path, "abc", binary_hash, deployment)["status"], "PASS")
+            for field in ("root", "guid", "serial", "filesystem", "flags", "drive_type"):
+                with self.subTest(missing_volume_field=field):
+                    incomplete = {key: val for key, val in volume.items() if key != field}
+                    broken = {**evidence, "target_volume": incomplete, "intended_volume": incomplete, "probe_volume": incomplete}
+                    path.write_text(json.dumps(broken), encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "volume"):
+                        gate.load_target_qualification(path, "abc", binary_hash, deployment)
+            for patch in ({"filesystem": "ReFS"}, {"drive_type": 4}, {"guid": ""}):
+                with self.subTest(volume_patch=patch):
+                    bad_volume = {**volume, **patch}
+                    broken = {**evidence, "target_volume": bad_volume, "intended_volume": bad_volume, "probe_volume": bad_volume}
+                    path.write_text(json.dumps(broken), encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, "volume"):
+                        gate.load_target_qualification(path, "abc", binary_hash, deployment)
+
+    def test_failed_ci_probe_retains_scope_and_binary_binding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp).resolve()
+            binary, artifact = parent / "steve", parent / "ci-evidence.json"
+            binary.write_bytes(b"candidate")
+            command = [
+                sys.executable, "-B", str(SCRIPT), "--qualify-target", str(parent),
+                "--deployment-path", str(parent / "unused-root"),
+                "--candidate-binary", str(binary), "--expected-sha", "wrong-sha",
+                "--evidence-scope", "ci-runner-process-semantics", "--output", str(artifact),
+            ]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            evidence = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertEqual(evidence["status"], "FAIL")
+            self.assertEqual(evidence["source_sha"], "wrong-sha")
+            self.assertEqual(evidence["evidence_scope"], "ci-runner-process-semantics")
+            self.assertEqual(evidence["binary_sha256"], gate.sha256(binary))
+            with self.assertRaisesRegex(RuntimeError, "scope"):
+                gate.load_target_qualification(artifact, "wrong-sha", gate.sha256(binary), parent / "unused-root")
+
+    @unittest.skipUnless(os.name == "nt", "native NTFS check requires Windows")
+    def test_windows_ntfs_process_checks_use_real_children_and_release_locks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            probe = Path(temp).resolve()
+            volume = gate.windows_volume(probe)
+            self.assertEqual(volume["filesystem"].upper(), "NTFS")
+            checks, processes = gate.windows_process_checks(probe)
+            self.assertEqual(set(checks), gate.TARGET_CHECKS - {"directory_sync"})
+            self.assertTrue(all(value == "PASS" for value in checks.values()))
+            self.assertTrue(all(item["pid"] != os.getpid() for item in processes.values()))
+            self.assertTrue(all(item["status"] == "PASS" for item in processes.values()))
+            self.assertTrue(all(item["exit_code"] is not None for item in processes.values()))
+            self.assertTrue(processes["lock_holder_process_death"]["terminated_by_probe"])
+
+    @unittest.skipUnless(os.name == "nt", "native NTFS check requires Windows")
+    def test_windows_full_probe_qualifies_or_rejects_unsupported_directory_sync(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp).resolve()
+            binary = parent / "steve.exe"
+            binary.write_bytes(b"candidate")
+            deployment = parent / "accounting"
+            try:
+                evidence = gate.qualify_target(
+                    parent, deployment, "abc", binary,
+                    evidence_scope="ci-runner-process-semantics",
+                )
+            except OSError as error:
+                self.assertIn("directory sync", str(error))
+                self.assertIsNotNone(error.winerror)
+            else:
+                self.assertEqual(evidence["status"], "PASS")
+                self.assertEqual(evidence["filesystem"], "ntfs")
+                self.assertEqual(evidence["evidence_scope"], "ci-runner-process-semantics")
+                self.assertEqual(evidence["target_volume"], evidence["probe_volume"])
+                self.assertEqual(evidence["binary_sha256"], gate.sha256(binary))
+            self.assertFalse(deployment.exists())
+            self.assertFalse(list(parent.glob("steve-m1-target-probe-*")))
 
     def test_target_evidence_rejects_a_status_only_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -884,7 +1001,8 @@ class ReleaseGateTests(unittest.TestCase):
             root = Path(temp)
             output = root / "evidence.json"
             env = os.environ.copy()
-            env["M1_DEPLOYMENT_PATH"] = "/srv/steve/accounting"
+            env.pop("M1_EXPECTED_SHA", None)
+            env["M1_DEPLOYMENT_PATH"] = str(Path(temp).resolve() / "accounting")
             result = subprocess.run(
                 [
                     sys.executable,
@@ -906,13 +1024,14 @@ class ReleaseGateTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             evidence = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(evidence["functional"], "FAIL")
+            self.assertIsNone(evidence["source_sha"])
             self.assertIn("git", evidence["error"])
 
     def test_cli_timeout_preflight_failure_writes_fail_json(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "evidence.json"
             env = os.environ.copy()
-            env["M1_DEPLOYMENT_PATH"] = "/srv/steve/accounting"
+            env["M1_DEPLOYMENT_PATH"] = str(Path(temp).resolve() / "accounting")
             result = subprocess.run(
                 [
                     sys.executable,
