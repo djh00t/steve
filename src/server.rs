@@ -1057,7 +1057,10 @@ mod tests {
     async fn messages_test_state(upstream_url: String) -> (Arc<AppState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
-        cfg.database.url = "sqlite::memory:".into();
+        cfg.database.url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("steve.db").display()
+        );
         cfg.object_storage.root = dir.path().join("objects").to_string_lossy().into_owned();
         let accounting_root = dir.path().join("accounting");
         AccountingCoordinator::provision(&accounting_root).unwrap();

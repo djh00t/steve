@@ -6,6 +6,8 @@ use std::{
 };
 
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
+/// Keeps retry scheduling finite and well within monotonic clock arithmetic.
+const MAX_ACCOUNTING_RETRY_DURATION_MS: u64 = 3_600_000;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -71,6 +73,9 @@ pub struct QueueConfig {
     pub accounting: usize,
     pub accounting_journal: String,
     pub accounting_journal_queue: usize,
+    pub accounting_operation_timeout_ms: u64,
+    pub accounting_retry_deadline_ms: u64,
+    pub accounting_retry_interval_ms: u64,
     pub history: usize,
     pub telemetry: usize,
 }
@@ -125,6 +130,9 @@ impl Default for QueueConfig {
             accounting: 4096,
             accounting_journal: "/var/lib/steve/accounting".into(),
             accounting_journal_queue: 1024,
+            accounting_operation_timeout_ms: 1_000,
+            accounting_retry_deadline_ms: 5_000,
+            accounting_retry_interval_ms: 100,
             history: 2048,
             telemetry: 8192,
         }
@@ -197,7 +205,31 @@ impl Config {
             cfg.logging.level = v;
         }
 
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let queues = &self.queues;
+        if queues.accounting_operation_timeout_ms == 0
+            || queues.accounting_retry_deadline_ms == 0
+            || queues.accounting_retry_interval_ms == 0
+        {
+            anyhow::bail!("accounting retry durations must be positive");
+        }
+        if queues.accounting_operation_timeout_ms > MAX_ACCOUNTING_RETRY_DURATION_MS
+            || queues.accounting_retry_deadline_ms > MAX_ACCOUNTING_RETRY_DURATION_MS
+            || queues.accounting_retry_interval_ms > MAX_ACCOUNTING_RETRY_DURATION_MS
+        {
+            anyhow::bail!("accounting retry durations must not exceed 3600000 milliseconds");
+        }
+        if queues.accounting_operation_timeout_ms > queues.accounting_retry_deadline_ms {
+            anyhow::bail!("accounting operation timeout must not exceed retry deadline");
+        }
+        if queues.accounting_retry_interval_ms > queues.accounting_retry_deadline_ms {
+            anyhow::bail!("accounting retry interval must not exceed retry deadline");
+        }
+        Ok(())
     }
 
     pub fn source_display(&self) -> String {
@@ -273,5 +305,32 @@ mod tests {
             ..DatabaseConfig::default()
         };
         assert_eq!(config.backend(), "postgres");
+    }
+
+    #[test]
+    fn accounting_retry_bounds_are_validated() {
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok());
+
+        cfg.queues.accounting_operation_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
+        cfg.queues.accounting_operation_timeout_ms = 6_000;
+        assert!(cfg.validate().is_err());
+
+        cfg.queues.accounting_operation_timeout_ms = 1_000;
+        cfg.queues.accounting_retry_interval_ms = 6_000;
+        assert!(cfg.validate().is_err());
+
+        cfg = Config::default();
+        cfg.queues.accounting_retry_deadline_ms = MAX_ACCOUNTING_RETRY_DURATION_MS + 1;
+        assert!(cfg.validate().is_err());
+        cfg = Config::default();
+        cfg.queues.accounting_operation_timeout_ms = MAX_ACCOUNTING_RETRY_DURATION_MS + 1;
+        cfg.queues.accounting_retry_deadline_ms = MAX_ACCOUNTING_RETRY_DURATION_MS + 1;
+        assert!(cfg.validate().is_err());
+        cfg = Config::default();
+        cfg.queues.accounting_retry_interval_ms = MAX_ACCOUNTING_RETRY_DURATION_MS + 1;
+        cfg.queues.accounting_retry_deadline_ms = MAX_ACCOUNTING_RETRY_DURATION_MS + 1;
+        assert!(cfg.validate().is_err());
     }
 }

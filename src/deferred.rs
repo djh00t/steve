@@ -1,15 +1,18 @@
 use crate::{
     accounting::{AccountingCoordinator, AccountingEvent},
     config::Config,
-    storage::{DatabasePool, ObjectStorage},
+    storage::{DatabasePool, InsertBackgroundEvent, ObjectStorage},
 };
 use anyhow::Result;
 use bytes::Bytes;
 use serde::Serialize;
 use serde_json::Value;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -51,6 +54,13 @@ struct HistoryEvent {
     data: Bytes,
 }
 
+#[derive(Clone, Copy)]
+struct AccountingRetryPolicy {
+    operation_timeout: Duration,
+    retry_deadline: Duration,
+    retry_interval: Duration,
+}
+
 impl DeferredQueues {
     pub async fn start(
         cfg: &Config,
@@ -58,6 +68,14 @@ impl DeferredQueues {
         objects: ObjectStorage,
     ) -> Result<Self> {
         let stats = Arc::new(QueueStats::default());
+        AccountingCoordinator::reconcile_startup(
+            std::path::Path::new(&cfg.queues.accounting_journal),
+            &background_db,
+            std::time::Duration::from_millis(cfg.queues.accounting_operation_timeout_ms),
+            std::time::Duration::from_millis(cfg.queues.accounting_retry_deadline_ms),
+            std::time::Duration::from_millis(cfg.queues.accounting_retry_interval_ms),
+        )
+        .await?;
         let accounting_journal = AccountingCoordinator::start(
             std::path::Path::new(&cfg.queues.accounting_journal),
             cfg.queues.accounting_journal_queue,
@@ -71,24 +89,37 @@ impl DeferredQueues {
 
         let journal_for_worker = accounting_journal.clone();
         let stats_for_worker = stats.clone();
+        let accounting_retry = AccountingRetryPolicy {
+            operation_timeout: Duration::from_millis(cfg.queues.accounting_operation_timeout_ms),
+            retry_deadline: Duration::from_millis(cfg.queues.accounting_retry_deadline_ms),
+            retry_interval: Duration::from_millis(cfg.queues.accounting_retry_interval_ms),
+        };
         tokio::spawn(async move {
             while let Some(event) = accounting_rx.recv().await {
-                let result = background_db
-                    .insert_background_event(
-                        &event.id,
-                        &event.kind,
-                        &event.payload.to_string(),
-                        &event.created_at,
-                    )
-                    .await;
-                if let Err(err) = result {
-                    error!(%err, event_id = %event.id, "background accounting write failed");
-                    spill_accounting_event(
-                        &journal_for_worker,
-                        &stats_for_worker,
-                        event,
-                        "database_write_failed",
-                    );
+                let outcome =
+                    insert_accounting_event(&background_db, &event, accounting_retry).await;
+                match outcome {
+                    InsertBackgroundEvent::Inserted | InsertBackgroundEvent::DuplicateIdentical => {
+                    }
+                    InsertBackgroundEvent::DuplicateConflict { .. } => {
+                        error!(event_id = %event.id, "background accounting content conflict");
+                        spill_accounting_event(
+                            &journal_for_worker,
+                            &stats_for_worker,
+                            event,
+                            "database_content_conflict",
+                        );
+                    }
+                    InsertBackgroundEvent::Failed { error }
+                    | InsertBackgroundEvent::Unknown { error } => {
+                        error!(%error, event_id = %event.id, "background accounting write failed");
+                        spill_accounting_event(
+                            &journal_for_worker,
+                            &stats_for_worker,
+                            event,
+                            "database_write_failed",
+                        );
+                    }
                 }
             }
         });
@@ -172,7 +203,7 @@ fn spill_accounting_event(
             warn!(
                 event_id = %event_id,
                 reason,
-                "accounting event spilled to durable journal"
+                "accounting event queued for durable journal"
             );
         }
         Err(_event) => {
@@ -183,6 +214,50 @@ fn spill_accounting_event(
                 "accounting event could not be queued or journaled"
             );
         }
+    }
+}
+
+async fn insert_accounting_event(
+    database: &DatabasePool,
+    event: &AccountingEvent,
+    policy: AccountingRetryPolicy,
+) -> InsertBackgroundEvent {
+    let Some(deadline) = Instant::now().checked_add(policy.retry_deadline) else {
+        return InsertBackgroundEvent::Unknown {
+            error: "accounting retry deadline is out of range".into(),
+        };
+    };
+    let payload = event.payload.to_string();
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return InsertBackgroundEvent::Unknown {
+                error: "accounting retry deadline exhausted".into(),
+            };
+        };
+        let bound = policy.operation_timeout.min(remaining);
+        let outcome = match tokio::time::timeout(
+            bound,
+            database.insert_background_event(&event.id, &event.kind, &payload, &event.created_at),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => InsertBackgroundEvent::Unknown {
+                error: format!("database operation exceeded {bound:?}"),
+            },
+        };
+        if matches!(
+            outcome,
+            InsertBackgroundEvent::Inserted
+                | InsertBackgroundEvent::DuplicateIdentical
+                | InsertBackgroundEvent::DuplicateConflict { .. }
+        ) {
+            return outcome;
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return outcome;
+        };
+        tokio::time::sleep(policy.retry_interval.min(remaining)).await;
     }
 }
 

@@ -40,7 +40,17 @@ impl SteveProcess {
     }
 
     pub fn start_with_database_url(database_url: &str) -> io::Result<Self> {
-        Self::start_with_options(None, None, 60, None, None, Some(database_url), None, None)
+        Self::start_with_options(
+            None,
+            None,
+            60,
+            None,
+            None,
+            Some(database_url),
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn start_with_upstream_urls(
@@ -64,6 +74,7 @@ impl SteveProcess {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -82,6 +93,7 @@ impl SteveProcess {
             None,
             ca_bundle,
             None,
+            None,
         )
     }
 
@@ -93,6 +105,7 @@ impl SteveProcess {
             60,
             Some(endpoint),
             Some(history_capacity),
+            None,
             None,
             None,
             None,
@@ -110,6 +123,28 @@ impl SteveProcess {
             None,
             None,
             Some(accounting_root),
+            None,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn start_with_database_and_accounting(
+        database_url: &str,
+        accounting_root: &Path,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            None,
+            None,
+            60,
+            None,
+            None,
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
         )
     }
 
@@ -123,6 +158,7 @@ impl SteveProcess {
         database_url: Option<&str>,
         ca_bundle: Option<&Path>,
         accounting_root: Option<&Path>,
+        accounting_retry: Option<(u64, u64, u64)>,
     ) -> io::Result<Self> {
         let startup_lock = acquire_accounting_startup_lock()?;
         let temp = tempfile::tempdir()?;
@@ -163,6 +199,15 @@ impl SteveProcess {
         let history = history_capacity
             .map(|capacity| format!("history = {capacity}\n"))
             .unwrap_or_default();
+        let accounting_retry = accounting_retry
+            .map(|(operation, deadline, interval)| {
+                format!(
+                    "accounting_operation_timeout_ms = {operation}\n\
+                     accounting_retry_deadline_ms = {deadline}\n\
+                     accounting_retry_interval_ms = {interval}\n"
+                )
+            })
+            .unwrap_or_default();
         let database_url = database_url
             .map(str::to_owned)
             .unwrap_or_else(|| format!("sqlite://{}?mode=rwc", db_path.display()));
@@ -189,6 +234,7 @@ impl SteveProcess {
         let config = format!(
             "{server_config}\n[database]\nurl = {}\n\
              {object_storage}\n[queues]\naccounting_journal = {}\n{history}\
+             {accounting_retry}\
              [logging]\nlevel = \"info\"\njson = true\n",
             toml::Value::String(database_url),
             toml::Value::String(accounting_root.display().to_string()),

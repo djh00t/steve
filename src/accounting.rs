@@ -1,3 +1,4 @@
+use crate::storage::{DatabasePool, InsertBackgroundEvent};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -44,6 +45,178 @@ impl AccountingEvent {
             payload,
             created_at: Utc::now().to_rfc3339(),
         }
+    }
+}
+
+#[derive(Debug)]
+struct ParsedFrame {
+    offset: u64,
+    length: u64,
+    digest: String,
+    event: AccountingEvent,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct FrameEvidence {
+    offset: u64,
+    length: u64,
+    digest: String,
+}
+
+#[derive(Debug)]
+struct ParsedJournal {
+    frames: Vec<ParsedFrame>,
+    malformed: Vec<FrameEvidence>,
+    torn_tail: Option<FrameEvidence>,
+    complete_boundary: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ReplayOutcome {
+    Inserted,
+    DuplicateIdentical,
+    DuplicateConflict,
+    Failed,
+    Unknown,
+}
+
+impl ReplayOutcome {
+    fn acknowledges(&self) -> bool {
+        matches!(self, Self::Inserted | Self::DuplicateIdentical)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReplayReceipt {
+    generation_id: String,
+    offset: u64,
+    length: u64,
+    record_digest: String,
+    event_id: String,
+    content_digest: String,
+    outcome: ReplayOutcome,
+    attempts: u64,
+    error: Option<String>,
+    database_evidence_ref: Option<String>,
+    database_evidence_at: Option<String>,
+    conflict_snapshot_ref: Option<String>,
+    conflict_snapshot_digest: Option<String>,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ReplayManifest {
+    format_version: u64,
+    installation_id: String,
+    generation_id: String,
+    revision: u64,
+    source_coordination_revision: u64,
+    source_generation_revision: u64,
+    journal_length: u64,
+    journal_evidence_digest: String,
+    complete_boundary: u64,
+    complete_record_count: u64,
+    malformed_frames: Vec<FrameEvidence>,
+    torn_tail_offset: Option<u64>,
+    torn_tail_length: u64,
+    torn_tail_digest: Option<String>,
+    database_durability: Value,
+    receipts: Vec<ReplayReceipt>,
+    ordered_receipt_digest: String,
+    outcome_counts: BTreeMap<String, u64>,
+    parser_result: String,
+    sync_result: String,
+    retry_exhausted: bool,
+    updated_at: String,
+}
+
+#[derive(Clone, Copy)]
+struct ReplayPolicy {
+    operation_timeout: Duration,
+    retry_deadline: Duration,
+    retry_interval: Duration,
+}
+
+#[derive(Debug, Serialize)]
+struct ConflictSnapshot<'a> {
+    format_version: u64,
+    installation_id: &'a str,
+    generation_id: &'a str,
+    journal_offset: u64,
+    journal_length: u64,
+    journal_record_digest: &'a str,
+    source: Value,
+    existing: Value,
+    existing_row_digest: String,
+    verification_id: &'a str,
+    backend: &'a str,
+    transaction_isolation: &'a str,
+    read_evidence: String,
+    observed_at: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ConflictRowEvidence {
+    id: String,
+    kind: String,
+    payload: String,
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordedConflictSnapshot {
+    format_version: u64,
+    installation_id: String,
+    generation_id: String,
+    journal_offset: u64,
+    journal_length: u64,
+    journal_record_digest: String,
+    source: ConflictRowEvidence,
+    existing: ConflictRowEvidence,
+    existing_row_digest: String,
+    verification_id: String,
+    backend: String,
+    transaction_isolation: String,
+    read_evidence: String,
+    observed_at: String,
+}
+
+fn parse_journal(bytes: &[u8]) -> ParsedJournal {
+    let mut frames = Vec::new();
+    let mut malformed = Vec::new();
+    let mut offset = 0;
+
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        if line.last() != Some(&b'\n') {
+            break;
+        }
+        let evidence = FrameEvidence {
+            offset: offset as u64,
+            length: line.len() as u64,
+            digest: digest(line),
+        };
+        match serde_json::from_slice(&line[..line.len() - 1]) {
+            Ok(event) => frames.push(ParsedFrame {
+                offset: evidence.offset,
+                length: evidence.length,
+                digest: evidence.digest,
+                event,
+            }),
+            Err(_) => malformed.push(evidence),
+        }
+        offset += line.len();
+    }
+
+    ParsedJournal {
+        frames,
+        malformed,
+        torn_tail: (offset < bytes.len()).then(|| FrameEvidence {
+            offset: offset as u64,
+            length: (bytes.len() - offset) as u64,
+            digest: digest(&bytes[offset..]),
+        }),
+        complete_boundary: offset as u64,
     }
 }
 
@@ -165,6 +338,20 @@ struct GenerationState {
     journal: String,
     journal_length: u64,
     journal_evidence_digest: String,
+    #[serde(default)]
+    admitted_count: Option<u64>,
+    #[serde(default)]
+    worker_completed_count: Option<u64>,
+    #[serde(default)]
+    journal_synced_count: Option<u64>,
+    #[serde(default)]
+    database_committed_count: Option<u64>,
+    #[serde(default)]
+    last_complete_record_boundary: Option<u64>,
+    #[serde(default)]
+    replay_manifest: Option<String>,
+    #[serde(default)]
+    replay_manifest_digest: Option<String>,
     updated_at: String,
 }
 
@@ -269,6 +456,23 @@ impl AccountingCoordinator {
         adopt_legacy(source, root, maintenance_assertion)
     }
 
+    pub(crate) async fn reconcile_startup(
+        root: &Path,
+        database: &DatabasePool,
+        operation_timeout: Duration,
+        retry_deadline: Duration,
+        retry_interval: Duration,
+    ) -> Result<()> {
+        reconcile_startup(
+            root,
+            database,
+            operation_timeout,
+            retry_deadline,
+            retry_interval,
+        )
+        .await
+    }
+
     pub(crate) fn start(root: &Path, capacity: usize) -> Result<Self> {
         let root = resolve_accounting_root(root)?;
         let coordination_lock = open_coordination_lock(&root)?;
@@ -284,6 +488,7 @@ impl AccountingCoordinator {
                     adoption.state
                 );
             }
+            validate_complete_adoption(&root, &installation, &adoption)?;
         }
 
         cleanup_empty_staging(&root)?;
@@ -317,6 +522,13 @@ impl AccountingCoordinator {
             journal: journal_path.display().to_string(),
             journal_length: 0,
             journal_evidence_digest: digest(&[]),
+            admitted_count: None,
+            worker_completed_count: None,
+            journal_synced_count: None,
+            database_committed_count: None,
+            last_complete_record_boundary: None,
+            replay_manifest: None,
+            replay_manifest_digest: None,
             updated_at: Utc::now().to_rfc3339(),
         };
         write_checked(&generation_state_path(&root, &generation_id), &state)?;
@@ -647,7 +859,7 @@ fn adopt_legacy(source: &Path, root: &Path, maintenance_assertion: &Path) -> Res
     let importing_path = journal_path.with_extension("journal.importing");
     let state_path = generation_state_path(&root, &adoption.generation_id);
     let journal = open_or_publish_import(&root, &journal_path, &importing_path, &bytes)?;
-    let state = if state_path.exists() {
+    let mut state = if state_path.exists() {
         let state: GenerationState = read_checked(&state_path)?;
         verify_import_state(&state, &installation, &adoption, &journal_path, &bytes)?;
         state
@@ -665,6 +877,13 @@ fn adopt_legacy(source: &Path, root: &Path, maintenance_assertion: &Path) -> Res
             journal: journal_path.display().to_string(),
             journal_length: bytes.len() as u64,
             journal_evidence_digest: source_digest,
+            admitted_count: Some(0),
+            worker_completed_count: Some(0),
+            journal_synced_count: Some(parse_journal(&bytes).frames.len() as u64),
+            database_committed_count: Some(0),
+            last_complete_record_boundary: bytes.is_empty().then_some(0),
+            replay_manifest: None,
+            replay_manifest_digest: None,
             updated_at: Utc::now().to_rfc3339(),
         };
         write_checked(&state_path, &state)?;
@@ -690,10 +909,30 @@ fn adopt_legacy(source: &Path, root: &Path, maintenance_assertion: &Path) -> Res
 
     ensure_source_unchanged(&source, &bytes)?;
     if bytes.is_empty() {
+        let manifest_path = replay_manifest_path(&root, &adoption.generation_id);
+        let parsed = parse_journal(&bytes);
+        let _manifest = load_or_create_replay_manifest(
+            &manifest_path,
+            &installation,
+            &coordination,
+            &state,
+            &parsed,
+            serde_json::json!({"backend":"offline_adoption"}),
+        )?;
+        let manifest_digest = digest(&fs::read(&manifest_path)?);
+        state.revision += 1;
+        state.last_complete_record_boundary = Some(0);
+        state.replay_manifest = Some(manifest_path.display().to_string());
+        state.replay_manifest_digest = Some(manifest_digest.clone());
+        state.updated_at = Utc::now().to_rfc3339();
+        write_checked(&state_path, &state)?;
+        coordination.revision += 1;
+        replace_coverage(&mut coordination.coverage, coverage(&state));
+        write_checked(&root.join("coordination.json"), &coordination)?;
         let retained = retained_source_path(&source)?;
         adoption.state = "retaining_source".into();
         adoption.record_outcome = "empty_vacuous".into();
-        adoption.accepted_evidence_ref = Some(format!("sha256:{}", digest(&bytes)));
+        adoption.accepted_evidence_ref = Some(format!("sha256:{manifest_digest}"));
         adoption.retained_source = Some(retained.display().to_string());
         adoption.source_directory_synced = false;
         adoption.updated_at = Utc::now().to_rfc3339();
@@ -732,6 +971,1119 @@ fn adopt_legacy(source: &Path, root: &Path, maintenance_assertion: &Path) -> Res
     ))
 }
 
+async fn reconcile_startup(
+    root: &Path,
+    database: &DatabasePool,
+    operation_timeout: Duration,
+    retry_deadline: Duration,
+    retry_interval: Duration,
+) -> Result<()> {
+    let policy = ReplayPolicy {
+        operation_timeout,
+        retry_deadline,
+        retry_interval,
+    };
+    let database_durability = serde_json::to_value(database.durability_profile().await?)?;
+    let root = resolve_accounting_root(root)?;
+    let coordination_lock = open_coordination_lock(&root)?;
+    lock_with_timeout(&coordination_lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(&root)?;
+    let installation = load_provisioned_root_locked(&root)?;
+    cleanup_empty_staging(&root)?;
+    let mut coordination: Coordination = read_checked(&root.join("coordination.json"))?;
+    recover_reconciled_coverage_gaps(&root, &mut coordination)?;
+
+    let adoption_path = root.join("adoption.json");
+    let adoption_record = adoption_path
+        .exists()
+        .then(|| read_checked::<Adoption>(&adoption_path))
+        .transpose()?;
+    if let Some(complete) = adoption_record
+        .as_ref()
+        .filter(|adoption| adoption.state == "complete")
+    {
+        validate_complete_adoption(&root, &installation, complete)?;
+    }
+    let mut adoption = adoption_record.filter(|adoption| adoption.state != "complete");
+    let states = verify_generations_with_adoption(&root, &installation, &coordination, true)?;
+    if let Some(pending) = adoption.as_mut() {
+        let state = states
+            .get(&pending.generation_id)
+            .context("pending adoption is missing generation state")?;
+        if state.phase == GenerationPhase::Reconciled {
+            finish_reconciled_adoption(
+                &root,
+                pending,
+                state,
+                &replay_manifest_path(&root, &state.generation_id),
+            )?;
+        } else if state.phase != GenerationPhase::Adopting {
+            bail!("pending adoption generation is not available for replay");
+        }
+    }
+    File::unlock(&coordination_lock).context("unlocking accounting coordination")?;
+
+    for state in states.values() {
+        if !matches!(
+            state.phase,
+            GenerationPhase::Active | GenerationPhase::Adopting
+        ) {
+            continue;
+        }
+        let adoption_for_generation = adoption
+            .as_mut()
+            .filter(|pending| pending.generation_id == state.generation_id);
+        if state.phase == GenerationPhase::Adopting && adoption_for_generation.is_none() {
+            bail!("adopting generation has no pending adoption evidence");
+        }
+        reconcile_generation(
+            &root,
+            database,
+            &installation,
+            state,
+            database_durability.clone(),
+            policy,
+            adoption_for_generation,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn reconcile_generation(
+    root: &Path,
+    database: &DatabasePool,
+    installation: &Installation,
+    state: &GenerationState,
+    database_durability: Value,
+    policy: ReplayPolicy,
+    mut adoption: Option<&mut Adoption>,
+) -> Result<()> {
+    let journal_path = generation_journal_path(root, &state.generation_id);
+    let journal = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&journal_path)
+        .context("opening journal for replay")?;
+    match journal.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) if state.phase == GenerationPhase::Active => {
+            return Ok(())
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("adopting generation journal is still busy")
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            return Err(err).context("locking journal for replay")
+        }
+    }
+
+    let coordination_lock = open_coordination_lock(root)?;
+    lock_with_timeout(&coordination_lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(root)?;
+    let coordination: Coordination = read_checked(&root.join("coordination.json"))?;
+    let current: GenerationState =
+        read_checked(&generation_state_path(root, &state.generation_id))?;
+    if current.revision != state.revision
+        || current.phase != state.phase
+        || coordination
+            .coverage
+            .iter()
+            .find(|entry| entry.generation_id == state.generation_id)
+            != Some(&coverage(state))
+    {
+        bail!("accounting generation changed before replay snapshot");
+    }
+    let bytes = fs::read(&journal_path)?;
+    if bytes.len() as u64 != state.journal_length || digest(&bytes) != state.journal_evidence_digest
+    {
+        bail!("journal no longer matches ownership evidence");
+    }
+    if let Some(pending) = adoption.as_deref() {
+        if bytes.len() as u64 != pending.source_length || digest(&bytes) != pending.source_digest {
+            bail!("adopted journal no longer matches ownership evidence");
+        }
+        verify_adoption_copy(pending, true)?;
+    }
+
+    let parsed = parse_journal(&bytes);
+    let source_coverage = coverage(state);
+    let manifest_path = replay_manifest_path(root, &state.generation_id);
+    let mut manifest = load_or_create_replay_manifest(
+        &manifest_path,
+        installation,
+        &coordination,
+        state,
+        &parsed,
+        database_durability,
+    )?;
+    File::unlock(&coordination_lock).context("unlocking accounting coordination")?;
+
+    replay_frames(
+        database,
+        root,
+        installation,
+        &parsed,
+        &manifest_path,
+        &mut manifest,
+        policy,
+    )
+    .await?;
+
+    let complete = parsed.malformed.is_empty()
+        && parsed.torn_tail.is_none()
+        && parsed.frames.iter().all(|frame| {
+            manifest
+                .receipts
+                .iter()
+                .find(|receipt| receipt.offset == frame.offset)
+                .is_some_and(|receipt| {
+                    receipt.record_digest == frame.digest && receipt.outcome.acknowledges()
+                })
+        });
+    if !complete {
+        File::unlock(&journal).context("unlocking journal")?;
+        bail!("accounting replay remains unresolved");
+    }
+    if state.phase == GenerationPhase::Active {
+        File::unlock(&journal).context("unlocking journal")?;
+        bail!("prior active accounting generation has no verified completion boundary");
+    }
+
+    let coordination_lock = open_coordination_lock(root)?;
+    lock_with_timeout(&coordination_lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(root)?;
+    let mut coordination: Coordination = read_checked(&root.join("coordination.json"))?;
+    let mut current: GenerationState =
+        read_checked(&generation_state_path(root, &state.generation_id))?;
+    if coordination.revision != manifest.source_coordination_revision
+        || current.revision != manifest.source_generation_revision
+        || current.phase != state.phase
+        || coordination
+            .coverage
+            .iter()
+            .find(|entry| entry.generation_id == state.generation_id)
+            != Some(&source_coverage)
+        || fs::read(&journal_path)? != bytes
+    {
+        bail!("accounting replay snapshot changed before publication");
+    }
+    let manifest_digest = digest(&fs::read(&manifest_path)?);
+    current.revision += 1;
+    current.phase = GenerationPhase::Reconciled;
+    current.last_complete_record_boundary = Some(parsed.complete_boundary);
+    if state.phase == GenerationPhase::Adopting {
+        current.admitted_count = Some(0);
+        current.worker_completed_count = Some(0);
+        current.journal_synced_count = Some(parsed.frames.len() as u64);
+        current.database_committed_count = Some(
+            manifest
+                .receipts
+                .iter()
+                .filter(|receipt| receipt.outcome.acknowledges())
+                .count() as u64,
+        );
+    }
+    current.replay_manifest = Some(manifest_path.display().to_string());
+    current.replay_manifest_digest = Some(manifest_digest);
+    current.updated_at = Utc::now().to_rfc3339();
+    write_checked(
+        &generation_state_path(root, &current.generation_id),
+        &current,
+    )?;
+    coordination.revision += 1;
+    replace_coverage(&mut coordination.coverage, coverage(&current));
+    write_checked(&root.join("coordination.json"), &coordination)?;
+    if let Some(pending) = adoption.as_mut() {
+        finish_reconciled_adoption(root, pending, &current, &manifest_path)?;
+    }
+    File::unlock(&coordination_lock).context("unlocking accounting coordination")?;
+    File::unlock(&journal).context("unlocking journal")?;
+    Ok(())
+}
+
+fn load_or_create_replay_manifest(
+    path: &Path,
+    installation: &Installation,
+    coordination: &Coordination,
+    state: &GenerationState,
+    parsed: &ParsedJournal,
+    database_durability: Value,
+) -> Result<ReplayManifest> {
+    let tail_offset = parsed.torn_tail.as_ref().map(|tail| tail.offset);
+    let tail_length = parsed.torn_tail.as_ref().map_or(0, |tail| tail.length);
+    let tail_digest = parsed.torn_tail.as_ref().map(|tail| tail.digest.clone());
+    if path.exists() {
+        let mut manifest: ReplayManifest = read_checked(path)?;
+        if manifest.format_version != FORMAT_VERSION
+            || manifest.installation_id != installation.installation_id
+            || manifest.generation_id != state.generation_id
+            || manifest.source_coordination_revision != coordination.revision
+            || manifest.source_generation_revision != state.revision
+            || manifest.journal_length != state.journal_length
+            || manifest.journal_evidence_digest != state.journal_evidence_digest
+            || manifest.complete_boundary != parsed.complete_boundary
+            || manifest.complete_record_count != parsed.frames.len() as u64
+            || manifest.malformed_frames != parsed.malformed
+            || manifest.torn_tail_offset != tail_offset
+            || manifest.torn_tail_length != tail_length
+            || manifest.torn_tail_digest != tail_digest
+            || manifest.parser_result != parser_result(parsed)
+            || manifest.database_durability != database_durability
+        {
+            bail!("replay manifest does not match frozen journal evidence");
+        }
+        validate_manifest_summary(&manifest)?;
+        let mut receipt_offsets = BTreeSet::new();
+        for receipt in &manifest.receipts {
+            if !receipt_offsets.insert(receipt.offset) {
+                bail!("replay manifest contains duplicate frame receipts");
+            }
+            let Some(frame) = parsed
+                .frames
+                .iter()
+                .find(|frame| frame.offset == receipt.offset)
+            else {
+                bail!("replay manifest contains an unknown frame receipt");
+            };
+            if receipt.length != frame.length
+                || receipt.generation_id != manifest.generation_id
+                || receipt.record_digest != frame.digest
+                || receipt.event_id != frame.event.id
+                || receipt.content_digest != event_content_digest(&frame.event)?
+            {
+                bail!("replay receipt does not match frozen journal frame");
+            }
+            if receipt.outcome.acknowledges()
+                && (receipt.database_evidence_ref.is_none()
+                    || receipt.database_evidence_at.is_none())
+            {
+                bail!("acknowledged replay receipt lacks database evidence");
+            }
+        }
+        let root = path
+            .parent()
+            .context("manifest has no parent")?
+            .parent()
+            .context("generations has no parent")?;
+        if recover_conflict_receipts(root, installation, parsed, &mut manifest)? {
+            persist_replay_manifest(path, &mut manifest)?;
+        }
+        return Ok(manifest);
+    }
+    let mut manifest = ReplayManifest {
+        format_version: FORMAT_VERSION,
+        installation_id: installation.installation_id.clone(),
+        generation_id: state.generation_id.clone(),
+        revision: 1,
+        source_coordination_revision: coordination.revision,
+        source_generation_revision: state.revision,
+        journal_length: state.journal_length,
+        journal_evidence_digest: state.journal_evidence_digest.clone(),
+        complete_boundary: parsed.complete_boundary,
+        complete_record_count: parsed.frames.len() as u64,
+        malformed_frames: parsed.malformed.clone(),
+        torn_tail_offset: tail_offset,
+        torn_tail_length: tail_length,
+        torn_tail_digest: tail_digest,
+        database_durability,
+        receipts: Vec::new(),
+        ordered_receipt_digest: String::new(),
+        outcome_counts: BTreeMap::new(),
+        parser_result: parser_result(parsed).into(),
+        sync_result: "synced".into(),
+        retry_exhausted: false,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    refresh_manifest_summary(&mut manifest)?;
+    write_checked(path, &manifest)?;
+    Ok(manifest)
+}
+
+fn recover_conflict_receipts(
+    root: &Path,
+    installation: &Installation,
+    parsed: &ParsedJournal,
+    manifest: &mut ReplayManifest,
+) -> Result<bool> {
+    let mut recovered = BTreeMap::new();
+    for entry in fs::read_dir(root.join("generations"))? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            bail!("generation conflict filename is not valid UTF-8");
+        };
+        let Some((generation_id, artifact_offset, artifact_length, artifact_digest)) =
+            conflict_snapshot_identity(name)
+        else {
+            continue;
+        };
+        if generation_id != manifest.generation_id {
+            continue;
+        }
+
+        let snapshot: RecordedConflictSnapshot = read_checked(&path)?;
+        let frame = parsed
+            .frames
+            .iter()
+            .find(|frame| frame.offset == snapshot.journal_offset)
+            .context("conflict evidence has no matching frozen journal frame")?;
+        let expected_source = ConflictRowEvidence {
+            id: frame.event.id.clone(),
+            kind: frame.event.kind.clone(),
+            payload: frame.event.payload.to_string(),
+            created_at: frame.event.created_at.clone(),
+        };
+        let expected_path = conflict_snapshot_path(
+            root,
+            generation_id,
+            frame.offset,
+            frame.length,
+            &frame.digest,
+        );
+        let durability_backend = manifest
+            .database_durability
+            .get("backend")
+            .and_then(Value::as_str)
+            .context("replay manifest durability profile has no backend")?;
+        if path != expected_path
+            || artifact_offset != frame.offset
+            || artifact_length != frame.length
+            || artifact_digest != frame.digest
+            || snapshot.format_version != FORMAT_VERSION
+            || snapshot.installation_id != installation.installation_id
+            || snapshot.generation_id != manifest.generation_id
+            || snapshot.journal_length != frame.length
+            || snapshot.journal_record_digest != frame.digest
+            || snapshot.source != expected_source
+            || snapshot.existing.id != frame.event.id
+            || snapshot.existing_row_digest != digest(&serde_json::to_vec(&snapshot.existing)?)
+            || snapshot.verification_id.is_empty()
+            || snapshot.backend != durability_backend
+            || snapshot.transaction_isolation.is_empty()
+            || snapshot.read_evidence
+                != format!(
+                    "{}:{}:{}",
+                    snapshot.backend, snapshot.transaction_isolation, snapshot.verification_id
+                )
+            || snapshot.observed_at.is_empty()
+        {
+            bail!("conflict evidence does not match frozen journal frame");
+        }
+        let snapshot_digest = digest(&fs::read(&path)?);
+        let prior_attempts = manifest
+            .receipts
+            .iter()
+            .find(|receipt| receipt.offset == frame.offset)
+            .map_or(0, |receipt| receipt.attempts);
+        let receipt = ReplayReceipt {
+            generation_id: manifest.generation_id.clone(),
+            offset: frame.offset,
+            length: frame.length,
+            record_digest: frame.digest.clone(),
+            event_id: frame.event.id.clone(),
+            content_digest: event_content_digest(&frame.event)?,
+            outcome: ReplayOutcome::DuplicateConflict,
+            attempts: prior_attempts.saturating_add(1),
+            error: None,
+            database_evidence_ref: Some(snapshot.verification_id),
+            database_evidence_at: Some(snapshot.observed_at.clone()),
+            conflict_snapshot_ref: Some(path.display().to_string()),
+            conflict_snapshot_digest: Some(snapshot_digest),
+            updated_at: snapshot.observed_at,
+        };
+        if recovered.insert(frame.offset, receipt).is_some() {
+            bail!("multiple conflict artifacts map to one journal frame");
+        }
+    }
+
+    for receipt in &manifest.receipts {
+        if receipt.outcome == ReplayOutcome::DuplicateConflict
+            && !recovered.contains_key(&receipt.offset)
+        {
+            bail!("conflict receipt is missing protected evidence");
+        }
+    }
+
+    let mut changed = false;
+    for (offset, recovered_receipt) in recovered {
+        match manifest
+            .receipts
+            .iter_mut()
+            .find(|receipt| receipt.offset == offset)
+        {
+            Some(receipt) if receipt.outcome == ReplayOutcome::DuplicateConflict => {
+                if receipt.length != recovered_receipt.length
+                    || receipt.record_digest != recovered_receipt.record_digest
+                    || receipt.event_id != recovered_receipt.event_id
+                    || receipt.content_digest != recovered_receipt.content_digest
+                    || receipt.database_evidence_ref != recovered_receipt.database_evidence_ref
+                    || receipt.conflict_snapshot_ref != recovered_receipt.conflict_snapshot_ref
+                    || receipt.conflict_snapshot_digest
+                        != recovered_receipt.conflict_snapshot_digest
+                {
+                    bail!("conflict receipt does not match protected evidence");
+                }
+            }
+            Some(receipt) => {
+                *receipt = recovered_receipt;
+                changed = true;
+            }
+            None => {
+                manifest.receipts.push(recovered_receipt);
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+async fn replay_frames(
+    database: &DatabasePool,
+    root: &Path,
+    installation: &Installation,
+    parsed: &ParsedJournal,
+    manifest_path: &Path,
+    manifest: &mut ReplayManifest,
+    policy: ReplayPolicy,
+) -> Result<()> {
+    let deadline = Instant::now()
+        .checked_add(policy.retry_deadline)
+        .context("accounting replay retry deadline is out of range")?;
+    manifest.retry_exhausted = false;
+
+    for frame in &parsed.frames {
+        let receipt_index = match manifest
+            .receipts
+            .iter()
+            .position(|receipt| receipt.offset == frame.offset)
+        {
+            Some(index) => index,
+            None => {
+                manifest.receipts.push(ReplayReceipt {
+                    generation_id: manifest.generation_id.clone(),
+                    offset: frame.offset,
+                    length: frame.length,
+                    record_digest: frame.digest.clone(),
+                    event_id: frame.event.id.clone(),
+                    content_digest: event_content_digest(&frame.event)?,
+                    outcome: ReplayOutcome::Unknown,
+                    attempts: 0,
+                    error: Some("not attempted".into()),
+                    database_evidence_ref: None,
+                    database_evidence_at: None,
+                    conflict_snapshot_ref: None,
+                    conflict_snapshot_digest: None,
+                    updated_at: Utc::now().to_rfc3339(),
+                });
+                manifest.receipts.len() - 1
+            }
+        };
+        if manifest.receipts[receipt_index].outcome.acknowledges()
+            || manifest.receipts[receipt_index].outcome == ReplayOutcome::DuplicateConflict
+        {
+            continue;
+        }
+
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                let receipt = &mut manifest.receipts[receipt_index];
+                receipt.outcome = ReplayOutcome::Unknown;
+                receipt.error = Some("accounting replay retry deadline exhausted".into());
+                receipt.updated_at = Utc::now().to_rfc3339();
+                manifest.retry_exhausted = true;
+                publish_replay_manifest(root, manifest_path, manifest)?;
+                break;
+            };
+            let bound = policy.operation_timeout.min(remaining);
+            let result = tokio::time::timeout(
+                bound,
+                database.insert_background_event(
+                    &frame.event.id,
+                    &frame.event.kind,
+                    &frame.event.payload.to_string(),
+                    &frame.event.created_at,
+                ),
+            )
+            .await;
+            let attempts = manifest.receipts[receipt_index].attempts + 1;
+            let receipt = match result {
+                Ok(InsertBackgroundEvent::Inserted) => successful_receipt(
+                    &manifest.generation_id,
+                    frame,
+                    ReplayOutcome::Inserted,
+                    attempts,
+                    &manifest.database_durability,
+                )?,
+                Ok(InsertBackgroundEvent::DuplicateIdentical) => successful_receipt(
+                    &manifest.generation_id,
+                    frame,
+                    ReplayOutcome::DuplicateIdentical,
+                    attempts,
+                    &manifest.database_durability,
+                )?,
+                Ok(InsertBackgroundEvent::DuplicateConflict {
+                    existing,
+                    verification_id,
+                    backend,
+                    transaction_isolation,
+                }) => conflict_receipt(
+                    root,
+                    installation,
+                    manifest,
+                    frame,
+                    attempts,
+                    existing,
+                    &verification_id,
+                    &backend,
+                    &transaction_isolation,
+                )?,
+                Ok(InsertBackgroundEvent::Failed { error }) => unresolved_receipt(
+                    &manifest.generation_id,
+                    frame,
+                    ReplayOutcome::Failed,
+                    attempts,
+                    error,
+                )?,
+                Ok(InsertBackgroundEvent::Unknown { error }) => unresolved_receipt(
+                    &manifest.generation_id,
+                    frame,
+                    ReplayOutcome::Unknown,
+                    attempts,
+                    error,
+                )?,
+                Err(_) => unresolved_receipt(
+                    &manifest.generation_id,
+                    frame,
+                    ReplayOutcome::Unknown,
+                    attempts,
+                    format!("database operation exceeded {bound:?}"),
+                )?,
+            };
+            let acknowledged = receipt.outcome.acknowledges();
+            let conflict = receipt.outcome == ReplayOutcome::DuplicateConflict;
+            manifest.receipts[receipt_index] = receipt;
+            publish_replay_manifest(root, manifest_path, manifest)?;
+            if acknowledged || conflict {
+                break;
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                manifest.retry_exhausted = true;
+                publish_replay_manifest(root, manifest_path, manifest)?;
+                break;
+            };
+            tokio::time::sleep(policy.retry_interval.min(remaining)).await;
+        }
+    }
+    Ok(())
+}
+
+fn successful_receipt(
+    generation_id: &str,
+    frame: &ParsedFrame,
+    outcome: ReplayOutcome,
+    attempts: u64,
+    durability: &Value,
+) -> Result<ReplayReceipt> {
+    let backend = durability
+        .get("backend")
+        .and_then(Value::as_str)
+        .unwrap_or("database");
+    let outcome_name = match &outcome {
+        ReplayOutcome::Inserted => "inserted",
+        ReplayOutcome::DuplicateIdentical => "duplicate_identical",
+        _ => unreachable!("successful receipt requires an acknowledging outcome"),
+    };
+    Ok(ReplayReceipt {
+        generation_id: generation_id.to_string(),
+        offset: frame.offset,
+        length: frame.length,
+        record_digest: frame.digest.clone(),
+        event_id: frame.event.id.clone(),
+        content_digest: event_content_digest(&frame.event)?,
+        outcome,
+        attempts,
+        error: None,
+        database_evidence_ref: Some(format!("{backend}:{outcome_name}:sha256:{}", frame.digest)),
+        database_evidence_at: Some(Utc::now().to_rfc3339()),
+        conflict_snapshot_ref: None,
+        conflict_snapshot_digest: None,
+        updated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+fn unresolved_receipt(
+    generation_id: &str,
+    frame: &ParsedFrame,
+    outcome: ReplayOutcome,
+    attempts: u64,
+    error: String,
+) -> Result<ReplayReceipt> {
+    Ok(ReplayReceipt {
+        generation_id: generation_id.to_string(),
+        offset: frame.offset,
+        length: frame.length,
+        record_digest: frame.digest.clone(),
+        event_id: frame.event.id.clone(),
+        content_digest: event_content_digest(&frame.event)?,
+        outcome,
+        attempts,
+        error: Some(error),
+        database_evidence_ref: None,
+        database_evidence_at: None,
+        conflict_snapshot_ref: None,
+        conflict_snapshot_digest: None,
+        updated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conflict_receipt(
+    root: &Path,
+    installation: &Installation,
+    manifest: &ReplayManifest,
+    frame: &ParsedFrame,
+    attempts: u64,
+    existing: crate::storage::BackgroundEventRow,
+    verification_id: &str,
+    backend: &str,
+    transaction_isolation: &str,
+) -> Result<ReplayReceipt> {
+    let generation_id = &manifest.generation_id;
+    let path = conflict_snapshot_path(
+        root,
+        generation_id,
+        frame.offset,
+        frame.length,
+        &frame.digest,
+    );
+    let existing = ConflictRowEvidence {
+        id: existing.id,
+        kind: existing.kind,
+        payload: existing.payload,
+        created_at: existing.created_at,
+    };
+    let existing_row_digest = digest(&serde_json::to_vec(&existing)?);
+    let existing = serde_json::to_value(existing)?;
+    let snapshot = ConflictSnapshot {
+        format_version: FORMAT_VERSION,
+        installation_id: &installation.installation_id,
+        generation_id,
+        journal_offset: frame.offset,
+        journal_length: frame.length,
+        journal_record_digest: &frame.digest,
+        source: serde_json::json!({
+            "id": frame.event.id,
+            "kind": frame.event.kind,
+            "payload": frame.event.payload.to_string(),
+            "created_at": frame.event.created_at,
+        }),
+        existing,
+        existing_row_digest,
+        verification_id,
+        backend,
+        transaction_isolation,
+        read_evidence: format!("{backend}:{transaction_isolation}:{verification_id}"),
+        observed_at: Utc::now().to_rfc3339(),
+    };
+    let coordination_lock = open_coordination_lock(root)?;
+    lock_with_timeout(&coordination_lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(root)?;
+    verify_replay_publication_snapshot(root, manifest)?;
+    if path.exists() {
+        let recorded: Value = read_checked(&path)?;
+        let expected = serde_json::to_value(&snapshot)?;
+        for field in [
+            "format_version",
+            "installation_id",
+            "generation_id",
+            "journal_offset",
+            "journal_length",
+            "journal_record_digest",
+            "source",
+            "existing",
+            "existing_row_digest",
+            "verification_id",
+            "backend",
+            "transaction_isolation",
+            "read_evidence",
+        ] {
+            if recorded.get(field) != expected.get(field) {
+                bail!("protected replay conflict evidence changed");
+            }
+        }
+    } else {
+        write_checked(&path, &snapshot)?;
+    }
+    File::unlock(&coordination_lock).context("unlocking accounting coordination")?;
+    let snapshot_digest = digest(&fs::read(&path)?);
+    Ok(ReplayReceipt {
+        generation_id: generation_id.to_string(),
+        offset: frame.offset,
+        length: frame.length,
+        record_digest: frame.digest.clone(),
+        event_id: frame.event.id.clone(),
+        content_digest: event_content_digest(&frame.event)?,
+        outcome: ReplayOutcome::DuplicateConflict,
+        attempts,
+        error: None,
+        database_evidence_ref: Some(verification_id.to_string()),
+        database_evidence_at: Some(snapshot.observed_at),
+        conflict_snapshot_ref: Some(path.display().to_string()),
+        conflict_snapshot_digest: Some(snapshot_digest),
+        updated_at: Utc::now().to_rfc3339(),
+    })
+}
+
+fn persist_replay_manifest(path: &Path, manifest: &mut ReplayManifest) -> Result<()> {
+    refresh_manifest_summary(manifest)?;
+    manifest.revision += 1;
+    manifest.updated_at = Utc::now().to_rfc3339();
+    write_checked(path, manifest)
+}
+
+fn publish_replay_manifest(root: &Path, path: &Path, manifest: &mut ReplayManifest) -> Result<()> {
+    let coordination_lock = open_coordination_lock(root)?;
+    lock_with_timeout(&coordination_lock, LOCK_TIMEOUT)?;
+    recover_checked_publications(root)?;
+    verify_replay_publication_snapshot(root, manifest)?;
+    persist_replay_manifest(path, manifest)?;
+    File::unlock(&coordination_lock).context("unlocking accounting coordination")
+}
+
+fn verify_replay_publication_snapshot(root: &Path, manifest: &ReplayManifest) -> Result<()> {
+    let coordination: Coordination = read_checked(&root.join("coordination.json"))?;
+    let state: GenerationState =
+        read_checked(&generation_state_path(root, &manifest.generation_id))?;
+    let journal = fs::read(generation_journal_path(root, &manifest.generation_id))?;
+    if coordination.revision != manifest.source_coordination_revision
+        || state.revision != manifest.source_generation_revision
+        || !matches!(
+            state.phase,
+            GenerationPhase::Active | GenerationPhase::Adopting
+        )
+        || coordination
+            .coverage
+            .iter()
+            .find(|entry| entry.generation_id == manifest.generation_id)
+            != Some(&coverage(&state))
+        || journal.len() as u64 != manifest.journal_length
+        || digest(&journal) != manifest.journal_evidence_digest
+    {
+        bail!("accounting generation changed before replay evidence publication");
+    }
+    Ok(())
+}
+
+fn parser_result(parsed: &ParsedJournal) -> &'static str {
+    if parsed.torn_tail.is_some() {
+        "torn_tail"
+    } else if !parsed.malformed.is_empty() {
+        "malformed_frame"
+    } else {
+        "complete"
+    }
+}
+
+fn replay_outcome_name(outcome: &ReplayOutcome) -> &'static str {
+    match outcome {
+        ReplayOutcome::Inserted => "inserted",
+        ReplayOutcome::DuplicateIdentical => "duplicate_identical",
+        ReplayOutcome::DuplicateConflict => "duplicate_conflict",
+        ReplayOutcome::Failed => "failed",
+        ReplayOutcome::Unknown => "unknown",
+    }
+}
+
+fn receipt_summary(receipts: &[ReplayReceipt]) -> Result<(String, BTreeMap<String, u64>)> {
+    let mut counts = [
+        "inserted",
+        "duplicate_identical",
+        "duplicate_conflict",
+        "failed",
+        "unknown",
+    ]
+    .into_iter()
+    .map(|outcome| (outcome.to_string(), 0))
+    .collect::<BTreeMap<_, _>>();
+    for receipt in receipts {
+        *counts
+            .get_mut(replay_outcome_name(&receipt.outcome))
+            .expect("all replay outcomes are initialized") += 1;
+    }
+    Ok((digest(&serde_json::to_vec(receipts)?), counts))
+}
+
+fn refresh_manifest_summary(manifest: &mut ReplayManifest) -> Result<()> {
+    manifest.receipts.sort_by_key(|receipt| receipt.offset);
+    let (receipt_digest, outcome_counts) = receipt_summary(&manifest.receipts)?;
+    manifest.ordered_receipt_digest = receipt_digest;
+    manifest.outcome_counts = outcome_counts;
+    Ok(())
+}
+
+fn validate_manifest_summary(manifest: &ReplayManifest) -> Result<()> {
+    let (receipt_digest, outcome_counts) = receipt_summary(&manifest.receipts)?;
+    if manifest.ordered_receipt_digest != receipt_digest
+        || manifest.outcome_counts != outcome_counts
+        || !matches!(
+            manifest.parser_result.as_str(),
+            "complete" | "malformed_frame" | "torn_tail"
+        )
+        || manifest.sync_result != "synced"
+        || manifest
+            .receipts
+            .windows(2)
+            .any(|pair| pair[0].offset >= pair[1].offset)
+    {
+        bail!("replay manifest summary evidence is inconsistent");
+    }
+    Ok(())
+}
+
+fn event_content_digest(event: &AccountingEvent) -> Result<String> {
+    Ok(digest(&serde_json::to_vec(&serde_json::json!({
+        "id": event.id,
+        "kind": event.kind,
+        "payload": event.payload.to_string(),
+        "created_at": event.created_at,
+    }))?))
+}
+
+fn verify_adoption_copy(adoption: &Adoption, require_source: bool) -> Result<()> {
+    let backup = fs::read(&adoption.backup).context("reading retained legacy backup")?;
+    if backup.len() as u64 != adoption.source_length || digest(&backup) != adoption.source_digest {
+        bail!("retained legacy backup does not match adoption evidence");
+    }
+    let source = Path::new(&adoption.source);
+    if require_source || source.exists() {
+        let source_bytes = fs::read(source).context("reading retained legacy source")?;
+        if source_bytes.len() as u64 != adoption.source_length
+            || digest(&source_bytes) != adoption.source_digest
+        {
+            bail!("retained legacy source does not match adoption evidence");
+        }
+    }
+    Ok(())
+}
+
+fn validate_complete_adoption(
+    root: &Path,
+    installation: &Installation,
+    adoption: &Adoption,
+) -> Result<()> {
+    let source = Path::new(&adoption.source);
+    let expected_backup = source.with_file_name(format!(
+        "{}.steve-backup",
+        source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("completed adoption source name is invalid")?
+    ));
+    let expected_retained = retained_source_path(source)?;
+    let expected_outcome = if adoption.source_length == 0 {
+        "empty_vacuous"
+    } else {
+        "reconciled"
+    };
+    if adoption.format_version != FORMAT_VERSION
+        || adoption.installation_id != installation.installation_id
+        || adoption.state != "complete"
+        || !adoption.source_directory_synced
+        || adoption.record_outcome != expected_outcome
+        || Path::new(&adoption.backup) != expected_backup
+        || adoption.retained_source.as_deref() != expected_retained.to_str()
+    {
+        bail!("completed adoption metadata is inconsistent");
+    }
+    let backup =
+        fs::read(&adoption.backup).context("completed adoption backup does not match evidence")?;
+    if backup.len() as u64 != adoption.source_length || digest(&backup) != adoption.source_digest {
+        bail!("completed adoption backup does not match evidence");
+    }
+    if source.exists() {
+        bail!("completed adoption original source still exists");
+    }
+    let retained = adoption
+        .retained_source
+        .as_deref()
+        .map(Path::new)
+        .context("completed adoption retained source does not match evidence")?;
+    let retained_bytes =
+        fs::read(retained).context("completed adoption retained source does not match evidence")?;
+    if retained_bytes.len() as u64 != adoption.source_length
+        || digest(&retained_bytes) != adoption.source_digest
+    {
+        bail!("completed adoption retained source does not match evidence");
+    }
+
+    let state: GenerationState =
+        read_checked(&generation_state_path(root, &adoption.generation_id))?;
+    let manifest_path = replay_manifest_path(root, &adoption.generation_id);
+    let manifest_digest = digest(&fs::read(&manifest_path)?);
+    let expected_manifest = manifest_path.display().to_string();
+    let expected_evidence_ref = format!("sha256:{manifest_digest}");
+    if state.phase != GenerationPhase::Reconciled
+        || state.format_version != FORMAT_VERSION
+        || state.installation_id != installation.installation_id
+        || state.generation_id != adoption.generation_id
+        || state.replay_manifest.as_deref() != Some(expected_manifest.as_str())
+        || state.replay_manifest_digest.as_deref() != Some(manifest_digest.as_str())
+        || adoption.accepted_evidence_ref.as_deref() != Some(expected_evidence_ref.as_str())
+    {
+        bail!("completed adoption replay evidence is inconsistent");
+    }
+    let manifest: ReplayManifest = read_checked(&manifest_path)?;
+    validate_manifest_summary(&manifest)?;
+    let database_committed =
+        manifest.outcome_counts["inserted"] + manifest.outcome_counts["duplicate_identical"];
+    if manifest.format_version != FORMAT_VERSION
+        || manifest.installation_id != installation.installation_id
+        || manifest.generation_id != adoption.generation_id
+        || manifest.journal_length != adoption.source_length
+        || manifest.journal_evidence_digest != adoption.source_digest
+        || state.admitted_count != Some(0)
+        || state.worker_completed_count != Some(0)
+        || state.journal_synced_count != Some(manifest.complete_record_count)
+        || state.database_committed_count != Some(database_committed)
+    {
+        bail!("completed adoption replay evidence is inconsistent");
+    }
+    Ok(())
+}
+
+fn finish_reconciled_adoption(
+    root: &Path,
+    adoption: &mut Adoption,
+    state: &GenerationState,
+    manifest_path: &Path,
+) -> Result<()> {
+    let manifest_digest = digest(&fs::read(manifest_path)?);
+    let expected_manifest = manifest_path.display().to_string();
+    if state.phase != GenerationPhase::Reconciled
+        || state.replay_manifest.as_deref() != Some(expected_manifest.as_str())
+        || state.replay_manifest_digest.as_deref() != Some(manifest_digest.as_str())
+    {
+        bail!("reconciled adoption lacks matching replay evidence");
+    }
+    verify_adoption_copy(adoption, false)?;
+    let source = PathBuf::from(&adoption.source);
+    let retained = match adoption.retained_source.as_deref() {
+        Some(path) => PathBuf::from(path),
+        None => retained_source_path(&source)?,
+    };
+    if adoption.state != "retaining_source" {
+        if !source.exists() || retained.exists() {
+            bail!("reconciled legacy source move is ambiguous");
+        }
+        verify_adoption_copy(adoption, true)?;
+        adoption.state = "retaining_source".into();
+        adoption.record_outcome = "reconciled".into();
+        adoption.accepted_evidence_ref = state
+            .replay_manifest_digest
+            .as_ref()
+            .map(|digest| format!("sha256:{digest}"));
+        adoption.retained_source = Some(retained.display().to_string());
+        adoption.source_directory_synced = false;
+        adoption.updated_at = Utc::now().to_rfc3339();
+        write_checked(&root.join("adoption.json"), adoption)?;
+    }
+
+    if source.exists() {
+        verify_adoption_copy(adoption, true)?;
+        if retained.exists() {
+            bail!("reconciled legacy source move is ambiguous");
+        }
+        fs::rename(&source, &retained).context("retaining reconciled legacy source")?;
+    } else {
+        let retained_bytes = fs::read(&retained).context("reading retained legacy source")?;
+        if retained_bytes.len() as u64 != adoption.source_length
+            || digest(&retained_bytes) != adoption.source_digest
+        {
+            bail!("retained legacy source does not match adoption evidence");
+        }
+    }
+    sync_directory(source.parent().context("legacy source has no parent")?)?;
+    adoption.state = "complete".into();
+    adoption.source_directory_synced = true;
+    adoption.updated_at = Utc::now().to_rfc3339();
+    write_checked(&root.join("adoption.json"), adoption)
+}
+
+fn replay_manifest_path(root: &Path, generation_id: &str) -> PathBuf {
+    root.join("generations")
+        .join(format!("{generation_id}.replay.json"))
+}
+
+fn conflict_snapshot_path(
+    root: &Path,
+    generation_id: &str,
+    frame_offset: u64,
+    frame_length: u64,
+    frame_digest: &str,
+) -> PathBuf {
+    root.join("generations").join(format!(
+        "{generation_id}.conflict.{frame_offset}.{frame_length}.{frame_digest}.json"
+    ))
+}
+
+fn recover_reconciled_coverage_gap(
+    root: &Path,
+    coordination: &mut Coordination,
+    state: &GenerationState,
+) -> Result<()> {
+    if state.phase != GenerationPhase::Reconciled
+        || coordination.coverage.contains(&coverage(state))
+    {
+        return Ok(());
+    }
+    let prior = coordination
+        .coverage
+        .iter()
+        .find(|entry| entry.generation_id == state.generation_id)
+        .context("reconciled generation is missing prior coverage")?;
+    let manifest_path = state
+        .replay_manifest
+        .as_deref()
+        .map(Path::new)
+        .context("reconciled generation is missing replay manifest")?;
+    let manifest: ReplayManifest = read_checked(manifest_path)?;
+    let manifest_digest = digest(&fs::read(manifest_path)?);
+    if prior.generation_state_revision + 1 != state.revision
+        || prior.journal_evidence_digest != state.journal_evidence_digest
+        || manifest_path != replay_manifest_path(root, &state.generation_id)
+        || state.replay_manifest_digest.as_deref() != Some(manifest_digest.as_str())
+        || manifest.source_coordination_revision != coordination.revision
+        || manifest.source_generation_revision != prior.generation_state_revision
+        || manifest.journal_length != state.journal_length
+        || manifest.journal_evidence_digest != state.journal_evidence_digest
+        || state.last_complete_record_boundary != Some(state.journal_length)
+        || manifest.complete_boundary != state.journal_length
+        || manifest.receipts.len() as u64 != manifest.complete_record_count
+        || !manifest.malformed_frames.is_empty()
+        || manifest.torn_tail_length != 0
+        || digest(&fs::read(&state.journal)?) != state.journal_evidence_digest
+        || manifest
+            .receipts
+            .iter()
+            .any(|receipt| !receipt.outcome.acknowledges())
+    {
+        bail!("reconciled generation coverage gap is not recoverable");
+    }
+    coordination.revision += 1;
+    replace_coverage(&mut coordination.coverage, coverage(state));
+    write_checked(&root.join("coordination.json"), coordination)
+}
+
+fn recover_reconciled_coverage_gaps(root: &Path, coordination: &mut Coordination) -> Result<()> {
+    for entry in coordination.coverage.clone() {
+        let state: GenerationState =
+            read_checked(&generation_state_path(root, &entry.generation_id))?;
+        recover_reconciled_coverage_gap(root, coordination, &state)?;
+    }
+    Ok(())
+}
+
 fn resume_empty_adoption_after_move(
     source: &Path,
     root: &Path,
@@ -745,6 +2097,8 @@ fn resume_empty_adoption_after_move(
     let adoption_path = root.join("adoption.json");
     let mut adoption: Adoption = read_checked(&adoption_path)?;
     let assertion = read_maintenance_assertion(maintenance_assertion, source)?;
+    let manifest_path = replay_manifest_path(&root, &adoption.generation_id);
+    let accepted_evidence_ref = format!("sha256:{}", digest(&fs::read(&manifest_path)?));
     if adoption.installation_id != installation.installation_id
         || !matches!(adoption.state.as_str(), "retaining_source" | "complete")
         || adoption.source != source.display().to_string()
@@ -752,7 +2106,7 @@ fn resume_empty_adoption_after_move(
         || adoption.source_digest != digest(&[])
         || adoption.maintenance_assertion != assertion
         || adoption.record_outcome != "empty_vacuous"
-        || adoption.accepted_evidence_ref != Some(format!("sha256:{}", digest(&[])))
+        || adoption.accepted_evidence_ref != Some(accepted_evidence_ref)
     {
         bail!("interrupted empty legacy adoption evidence is inconsistent");
     }
@@ -781,6 +2135,7 @@ fn resume_empty_adoption_after_move(
         if !adoption.source_directory_synced {
             bail!("completed empty adoption lacks source directory sync evidence");
         }
+        validate_complete_adoption(&root, &installation, &adoption)?;
         File::unlock(&coordination_lock).context("unlocking accounting coordination")?;
         return Ok(format!(
             "empty legacy accounting journal already adopted for generation {}",
@@ -968,10 +2323,23 @@ fn verify_generations(
     installation: &Installation,
     coordination: &Coordination,
 ) -> Result<BTreeMap<String, GenerationState>> {
+    verify_generations_with_adoption(root, installation, coordination, false)
+}
+
+fn verify_generations_with_adoption(
+    root: &Path,
+    installation: &Installation,
+    coordination: &Coordination,
+    allow_unlocked_replayable: bool,
+) -> Result<BTreeMap<String, GenerationState>> {
     let generation_root = root.join("generations");
     let mut states = BTreeMap::new();
     let mut state_checksums = BTreeSet::new();
     let mut journals = BTreeSet::new();
+    let mut replay_manifests = BTreeSet::new();
+    let mut replay_checksums = BTreeSet::new();
+    let mut conflict_snapshots = BTreeSet::new();
+    let mut conflict_checksums = BTreeSet::new();
     for entry in fs::read_dir(&generation_root)? {
         let path = entry?.path();
         let name = path
@@ -980,6 +2348,18 @@ fn verify_generations(
             .context("generation filename is not valid UTF-8")?;
         if let Some(id) = name.strip_suffix(".state.json.sha256") {
             state_checksums.insert(id.to_string());
+        } else if let Some(id) = name.strip_suffix(".replay.json.sha256") {
+            replay_checksums.insert(id.to_string());
+        } else if let Some(id) = name.strip_suffix(".replay.json") {
+            replay_manifests.insert(id.to_string());
+        } else if let Some(target) = name.strip_suffix(".sha256") {
+            if is_conflict_snapshot_name(target) {
+                conflict_checksums.insert(target.to_string());
+            } else {
+                bail!("unknown accounting generation artifact {}", path.display());
+            }
+        } else if is_conflict_snapshot_name(name) {
+            conflict_snapshots.insert(name.to_string());
         } else if let Some(id) = name.strip_suffix(".state.json") {
             let state: GenerationState = read_checked(&path)?;
             if state.format_version != FORMAT_VERSION
@@ -1010,6 +2390,24 @@ fn verify_generations(
     if state_checksums != states.keys().cloned().collect() {
         bail!("generation state/checksum inventory is incomplete");
     }
+    if replay_manifests != replay_checksums {
+        bail!("generation replay/checksum inventory is incomplete");
+    }
+    if conflict_snapshots != conflict_checksums {
+        bail!("generation conflict/checksum inventory is incomplete");
+    }
+    if replay_manifests
+        .iter()
+        .any(|generation_id| !states.contains_key(generation_id))
+    {
+        bail!("generation replay evidence has no owned generation");
+    }
+    if conflict_snapshots.iter().any(|name| {
+        conflict_snapshot_generation(name)
+            .is_none_or(|generation_id| !states.contains_key(generation_id))
+    }) {
+        bail!("generation conflict evidence has no owned generation");
+    }
     let mut expected = states.values().map(coverage).collect::<Vec<_>>();
     sort_coverage(&mut expected);
     let mut actual = coordination.coverage.clone();
@@ -1024,10 +2422,12 @@ fn verify_generations(
         match file.try_lock() {
             Ok(()) => {
                 File::unlock(&file)?;
-                if matches!(
-                    state.phase,
-                    GenerationPhase::Active | GenerationPhase::Draining | GenerationPhase::Adopting
-                ) {
+                if state.phase == GenerationPhase::Draining
+                    || (matches!(
+                        state.phase,
+                        GenerationPhase::Active | GenerationPhase::Adopting
+                    ) && !allow_unlocked_replayable)
+                {
                     bail!(
                         "generation {} has unresolved {:?} evidence",
                         state.generation_id,
@@ -1039,6 +2439,20 @@ fn verify_generations(
                     || digest(&bytes) != state.journal_evidence_digest
                 {
                     bail!("unlocked generation journal evidence changed");
+                }
+                if state.phase == GenerationPhase::Reconciled && state.journal_length > 0 {
+                    let manifest_path = state
+                        .replay_manifest
+                        .as_deref()
+                        .map(Path::new)
+                        .context("reconciled generation is missing replay evidence")?;
+                    let manifest_digest = digest(&fs::read(manifest_path)?);
+                    if manifest_path != replay_manifest_path(root, &state.generation_id)
+                        || state.replay_manifest_digest.as_deref() != Some(manifest_digest.as_str())
+                    {
+                        bail!("reconciled generation replay evidence changed");
+                    }
+                    let _: ReplayManifest = read_checked(manifest_path)?;
                 }
             }
             Err(std::fs::TryLockError::WouldBlock) => {
@@ -1460,7 +2874,9 @@ fn checked_target_allowed(name: &str, generations: bool) -> bool {
     if generations {
         return name
             .strip_suffix(".state.json")
-            .is_some_and(|generation_id| !generation_id.is_empty());
+            .or_else(|| name.strip_suffix(".replay.json"))
+            .is_some_and(|generation_id| !generation_id.is_empty())
+            || is_conflict_snapshot_name(name);
     }
     matches!(
         name,
@@ -1470,6 +2886,33 @@ fn checked_target_allowed(name: &str, generations: bool) -> bool {
             | "provisioning.json"
             | "adoption.json"
     )
+}
+
+fn is_conflict_snapshot_name(name: &str) -> bool {
+    conflict_snapshot_generation(name).is_some()
+}
+
+fn conflict_snapshot_generation(name: &str) -> Option<&str> {
+    conflict_snapshot_identity(name).map(|identity| identity.0)
+}
+
+fn conflict_snapshot_identity(name: &str) -> Option<(&str, u64, u64, &str)> {
+    let (generation_id, rest) = name.split_once(".conflict.")?;
+    let rest = rest.strip_suffix(".json")?;
+    let mut parts = rest.split('.');
+    let frame_offset = parts.next()?.parse().ok()?;
+    let frame_length = parts.next()?.parse().ok()?;
+    let frame_digest = parts.next()?;
+    if generation_id.is_empty()
+        || parts.next().is_some()
+        || frame_digest.len() != 64
+        || !frame_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some((generation_id, frame_offset, frame_length, frame_digest))
 }
 
 fn read_checked<T: DeserializeOwned>(path: &Path) -> Result<T> {
@@ -1592,6 +3035,301 @@ fn set_readonly_file(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journal_parser_replays_complete_frames_and_retains_unresolved_bytes() {
+        let complete = serde_json::to_vec(&AccountingEvent {
+            id: "complete".into(),
+            kind: "fixture".into(),
+            payload: serde_json::json!({"value": 1}),
+            created_at: "2026-09-29T00:00:00Z".into(),
+        })
+        .expect("complete frame");
+        let mut journal = complete.clone();
+        journal.extend_from_slice(b"\nnot-json\n{\"id\":\"torn\"");
+
+        let parsed = parse_journal(&journal);
+
+        assert_eq!(parsed.frames.len(), 1);
+        assert_eq!(parsed.frames[0].event.id, "complete");
+        assert_eq!(parsed.frames[0].offset, 0);
+        assert_eq!(parsed.frames[0].length, complete.len() as u64 + 1);
+        assert_eq!(parsed.malformed.len(), 1);
+        assert_eq!(parsed.malformed[0].offset, complete.len() as u64 + 1);
+        assert_eq!(
+            parsed.torn_tail.as_ref().map(|tail| tail.length),
+            Some(b"{\"id\":\"torn\"".len() as u64)
+        );
+    }
+
+    #[test]
+    fn replay_manifest_recovers_published_conflict_before_retry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let installation: Installation =
+            read_checked(&root.join("installation.json")).expect("installation");
+        let mut coordination: Coordination =
+            read_checked(&root.join("coordination.json")).expect("coordination");
+        let generation_id = "fixture-generation";
+        let event = AccountingEvent {
+            id: "event".into(),
+            kind: "fixture".into(),
+            payload: serde_json::json!({"value": 1}),
+            created_at: "2026-09-29T00:00:00Z".into(),
+        };
+        let mut journal = serde_json::to_vec(&event).expect("event bytes");
+        journal.push(b'\n');
+        let parsed = parse_journal(&journal);
+        let state = GenerationState {
+            format_version: FORMAT_VERSION,
+            installation_id: installation.installation_id.clone(),
+            generation_id: generation_id.into(),
+            revision: 1,
+            phase: GenerationPhase::Adopting,
+            journal: generation_journal_path(&root, generation_id)
+                .display()
+                .to_string(),
+            journal_length: journal.len() as u64,
+            journal_evidence_digest: digest(&journal),
+            admitted_count: Some(0),
+            worker_completed_count: Some(0),
+            journal_synced_count: Some(1),
+            database_committed_count: Some(0),
+            last_complete_record_boundary: None,
+            replay_manifest: None,
+            replay_manifest_digest: None,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        fs::write(generation_journal_path(&root, generation_id), &journal).expect("journal");
+        write_checked(&generation_state_path(&root, generation_id), &state).expect("state");
+        coordination.revision += 1;
+        coordination.coverage.push(coverage(&state));
+        write_checked(&root.join("coordination.json"), &coordination).expect("coordination");
+        let durability = serde_json::json!({"backend":"sqlite"});
+        let manifest_path = replay_manifest_path(&root, generation_id);
+        let manifest = load_or_create_replay_manifest(
+            &manifest_path,
+            &installation,
+            &coordination,
+            &state,
+            &parsed,
+            durability.clone(),
+        )
+        .expect("initial manifest");
+        conflict_receipt(
+            &root,
+            &installation,
+            &manifest,
+            &parsed.frames[0],
+            1,
+            crate::storage::BackgroundEventRow {
+                id: "event".into(),
+                kind: "fixture".into(),
+                payload: "{\"value\":2}".into(),
+                created_at: "2026-09-29T00:00:00Z".into(),
+            },
+            "verification",
+            "sqlite",
+            "serializable",
+        )
+        .expect("published conflict snapshot");
+
+        let recovered = load_or_create_replay_manifest(
+            &manifest_path,
+            &installation,
+            &coordination,
+            &state,
+            &parsed,
+            durability,
+        )
+        .expect("recover manifest");
+
+        assert_eq!(recovered.receipts.len(), 1);
+        assert_eq!(
+            recovered.receipts[0].outcome,
+            ReplayOutcome::DuplicateConflict
+        );
+    }
+
+    #[test]
+    fn identical_conflict_frames_have_distinct_artifact_paths() {
+        let root = Path::new("/tmp/accounting");
+        let line =
+            b"{\"id\":\"same\",\"kind\":\"fixture\",\"payload\":{},\"created_at\":\"now\"}\n";
+        let parsed = parse_journal(&[line.as_slice(), line.as_slice()].concat());
+        assert_eq!(parsed.frames[0].digest, parsed.frames[1].digest);
+        let first_frame = &parsed.frames[0];
+        let second_frame = &parsed.frames[1];
+        let first = conflict_snapshot_path(
+            root,
+            "generation",
+            first_frame.offset,
+            first_frame.length,
+            &first_frame.digest,
+        );
+        let second = conflict_snapshot_path(
+            root,
+            "generation",
+            second_frame.offset,
+            second_frame.length,
+            &second_frame.digest,
+        );
+
+        assert_ne!(first, second, "frame position must be part of identity");
+    }
+
+    #[test]
+    fn replay_publication_waits_for_coordination_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let installation: Installation =
+            read_checked(&root.join("installation.json")).expect("installation");
+        let mut coordination: Coordination =
+            read_checked(&root.join("coordination.json")).expect("coordination");
+        let generation_id = "fixture-generation";
+        let journal_path = generation_journal_path(&root, generation_id);
+        fs::write(&journal_path, b"").expect("journal");
+        let state = GenerationState {
+            format_version: FORMAT_VERSION,
+            installation_id: installation.installation_id.clone(),
+            generation_id: generation_id.into(),
+            revision: 1,
+            phase: GenerationPhase::Adopting,
+            journal: journal_path.display().to_string(),
+            journal_length: 0,
+            journal_evidence_digest: digest(b""),
+            admitted_count: Some(0),
+            worker_completed_count: Some(0),
+            journal_synced_count: Some(0),
+            database_committed_count: Some(0),
+            last_complete_record_boundary: None,
+            replay_manifest: None,
+            replay_manifest_digest: None,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_checked(&generation_state_path(&root, generation_id), &state).expect("state");
+        coordination.revision += 1;
+        coordination.coverage.push(coverage(&state));
+        write_checked(&root.join("coordination.json"), &coordination).expect("coordination");
+        let manifest_path = replay_manifest_path(&root, generation_id);
+        let mut manifest = load_or_create_replay_manifest(
+            &manifest_path,
+            &installation,
+            &coordination,
+            &state,
+            &parse_journal(b""),
+            serde_json::json!({"backend":"sqlite"}),
+        )
+        .expect("manifest");
+        manifest.retry_exhausted = true;
+        let before = fs::read(&manifest_path).expect("manifest bytes");
+        let lock = open_coordination_lock(&root).expect("coordination lock");
+        lock.lock().expect("hold coordination lock");
+        let (started_tx, started_rx) = mpsc::channel();
+        let publish_root = root.clone();
+        let publish_path = manifest_path.clone();
+        let publisher = thread::spawn(move || {
+            started_tx.send(()).expect("publisher started");
+            publish_replay_manifest(&publish_root, &publish_path, &mut manifest)
+        });
+        started_rx.recv().expect("publisher ready");
+        thread::sleep(Duration::from_millis(20));
+        assert_eq!(fs::read(&manifest_path).expect("manifest bytes"), before);
+        File::unlock(&lock).expect("release coordination lock");
+        publisher
+            .join()
+            .expect("publisher thread")
+            .expect("publish after lock release");
+        assert_ne!(fs::read(&manifest_path).expect("manifest bytes"), before);
+    }
+
+    #[test]
+    fn reconciled_state_publication_repairs_coverage_after_crash() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting");
+        AccountingCoordinator::provision(&root).expect("provision");
+        let installation: Installation =
+            read_checked(&root.join("installation.json")).expect("installation");
+        let mut coordination: Coordination =
+            read_checked(&root.join("coordination.json")).expect("coordination");
+        let generation_id = "fixture-generation";
+        let journal_path = generation_journal_path(&root, generation_id);
+        fs::write(&journal_path, b"").expect("journal");
+        let mut state = GenerationState {
+            format_version: FORMAT_VERSION,
+            installation_id: installation.installation_id.clone(),
+            generation_id: generation_id.into(),
+            revision: 1,
+            phase: GenerationPhase::Adopting,
+            journal: journal_path.display().to_string(),
+            journal_length: 0,
+            journal_evidence_digest: digest(b""),
+            admitted_count: Some(0),
+            worker_completed_count: Some(0),
+            journal_synced_count: Some(0),
+            database_committed_count: Some(0),
+            last_complete_record_boundary: None,
+            replay_manifest: None,
+            replay_manifest_digest: None,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_checked(&generation_state_path(&root, generation_id), &state).expect("state");
+        coordination.revision += 1;
+        coordination.coverage.push(coverage(&state));
+        write_checked(&root.join("coordination.json"), &coordination).expect("coordination");
+        let manifest_path = replay_manifest_path(&root, generation_id);
+        let (ordered_receipt_digest, outcome_counts) = receipt_summary(&[]).expect("summary");
+        write_checked(
+            &manifest_path,
+            &ReplayManifest {
+                format_version: FORMAT_VERSION,
+                installation_id: installation.installation_id,
+                generation_id: generation_id.into(),
+                revision: 1,
+                source_coordination_revision: coordination.revision,
+                source_generation_revision: state.revision,
+                journal_length: 0,
+                journal_evidence_digest: digest(b""),
+                complete_boundary: 0,
+                complete_record_count: 0,
+                malformed_frames: Vec::new(),
+                torn_tail_offset: None,
+                torn_tail_length: 0,
+                torn_tail_digest: None,
+                database_durability: serde_json::json!({"backend":"sqlite"}),
+                receipts: Vec::new(),
+                ordered_receipt_digest,
+                outcome_counts,
+                parser_result: "complete".into(),
+                sync_result: "synced".into(),
+                retry_exhausted: false,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("manifest");
+        state.revision += 1;
+        state.phase = GenerationPhase::Reconciled;
+        state.last_complete_record_boundary = Some(0);
+        state.replay_manifest = Some(manifest_path.display().to_string());
+        state.replay_manifest_digest = Some(digest(&fs::read(&manifest_path).expect("manifest")));
+        write_checked(&generation_state_path(&root, generation_id), &state)
+            .expect("publish state before coordination");
+
+        recover_reconciled_coverage_gap(&root, &mut coordination, &state)
+            .expect("repair expected publication gap");
+
+        let repaired: Coordination =
+            read_checked(&root.join("coordination.json")).expect("repaired coordination");
+        assert_eq!(
+            repaired
+                .coverage
+                .iter()
+                .find(|entry| entry.generation_id == generation_id),
+            Some(&coverage(&state))
+        );
+    }
 
     #[cfg(not(unix))]
     #[test]
@@ -1749,6 +3487,13 @@ mod tests {
                 journal: journal_path.display().to_string(),
                 journal_length: 0,
                 journal_evidence_digest: digest(bytes),
+                admitted_count: Some(0),
+                worker_completed_count: Some(0),
+                journal_synced_count: Some(0),
+                database_committed_count: Some(0),
+                last_complete_record_boundary: None,
+                replay_manifest: None,
+                replay_manifest_digest: None,
                 updated_at: Utc::now().to_rfc3339(),
             },
         )
