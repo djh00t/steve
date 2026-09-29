@@ -132,6 +132,168 @@ async fn sqlite_rejects_migration_ledger_column_drift() {
     }
 }
 
+#[tokio::test]
+async fn sqlite_rejects_foundation_column_drift() {
+    for (case, table_schema, should_ready, extra) in [
+        (
+            "valid v1",
+            "id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL",
+            true,
+            ExtraColumn::None,
+        ),
+        (
+            "nullable kind",
+            "id TEXT PRIMARY KEY, kind TEXT, payload TEXT NOT NULL, created_at TEXT NOT NULL",
+            false,
+            ExtraColumn::None,
+        ),
+        (
+            "generated extra",
+            "id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, extra TEXT GENERATED ALWAYS AS (kind || '-generated') VIRTUAL",
+            false,
+            ExtraColumn::Generated,
+        ),
+        (
+            "ordinary extra",
+            "id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, extra TEXT",
+            false,
+            ExtraColumn::Stored("extra-sentinel"),
+        ),
+        (
+            "wrong type",
+            "id BLOB PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL",
+            false,
+            ExtraColumn::None,
+        ),
+        (
+            "wrong primary key",
+            "id TEXT, kind TEXT NOT NULL PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL",
+            false,
+            ExtraColumn::None,
+        ),
+        (
+            "default",
+            "id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT 'now'",
+            false,
+            ExtraColumn::None,
+        ),
+    ] {
+        let temp = tempdir().expect("create SQLite temp directory");
+        let database_path = temp.path().join("seeded.db");
+        let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect to seeded SQLite database");
+        sqlx::query(
+            "CREATE TABLE steve_schema_migrations (
+                version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create migration ledger");
+        sqlx::query(&format!("CREATE TABLE steve_background_events ({table_schema})"))
+            .execute(&pool)
+            .await
+            .expect("create application table");
+        sqlx::query(
+            "INSERT INTO steve_schema_migrations(version, name, applied_at)
+             VALUES (1, 'm0_foundation', '2026-09-28T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed migration ledger");
+        sqlx::query(
+            "INSERT INTO steve_background_events(id, kind, payload, created_at)
+             VALUES ('preserve-me', 'fixture', 'payload', '2026-09-28T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed application row");
+        if let ExtraColumn::Stored(value) = extra {
+            sqlx::query("UPDATE steve_background_events SET extra = ? WHERE id = 'preserve-me'")
+                .bind(value)
+                .execute(&pool)
+                .await
+                .expect("seed extra column");
+        }
+        pool.close().await;
+
+        let mut steve =
+            SteveProcess::start_with_database_url(&database_url).expect("start Steve process");
+        let ready = steve.wait_ready(Duration::from_secs(15)).await;
+        if should_ready {
+            assert!(
+                ready.is_ok(),
+                "{case}: valid v1 must reach readiness: {}",
+                ready.err().unwrap_or_default()
+            );
+            drop(steve);
+        } else {
+            let error = match ready {
+                Ok(_) => panic!("{case}: drifted application table must block readiness"),
+                Err(error) => error,
+            };
+            assert!(error.contains("Steve exited"), "{case}: {error}");
+            assert!(error.contains("application column shape"), "{case}: {error}");
+        }
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("reconnect to seeded SQLite database");
+        let ledger: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT version, name, applied_at FROM steve_schema_migrations ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query migration ledger");
+        assert_eq!(
+            ledger,
+            vec![(
+                1,
+                "m0_foundation".to_owned(),
+                "2026-09-28T00:00:00Z".to_owned(),
+            )],
+            "{case}"
+        );
+        let events: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT id, kind, payload, created_at FROM steve_background_events ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("query application rows");
+        assert_eq!(
+            events,
+            vec![(
+                "preserve-me".to_owned(),
+                "fixture".to_owned(),
+                "payload".to_owned(),
+                "2026-09-28T00:00:00Z".to_owned(),
+            )],
+            "{case}"
+        );
+        if !matches!(extra, ExtraColumn::None) {
+            let value: String = sqlx::query_scalar(
+                "SELECT extra FROM steve_background_events WHERE id = 'preserve-me'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("query extra application column");
+            let expected = match extra {
+                ExtraColumn::Stored(value) => value,
+                ExtraColumn::Generated => "fixture-generated",
+                ExtraColumn::None => unreachable!(),
+            };
+            assert_eq!(value, expected, "{case}");
+        }
+        pool.close().await;
+    }
+}
+
 async fn run_sqlite_migration_case(
     case: &str,
     ledger_schema: &str,
