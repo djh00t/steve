@@ -30,6 +30,12 @@ const SNAPSHOT_FRESHNESS: Duration = PRODUCTION_SNAPSHOT_FRESHNESS;
 #[cfg(test)]
 const SNAPSHOT_FRESHNESS: Duration = Duration::from_secs(1); // Parallel unit tests can be unscheduled.
 
+#[cfg(test)]
+thread_local! {
+    static LOCK_CONTENTION_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct AccountingEvent {
     pub(crate) id: String,
@@ -5048,6 +5054,20 @@ fn lock_with_timeout(file: &File, timeout: Duration) -> Result<()> {
         match file.try_lock() {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                let synchronized = LOCK_CONTENTION_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().take() {
+                        hook();
+                        true
+                    } else {
+                        false
+                    }
+                });
+                #[cfg(test)]
+                if synchronized {
+                    first_attempt = true;
+                    continue;
+                }
                 thread::sleep(LOCK_POLL.min(deadline.saturating_duration_since(Instant::now())));
             }
             Err(std::fs::TryLockError::Error(err)) => {
@@ -6109,11 +6129,16 @@ mod tests {
         fs::rename(&checksum, &checksum_staging).expect("stage checksum publication");
 
         let start_root = root.clone();
-        let replacement = thread::spawn(move || AccountingCoordinator::start(&start_root, 1));
-        thread::sleep(Duration::from_millis(25));
-        fs::rename(&incident_staging, &incident).expect("publish incident");
-        fs::rename(&checksum_staging, &checksum).expect("publish checksum");
-        File::unlock(&lock).expect("finish publication");
+        let replacement = thread::spawn(move || {
+            LOCK_CONTENTION_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    fs::rename(&incident_staging, &incident).expect("publish incident");
+                    fs::rename(&checksum_staging, &checksum).expect("publish checksum");
+                    File::unlock(&lock).expect("finish publication");
+                }));
+            });
+            AccountingCoordinator::start(&start_root, 1)
+        });
 
         replacement
             .join()
