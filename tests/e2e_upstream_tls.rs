@@ -29,9 +29,14 @@ async fn stv_prov_38_shared_trust_acceptance() {
     .await
     .expect("start HTTPS provider fixture");
     let ca = Path::new("tests/fixtures/tls/ca.pem");
+    let bundle_dir = tempfile::tempdir().expect("CA bundle directory");
+    let bundle = bundle_dir.path().join("multi-ca.pem");
+    let certificate = fs::read(ca).expect("read CA certificate");
+    fs::write(&bundle, certificate.repeat(2)).expect("write multi-certificate bundle");
     let url = fixture.url();
-    let mut steve = SteveProcess::start_with_upstream_ca_bundle(Some(&url), Some(&url), Some(ca))
-        .expect("start Steve with CA bundle");
+    let mut steve =
+        SteveProcess::start_with_upstream_ca_bundle(Some(&url), Some(&url), Some(&bundle))
+            .expect("start Steve with CA bundle");
     let listeners = steve
         .wait_ready(READY_TIMEOUT)
         .await
@@ -86,6 +91,7 @@ async fn invalid_ca_bundles_fail_before_readiness() {
     let empty = temp.path().join("empty.pem");
     let malformed = temp.path().join("malformed.pem");
     let invalid_der = temp.path().join("invalid-der.pem");
+    let mixed = temp.path().join("mixed.pem");
     fs::write(&empty, b"").expect("write empty bundle");
     fs::write(
         &malformed,
@@ -97,12 +103,18 @@ async fn invalid_ca_bundles_fail_before_readiness() {
         b"-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n",
     )
     .expect("write invalid DER bundle");
+    let mut mixed_pem = fs::read("tests/fixtures/tls/ca.pem").expect("read valid CA");
+    mixed_pem.extend_from_slice(
+        b"-----BEGIN PRIVATE KEY-----\nU0VDUkVUX0tFWV9CWVRFUw==\n-----END PRIVATE KEY-----\n",
+    );
+    fs::write(&mixed, mixed_pem).expect("write mixed bundle");
 
     for (path, kind) in [
         (missing.as_path(), "reading"),
         (empty.as_path(), "empty"),
         (malformed.as_path(), "parsing"),
         (invalid_der.as_path(), "building"),
+        (mixed.as_path(), "parsing"),
     ] {
         assert_ca_rejected(path, kind).await;
     }
@@ -122,4 +134,8 @@ async fn assert_ca_rejected(path: &Path, kind: &str) {
     assert!(error.contains(&path.display().to_string()), "{error}");
     assert!(error.contains(kind), "{error}");
     assert!(!error.contains("@@@"), "CA contents leaked: {error}");
+    assert!(
+        !error.contains("U0VDUkVUX0tFWV9CWVRFUw=="),
+        "key contents leaked: {error}"
+    );
 }

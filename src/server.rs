@@ -234,8 +234,40 @@ pub async fn run(
     let certificates = if let Some(path) = &cfg.server.upstream_ca_bundle {
         let pem = std::fs::read(path)
             .with_context(|| format!("reading upstream CA bundle {}", path.display()))?;
-        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
-            .with_context(|| format!("parsing upstream CA bundle {}", path.display()))?;
+        let mut certificates = Vec::new();
+        let mut start = None;
+        let mut offset = 0;
+        for line in pem.split_inclusive(|byte| *byte == b'\n') {
+            let content = line.trim_ascii();
+            match (start, content) {
+                (None, b"") => {}
+                (None, b"-----BEGIN CERTIFICATE-----") => start = Some(offset),
+                (Some(begin), b"-----END CERTIFICATE-----") => {
+                    certificates.push(
+                        reqwest::Certificate::from_pem(&pem[begin..offset + line.len()])
+                            .with_context(|| {
+                                format!("parsing upstream CA bundle {}", path.display())
+                            })?,
+                    );
+                    start = None;
+                }
+                (Some(_), content)
+                    if content.iter().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(*byte, b'+' | b'/' | b'=')
+                    }) => {}
+                _ => anyhow::bail!(
+                    "parsing upstream CA bundle {}: unexpected PEM content",
+                    path.display()
+                ),
+            }
+            offset += line.len();
+        }
+        if start.is_some() {
+            anyhow::bail!(
+                "parsing upstream CA bundle {}: incomplete certificate",
+                path.display()
+            );
+        }
         if certificates.is_empty() {
             anyhow::bail!("empty upstream CA bundle {}", path.display());
         }
