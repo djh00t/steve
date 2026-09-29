@@ -156,6 +156,7 @@ impl SteveProcess {
 
     #[allow(dead_code, clippy::too_many_arguments)]
     pub fn start_with_accounting_fault_fixture(
+        openai_upstream_url: Option<&str>,
         database_url: &str,
         accounting_root: &Path,
         accounting_capacity: usize,
@@ -165,7 +166,7 @@ impl SteveProcess {
         retry_interval_ms: u64,
     ) -> io::Result<Self> {
         Self::start_with_options(
-            None,
+            openai_upstream_url,
             None,
             60,
             None,

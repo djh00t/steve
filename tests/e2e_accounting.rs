@@ -4,6 +4,8 @@
 mod object_store;
 #[path = "support/process.rs"]
 mod process;
+#[path = "support/upstream.rs"]
+mod upstream;
 
 use object_store::HeldObjectStoreEndpoint;
 use process::{acquire_accounting_startup_lock, steve_command, SteveProcess};
@@ -63,6 +65,20 @@ fn generation_journals(root: &Path) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     paths.sort();
     paths
+}
+
+fn journal_events(root: &Path) -> Vec<Value> {
+    generation_journals(root)
+        .into_iter()
+        .flat_map(|path| {
+            fs::read(path)
+                .expect("read generation journal")
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).expect("valid journal event"))
+                .collect::<Vec<Value>>()
+        })
+        .collect()
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -810,6 +826,281 @@ async fn accounting_counts_refresh_before_later_worker_timeout() {
     pool.close().await;
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_accounting_does_not_delay_response() {
+    use tokio_stream::StreamExt;
+    use upstream::{ControlledUpstream, Tail};
+
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting-root");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("chat-saturation.db").display()
+        );
+        assert!(
+            provision(&root).status.success(),
+            "provision accounting root"
+        );
+        let pool = prepare_sqlite(&database_url).await;
+        let first = b"data: {\"id\":\"chatcmpl_accounting\",\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}]}\n\n";
+        let tail = b"data: {\"id\":\"chatcmpl_accounting\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\ndata: [DONE]\n\n";
+        let mut upstream = ControlledUpstream::start(
+            "/v1/chat/completions",
+            first.as_slice(),
+            Tail::Bytes(tail.as_slice().into()),
+        )
+        .await
+        .expect("start controlled Chat upstream");
+        let mut process = SteveProcess::start_with_accounting_fault_fixture(
+            Some(&upstream.url()),
+            &database_url,
+            &root,
+            1,
+            1,
+            100,
+            5_000,
+            25,
+        )
+        .expect("start Chat accounting fixture");
+        let listeners = process
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .expect("Chat accounting fixture ready");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("HTTP client");
+        let mut database_lock = pool.acquire().await.expect("SQLite lock connection");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *database_lock)
+            .await
+            .expect("hold SQLite writer");
+        let coordination_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("coordination.lock"))
+            .expect("open accounting coordination lock");
+        coordination_lock
+            .lock()
+            .expect("hold accounting coordination lock");
+
+        let mut admitted = 0_u64;
+        for sequence in 0..16 {
+            let response = client
+                .post(format!("http://{}/api/v1/test/echo", listeners.inference))
+                .json(&json!({"value":{"saturation":sequence}}))
+                .send()
+                .await
+                .expect("send saturation accounting event");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            admitted += 1;
+            let status: Value = client
+                .get(format!(
+                    "http://{}/api/v1/system/status",
+                    listeners.management
+                ))
+                .send()
+                .await
+                .expect("read queue status")
+                .error_for_status()
+                .expect("queue status response")
+                .json()
+                .await
+                .expect("queue status JSON");
+            if status["queues"]["accounting_spilled"] == 1 {
+                break;
+            }
+        }
+        let saturated: Value = client
+            .get(format!(
+                "http://{}/api/v1/system/status",
+                listeners.management
+            ))
+            .send()
+            .await
+            .expect("read saturated queue status")
+            .error_for_status()
+            .expect("saturated queue status response")
+            .json()
+            .await
+            .expect("saturated queue status JSON");
+        assert_eq!(
+            saturated["queues"]["accounting_spilled"], 1,
+            "primary accounting queue did not saturate"
+        );
+
+        let response = client
+            .post(format!(
+                "http://{}/v1/chat/completions",
+                listeners.inference
+            ))
+            .json(&json!({
+                "model":"steve-test-model",
+                "messages":[{"role":"user","content":"prove nonblocking accounting"}],
+                "stream":true
+            }))
+            .send()
+            .await
+            .expect("request Chat stream while accounting is blocked");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let captured = upstream
+            .wait_for_request(Duration::from_secs(3))
+            .await
+            .expect("Chat request reached upstream");
+        assert_eq!(captured["model"], "steve-test-model");
+        let mut response = response.bytes_stream();
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !received.ends_with(b"\n\n") {
+                received.extend_from_slice(
+                    &response
+                        .next()
+                        .await
+                        .expect("stream ended before first SSE event")
+                        .expect("read first SSE event"),
+                );
+            }
+        })
+        .await
+        .expect("first SSE progress waited for accounting or upstream tail");
+        assert_eq!(received, first);
+        assert!(!upstream.tail_was_sent());
+
+        upstream.release_tail();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(chunk) = response.next().await {
+                received.extend_from_slice(&chunk.expect("read released Chat tail"));
+            }
+        })
+        .await
+        .expect("Chat response waited for accounting durability");
+        assert_eq!(received, [first.as_slice(), tail.as_slice()].concat());
+        admitted += 1;
+        assert!(
+            journal_events(&root)
+                .iter()
+                .all(|event| event["kind"] != "chat.attempt.terminal.v1"),
+            "Chat terminal event became durable while its journal writer was locked"
+        );
+
+        let triggering = client
+            .post(format!("http://{}/api/v1/test/echo", listeners.inference))
+            .json(&json!({"value":"fallback-unavailable"}))
+            .send()
+            .await
+            .expect("send fallback-unavailable trigger");
+        assert_eq!(
+            triggering.status(),
+            reqwest::StatusCode::OK,
+            "already admitted work must finish forwarding"
+        );
+        admitted += 1;
+        let observed = wait_for_incident(&client, listeners.management, "blocked").await;
+        assert_eq!(
+            observed["accounting_incident"]["cause"],
+            "primary_and_journal_unavailable"
+        );
+        assert_eq!(
+            observed["accounting_incident"]["payloads"]["outcome_totals"]
+                ["unrecoverable_lost"],
+            1
+        );
+        let rejected = client
+            .post(format!("http://{}/api/v1/test/echo", listeners.inference))
+            .json(&json!({"value":"after-accounting-incident"}))
+            .send()
+            .await
+            .expect("post-incident admission response");
+        assert_eq!(rejected.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.headers()["cache-control"], "no-store");
+        assert_eq!(rejected.headers()["retry-after"], "1");
+        let rejected_body: Value = rejected.json().await.expect("incident rejection JSON");
+        assert_eq!(
+            rejected_body,
+            json!({"error":{
+                "type":"unavailable",
+                "code":"accounting_incident",
+                "message":"inference admission stopped by an unresolved accounting incident",
+                "incident_id":observed["accounting_incident"]["incident_id"],
+                "state":"blocked"
+            }})
+        );
+
+        File::unlock(&coordination_lock).expect("release accounting coordination lock");
+        sqlx::query("COMMIT")
+            .execute(&mut *database_lock)
+            .await
+            .expect("release SQLite writer");
+        drop(database_lock);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let durable = journal_events(&root);
+                let journaled = durable
+                    .iter()
+                    .filter(|event| event["kind"] == "chat.attempt.terminal.v1")
+                    .count();
+                let lost = incident(&root)["payloads"]["outcome_totals"]
+                    ["unrecoverable_lost"]
+                    .as_u64()
+                    .expect("known incident loss count");
+                if journaled == 1
+                    && sqlite_events(&database_url).await.len() as u64 + durable.len() as u64 + lost
+                        == admitted
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("journal acknowledgement and accounting outcomes did not settle");
+
+        process.send_sigterm().expect("stop Chat accounting fixture");
+        assert!(
+            process
+                .wait_for_exit(Duration::from_secs(8))
+                .await
+                .expect("Chat accounting fixture exits")
+                .success()
+        );
+        let rows = sqlite_events(&database_url).await;
+        let terminal_rows = rows
+            .iter()
+            .filter(|row| row.1 == "chat.attempt.terminal.v1")
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_rows.len(), 1, "Chat terminal replay was not exact-once");
+        assert_eq!(
+            serde_json::from_str::<Value>(&terminal_rows[0].2).expect("terminal payload")["status"],
+            "success"
+        );
+        assert_eq!(
+            latest_generation_state(&root)["phase"],
+            "unclean",
+            "known loss must keep the generation retained instead of retiring it"
+        );
+        let terminal_journal_events = journal_events(&root)
+            .into_iter()
+            .filter(|event| event["kind"] == "chat.attempt.terminal.v1")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            terminal_journal_events.len(),
+            1,
+            "replayed Chat evidence must remain retained"
+        );
+        assert_eq!(
+            terminal_journal_events[0]["id"], terminal_rows[0].0,
+            "database replay must acknowledge the retained Chat event ID"
+        );
+        pool.close().await;
+    })
+    .await
+    .expect("Chat accounting saturation scenario exceeded 45 seconds");
+}
+
 async fn induce_runtime_incident(
     root: &Path,
     database_url: &str,
@@ -824,9 +1115,17 @@ async fn induce_runtime_incident(
         provision(root).status.success(),
         "provision accounting root"
     );
-    let mut process =
-        SteveProcess::start_with_accounting_fault_fixture(database_url, root, 1, 1, 50, 300, 25)
-            .expect("start fault fixture");
+    let mut process = SteveProcess::start_with_accounting_fault_fixture(
+        None,
+        database_url,
+        root,
+        1,
+        1,
+        50,
+        300,
+        25,
+    )
+    .expect("start fault fixture");
     let listeners = process
         .wait_ready(Duration::from_secs(10))
         .await
@@ -1184,9 +1483,17 @@ async fn sibling_fails_closed_when_an_active_owner_crashes_before_incident_publi
         provision(&root).status.success(),
         "provision accounting root"
     );
-    let mut predecessor =
-        SteveProcess::start_with_accounting_fault_fixture(&database_url, &root, 1, 1, 50, 300, 25)
-            .expect("start predecessor");
+    let mut predecessor = SteveProcess::start_with_accounting_fault_fixture(
+        None,
+        &database_url,
+        &root,
+        1,
+        1,
+        50,
+        300,
+        25,
+    )
+    .expect("start predecessor");
     let predecessor_listeners = predecessor
         .wait_ready(Duration::from_secs(10))
         .await
