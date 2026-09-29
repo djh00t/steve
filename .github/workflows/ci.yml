@@ -17,7 +17,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: make check
+        if: github.event_name == 'pull_request'
       - run: make quality-gates
+        if: github.event_name == 'push'
 
   official-sdk:
     runs-on: ubuntu-latest
@@ -147,6 +150,7 @@ jobs:
         run: cargo run -- doctor
 
   container:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
