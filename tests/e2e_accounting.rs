@@ -3,7 +3,7 @@
 #[path = "support/process.rs"]
 mod process;
 
-use process::{steve_command, SteveProcess};
+use process::{acquire_accounting_startup_lock, steve_command, SteveProcess};
 use serde_json::Value;
 use std::{
     fs::{self, File, OpenOptions},
@@ -12,6 +12,7 @@ use std::{
 };
 
 fn run_accounting(args: &[&str], paths: &[&Path]) -> std::process::Output {
+    let startup_lock = acquire_accounting_startup_lock().expect("serialize accounting command");
     let mut command = steve_command();
     command.arg("accounting");
     for arg in args {
@@ -20,11 +21,28 @@ fn run_accounting(args: &[&str], paths: &[&Path]) -> std::process::Output {
     for path in paths {
         command.arg(path);
     }
-    command.output().expect("run Steve accounting command")
+    let output = command.output().expect("run Steve accounting command");
+    File::unlock(&startup_lock).expect("release accounting command lock");
+    output
 }
 
 fn provision(root: &Path) -> std::process::Output {
     run_accounting(&["provision", "--root"], &[root])
+}
+
+fn adopt(source: &Path, root: &Path, maintenance_assertion: &Path) -> std::process::Output {
+    let startup_lock = acquire_accounting_startup_lock().expect("serialize adoption command");
+    let output = steve_command()
+        .args(["accounting", "adopt-legacy", "--source"])
+        .arg(source)
+        .arg("--root")
+        .arg(root)
+        .arg("--maintenance-assertion")
+        .arg(maintenance_assertion)
+        .output()
+        .expect("run Steve legacy adoption");
+    File::unlock(&startup_lock).expect("release adoption command lock");
+    output
 }
 
 fn generation_journals(root: &Path) -> Vec<PathBuf> {
@@ -51,7 +69,9 @@ async fn fresh_provision_and_missing_evidence_fail_closed() {
     );
 
     let installation = fs::read(root.join("installation.json")).expect("installation evidence");
-    let incident = fs::read(root.join("incident.json")).expect("incident evidence");
+    let incident: Value =
+        serde_json::from_slice(&fs::read(root.join("incident.json")).expect("incident evidence"))
+            .expect("valid incident evidence");
     let manifest: Value = serde_json::from_slice(
         &fs::read(root.join("provisioning.json")).expect("provisioning evidence"),
     )
@@ -65,7 +85,19 @@ async fn fresh_provision_and_missing_evidence_fail_closed() {
             .to_string()
     );
     assert!(!installation.is_empty());
-    assert!(!incident.is_empty());
+    assert_eq!(incident["state"], "clear");
+    assert_eq!(incident["incident_id"], Value::Null);
+    assert_eq!(incident["first_observed_at"], Value::Null);
+    assert_eq!(incident["cause"], Value::Null);
+    assert_eq!(incident["disposition"], Value::Null);
+    assert_eq!(incident["payloads"]["pending_replay"]["volatile"], 0);
+    assert_eq!(incident["payloads"]["pending_replay"]["durable"], 0);
+    assert_eq!(incident["payloads"]["provisional"]["unknown"], 0);
+    assert_eq!(incident["payloads"]["outcome_totals"]["reconciled"], 0);
+    assert_eq!(
+        incident["payloads"]["outcome_totals"]["unrecoverable_lost"],
+        0
+    );
 
     let repeated = provision(&root);
     assert!(
@@ -179,30 +211,58 @@ async fn legacy_journal_adoption_is_offline_and_resumable() {
     let temp = tempfile::tempdir().expect("tempdir");
     let source = temp.path().join("accounting-overflow.jsonl");
     let root = temp.path().join("accounting-root");
+    let maintenance_assertion = temp.path().join("maintenance-assertion.json");
+    let incomplete_assertion = temp.path().join("incomplete-assertion.json");
     let event = b"{\"id\":\"0199-test\",\"kind\":\"test\",\"payload\":{\"value\":42},\"created_at\":\"2026-09-29T00:00:00Z\"}\n";
     fs::write(&source, event).expect("legacy source");
+    fs::write(&incomplete_assertion, b"{}").expect("incomplete assertion");
+    let missing = adopt(&source, &root, &maintenance_assertion);
+    assert!(!missing.status.success(), "missing assertion was accepted");
+    let incomplete = adopt(&source, &root, &incomplete_assertion);
+    assert!(
+        !incomplete.status.success(),
+        "incomplete assertion was accepted"
+    );
+    assert!(
+        !root.exists(),
+        "invalid assertion created destination state"
+    );
+
+    fs::write(
+        &maintenance_assertion,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "workload_identity": "legacy-steve",
+            "host": "fixture-host",
+            "source": fs::canonicalize(&source).expect("canonical source"),
+            "stopped": true,
+            "restart_disabled": true,
+            "observed_at": "2026-09-29T00:00:00Z",
+            "command_or_exported_status": "fixture supervisor stopped and disabled legacy-steve"
+        }))
+        .expect("serialize assertion"),
+    )
+    .expect("maintenance assertion");
 
     let locked = OpenOptions::new()
         .read(true)
         .write(true)
         .open(&source)
         .expect("open legacy source");
-    locked.lock().expect("lock legacy source");
-    let busy = run_accounting(
-        &["adopt-legacy", "--source"],
-        &[&source, Path::new("--root"), &root],
+    locked
+        .lock()
+        .expect("cooperating legacy writer holds source lock");
+    let busy = adopt(&source, &root, &maintenance_assertion);
+    File::unlock(&locked).expect("cooperating legacy writer releases source lock");
+    assert!(
+        !busy.status.success(),
+        "cooperating live writer was adopted"
     );
-    File::unlock(&locked).expect("unlock legacy source");
-    assert!(!busy.status.success(), "live legacy source was adopted");
     assert!(
         !root.exists(),
         "failed offline check created destination state"
     );
 
-    let imported = run_accounting(
-        &["adopt-legacy", "--source"],
-        &[&source, Path::new("--root"), &root],
-    );
+    let imported = adopt(&source, &root, &maintenance_assertion);
     assert!(
         imported.status.success(),
         "import failed: {}",
@@ -215,16 +275,19 @@ async fn legacy_journal_adoption_is_offline_and_resumable() {
         serde_json::from_slice(&fs::read(root.join("adoption.json")).expect("adoption evidence"))
             .expect("valid adoption evidence");
     assert_eq!(adoption["state"], "pending_reconciliation");
+    assert_eq!(
+        adoption["maintenance_assertion"]["assertion_kind"],
+        "operator_supplied_unauthenticated"
+    );
+    assert_eq!(adoption["maintenance_assertion"]["stopped"], true);
+    assert_eq!(adoption["maintenance_assertion"]["restart_disabled"], true);
     let backup = PathBuf::from(adoption["backup"].as_str().expect("backup path"));
     assert_eq!(fs::read(&backup).expect("durable backup"), event);
     let journals = generation_journals(&root);
     assert_eq!(journals.len(), 1);
     assert_eq!(fs::read(&journals[0]).expect("imported journal"), event);
 
-    let resumed = run_accounting(
-        &["adopt-legacy", "--source"],
-        &[&source, Path::new("--root"), &root],
-    );
+    let resumed = adopt(&source, &root, &maintenance_assertion);
     assert!(
         resumed.status.success(),
         "resume failed: {}",
@@ -245,4 +308,60 @@ async fn legacy_journal_adoption_is_offline_and_resumable() {
         error.contains("pending reconciliation"),
         "unexpected error: {error}"
     );
+}
+
+#[tokio::test]
+async fn empty_legacy_journal_adoption_completes_vacuously() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("empty-overflow.jsonl");
+    let root = temp.path().join("accounting-root");
+    let maintenance_assertion = temp.path().join("maintenance-assertion.json");
+    fs::write(&source, b"").expect("empty source");
+    let canonical_source = fs::canonicalize(&source).expect("canonical source");
+    fs::write(
+        &maintenance_assertion,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "workload_identity": "legacy-steve",
+            "host": "fixture-host",
+            "source": canonical_source,
+            "stopped": true,
+            "restart_disabled": true,
+            "observed_at": "2026-09-29T00:00:00Z",
+            "command_or_exported_status": "fixture supervisor stopped and disabled legacy-steve"
+        }))
+        .expect("serialize assertion"),
+    )
+    .expect("maintenance assertion");
+
+    let adopted = adopt(&source, &root, &maintenance_assertion);
+    assert!(
+        adopted.status.success(),
+        "empty adoption failed: {}",
+        String::from_utf8_lossy(&adopted.stderr)
+    );
+    assert!(!source.exists(), "empty source was not retained by move");
+    let adoption: Value =
+        serde_json::from_slice(&fs::read(root.join("adoption.json")).expect("adoption evidence"))
+            .expect("valid adoption evidence");
+    assert_eq!(adoption["state"], "complete");
+    assert_eq!(adoption["record_outcome"], "empty_vacuous");
+    assert_eq!(adoption["source_directory_synced"], true);
+    let retained = PathBuf::from(
+        adoption["retained_source"]
+            .as_str()
+            .expect("retained source path"),
+    );
+    assert_eq!(fs::read(retained).expect("retained empty source"), b"");
+    let repeated = adopt(&source, &root, &maintenance_assertion);
+    assert!(
+        repeated.status.success(),
+        "empty adoption retry failed: {}",
+        String::from_utf8_lossy(&repeated.stderr)
+    );
+
+    let mut process = SteveProcess::start_with_accounting_root(&root).expect("start Steve");
+    process
+        .wait_ready(Duration::from_secs(10))
+        .await
+        .expect("empty adoption permits startup");
 }

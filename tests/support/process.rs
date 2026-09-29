@@ -1,6 +1,7 @@
 use std::{
     ffi::OsStr,
-    fs, io,
+    fs::{self, File, OpenOptions},
+    io,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -13,12 +14,24 @@ pub struct SteveProcess {
     child: Child,
     _temp: TempDir,
     log_path: PathBuf,
+    startup_lock: Option<File>,
 }
 
 #[derive(Debug)]
 pub struct Listeners {
     pub inference: SocketAddr,
     pub management: SocketAddr,
+}
+
+pub fn acquire_accounting_startup_lock() -> io::Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(std::env::temp_dir().join("steve-e2e-accounting-startup.lock"))?;
+    lock.lock()?;
+    Ok(lock)
 }
 
 impl SteveProcess {
@@ -111,6 +124,7 @@ impl SteveProcess {
         ca_bundle: Option<&Path>,
         accounting_root: Option<&Path>,
     ) -> io::Result<Self> {
+        let startup_lock = acquire_accounting_startup_lock()?;
         let temp = tempfile::tempdir()?;
         let root = temp.path();
         let db_path = root.join("steve.db");
@@ -193,10 +207,12 @@ impl SteveProcess {
             child,
             _temp: temp,
             log_path,
+            startup_lock: Some(startup_lock),
         })
     }
 
     pub async fn wait_ready(&mut self, timeout: Duration) -> Result<Listeners, String> {
+        let _startup_lock = self.startup_lock.take();
         let deadline = Instant::now() + timeout;
         loop {
             let logs = self.logs();

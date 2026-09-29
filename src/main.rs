@@ -53,6 +53,8 @@ enum AccountingCommand {
         source: PathBuf,
         #[arg(long)]
         root: PathBuf,
+        #[arg(long)]
+        maintenance_assertion: PathBuf,
     },
 }
 
@@ -81,8 +83,15 @@ async fn main() -> Result<()> {
                 println!("accounting root provisioned: {}", root.display());
                 Ok(())
             }
-            AccountingCommand::AdoptLegacy { source, root } => {
-                println!("{}", AccountingCoordinator::adopt_legacy(&source, &root)?);
+            AccountingCommand::AdoptLegacy {
+                source,
+                root,
+                maintenance_assertion,
+            } => {
+                println!(
+                    "{}",
+                    AccountingCoordinator::adopt_legacy(&source, &root, &maintenance_assertion,)?
+                );
                 Ok(())
             }
         },
