@@ -1,0 +1,57 @@
+# M1 release gate
+
+## Outcome
+
+M1 has one operator acceptance point: a loopback browser walkthrough over one exact candidate SHA. It starts the real daemon and deterministic upstream, runs the official SDK journeys and focused real-process scenarios, and exports one evidence summary. Engineering slices are reviewed without asking the operator to accept each deliverable.
+
+The browser has two separate verdicts:
+
+- **Functional run:** the local scenarios behaved as required.
+- **Release eligible:** the functional run passed, required hosted checks passed at the same SHA, and the deployment OS/filesystem/path has the required functional qualification.
+
+An expected conflict, timeout, or unknown outcome is a passing negative scenario when Steve retains it, reports it, and blocks admission as specified. It is not a successful accounting outcome.
+
+## Required evidence
+
+| Area | Observable result | Issues |
+| --- | --- | --- |
+| Protocols | Official OpenAI Chat and Responses and official Anthropic Messages streaming helpers complete through the real local daemon. | #37, #98 |
+| Streaming | First bytes precede the held tail; disconnect cancels upstream work and never replays after output starts. | #37, #98 |
+| Chat accounting | The separately owned #95 nonstream slice emits one `chat.attempt.terminal.v1` per terminal retry attempt. #96 emits no SSE event while pending and exactly one for EOF, upstream error, or disconnect. | #45, #94-#96 |
+| Framing and replay | Complete frames before a torn tail survive; temporary DB failure follows #86's configured per-operation bound; inserted and identical duplicates complete; conflicting or failed records remain retained. | #85-#87 |
+| Incident policy | An admitted response may finish after accounting failure; later inference gets `503 accounting_incident`; readiness is false while liveness/status remain available. Verified reconciliation returns to `clear`. Confirmed loss or irreducible uncertainty requires an auditable operator disposition and restores as redacted `acknowledged` after restart. | #84, #483, #485 |
+| Ownership | Fresh provisioning creates a stable installation identity and initial evidence. Revision-checked coordination and generation coverage permit replacement ready before healthy old exit, reject missing/expired evidence, and never inspect a locked live journal. Legacy flat-file adoption is explicit and offline. | #84, #484, #485 |
+| Shutdown | Management drain and process signal enter the same accounting-drain sequence under one absolute deadline. Management drain preserves its current non-terminating semantics; signal exits after the same barriers. Timeout evidence survives restart. | #84, #485 |
+| Saturation | A test-owned SQLite write lock fills capacity one; SSE progresses before release, then its stable event reconciles once. No production fault-control endpoint or flag exists. | #45, #97 |
+| Catalogue and health | Models, provider health, readiness, liveness, and status retain their contracts. | #37, #98 |
+
+## Ownership, adoption, and durability boundary
+
+The #483/#484 selections and #485 completion contract are working design baselines. One explicitly provisioned absolute private root contains a stable installation identity, a coordination lock, revisioned incident evidence, per-generation state and locked journals. A coordination update rereads the revision and records coverage tuples `(generation_id, generation_state_revision, journal_evidence_digest)`. A snapshot is usable only within the working-baseline freshness window; a stale revision, expired snapshot, missing/corrupt artifact, unsupported path, or sync/lock/publication error fails closed. A healthy busy predecessor journal is left untouched.
+
+The existing relative flat journal is never adopted automatically. Offline adoption stops all old writers, hashes and syncs a backup, provisions a distinct root, and imports under a locked generation using #85 framing. An empty source may complete vacuously. A nonempty source remains staged and startup-blocking, with source and backup retained, until the Task 3 replay path produces #485 acknowledgements; only then may it sync the adoption marker and move the unchanged source to a retained name. Any incomplete evidence fails closed and resumes from the backup.
+
+Completion has narrow meanings:
+
+- journal acknowledgement: frame write, flush, and file sync completed;
+- database acknowledgement: inserted or byte-identical duplicate under the backend's qualified durability settings;
+- drain acknowledgement: worker and journal barriers cover all earlier accepted messages; and
+- retirement: every covered frame is acknowledged, completion/incident evidence and containing directory are synced, and the backend guarantee covers the declared failure domain.
+
+M1 executable evidence covers **process crash only**. OS crash and power-loss durability remain **unknown** and must never be inferred from CI. The gate retains the completed generation rather than retire the only journal copy while either is unknown. Future retirement additionally requires the full backend durability contract: SQLite WAL accounting connections verified at `synchronous=FULL`, or PostgreSQL verified with `fsync=on`, `synchronous_commit=on`, and `full_page_writes=on`, plus separately qualified storage durability for the declared OS/power failure domain.
+
+Both drain triggers use one absolute deadline calculated once from `server.drain_timeout_seconds`; no stage resets it. Before the final admitted body or accounting write can fail, Steve syncs generation state that makes restart conservative. It then stops inference admission, lets admitted bodies finish until the deadline, cancels what remains, closes accounting producers, runs worker and journal barriers with the remaining time, and persists completion or unresolved evidence. Ownership is released only after every writer has stopped and joined. On successful management drain the process remains running and not-ready after releasing the completed generation. On management-drain timeout it remains running, retains the generation lock and unresolved evidence while any writer is alive, and a successor cannot acquire that generation. On signal timeout it retains ownership until process termination closes the file and releases the OS lock. Restart then observes unresolved evidence.
+
+## Guided walkthrough
+
+`scripts/m1_release_gate.py --guided` binds an ephemeral loopback address and opens one page with one **Run M1 gate** action. The runner accepts only fixed allowlisted steps. State changes are POST-only and require the exact loopback `Host`, exact `Origin`, and a random capability token. The page inserts command output with `textContent`, never HTML. Every subprocess has a deadline, runs in a killable process group, and is reaped with its daemon/fixture children on success, failure, disconnect, or interrupt. Foreign Host/Origin/token requests fail.
+
+The page shows daemon readiness, SDK journeys, Chat accounting, cancellation/no-replay, recovery, incident/restart, replacement, shutdown success/timeout, saturation, models/health, targeted mutation outcomes, SHA/dirty state, hosted evidence, target qualification, and unsupported limits. Headless mode runs the same allowlist and writes JSON for CI. It adds no curl, Swagger, frontend dependency, credential, bypass, or production test control. The gate builds the binary itself from a clean exact SHA using the tracked lockfile, records the binary hash and Rust/Cargo/Python/SDK versions, and runs only that binary. Python checks use explicit exceptions rather than `assert` and pass with `PYTHONOPTIMIZE=1`.
+
+Exact issue ownership, files, and focused selector commands are recorded in [the M1 implementation handoff](m1-acceptance.md#integrated-implementation-and-qualification-handoff). None is passing evidence until it exists and passes on the exact candidate SHA.
+
+## Qualification and final operator step
+
+Target qualification functionally verifies exclusive locking, publication/atomic replacement, append visibility, file and directory sync calls, revision/coverage behavior, and lock release after process death on the named OS/filesystem/path. This is process-level evidence. Linux/ext4 evidence does not qualify macOS/APFS, Windows/NTFS, network storage, or another path; OS-crash and power-loss behavior stay unknown unless separately proven.
+
+After PR #619 is ready for review, hosted checks and mutation evidence exist at its exact head, and target functional qualification is attached, the operator reviews the single browser summary and exported JSON. The release document's earlier proposal/approval wording is updated only at this final gate. The operator accepts or rejects M1 once; the gate never merges, deploys, acknowledges an accounting incident, or records release acceptance for them.
