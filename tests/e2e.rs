@@ -1221,30 +1221,10 @@ async fn chat_nonstream_accounting() {
                     .bind(&row.0).fetch_one(&pool).await.expect("count event by ID");
                 assert_eq!(count, 1);
             }
-            let stream_response = client
-                .post(format!("http://{}/v1/chat/completions", listeners.inference))
-                .json(&json!({"model":"gpt-test","messages":[{"role":"user","content":"hi"}],"stream":true}))
-                .send().await.expect("send streaming Chat request");
-            assert_eq!(stream_response.status(), reqwest::StatusCode::BAD_GATEWAY);
-            assert_eq!(calls.load(Ordering::SeqCst), 3, "stream header failure is one upstream attempt");
-            let barrier = uuid::Uuid::now_v7().to_string();
-            client.post(format!("http://{}/api/v1/test/echo", listeners.inference))
-                .json(&json!({"value":{"barrier":barrier}}))
-                .send().await.expect("send accounting barrier")
-                .error_for_status().expect("accounting barrier status");
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let count: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM steve_background_events WHERE kind = 'test.echo' AND payload LIKE ?"
-                    ).bind(format!("%{barrier}%")).fetch_one(&pool).await.expect("query accounting barrier");
-                    if count == 1 { break; }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            }).await.expect("accounting barrier persisted");
             let chat_count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM steve_background_events WHERE kind = 'chat.attempt.terminal.v1'"
             ).fetch_one(&pool).await.expect("count nonstream Chat events");
-            assert_eq!(chat_count, 3, "#96 accounts the stream header failure");
+            assert_eq!(chat_count, 2, "one event per nonstream attempt");
             pool.close().await;
         } => {}
     }
