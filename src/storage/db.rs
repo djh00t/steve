@@ -6,7 +6,7 @@ use std::path::Path;
 
 const SQLITE_V1_MIGRATION_NAME: &str = "m0_foundation";
 
-type SqliteLedgerColumnManifest = (
+type SqliteColumnManifest = (
     &'static str,
     &'static str,
     i64,
@@ -14,13 +14,37 @@ type SqliteLedgerColumnManifest = (
     i64,
     i64,
 );
-type SqliteLedgerColumn = (i64, String, String, i64, Option<String>, i64, i64);
+type SqliteColumn = (i64, String, String, i64, Option<String>, i64, i64);
 
-const SQLITE_V1_LEDGER_COLUMNS: [SqliteLedgerColumnManifest; 3] = [
+const SQLITE_V1_LEDGER_COLUMNS: [SqliteColumnManifest; 3] = [
     ("version", "INTEGER", 0, None, 1, 0),
     ("name", "TEXT", 1, None, 0, 0),
     ("applied_at", "TEXT", 1, None, 0, 0),
 ];
+const SQLITE_V1_APPLICATION_COLUMNS: [SqliteColumnManifest; 4] = [
+    ("id", "TEXT", 0, None, 1, 0),
+    ("kind", "TEXT", 1, None, 0, 0),
+    ("payload", "TEXT", 1, None, 0, 0),
+    ("created_at", "TEXT", 1, None, 0, 0),
+];
+
+fn expected_sqlite_columns(manifest: &[SqliteColumnManifest]) -> Vec<SqliteColumn> {
+    manifest
+        .iter()
+        .enumerate()
+        .map(|(cid, (name, ty, notnull, default, pk, hidden))| {
+            (
+                cid as i64,
+                (*name).to_owned(),
+                (*ty).to_owned(),
+                *notnull,
+                default.map(str::to_owned),
+                *pk,
+                *hidden,
+            )
+        })
+        .collect()
+}
 
 #[derive(Clone)]
 pub enum DatabasePool {
@@ -150,25 +174,10 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    let columns: Vec<SqliteLedgerColumn> =
-        sqlx::query_as("PRAGMA table_xinfo(steve_schema_migrations)")
-            .fetch_all(pool)
-            .await?;
-    let expected_columns: Vec<SqliteLedgerColumn> = SQLITE_V1_LEDGER_COLUMNS
-        .iter()
-        .enumerate()
-        .map(|(cid, (name, ty, notnull, default, pk, hidden))| {
-            (
-                cid as i64,
-                (*name).to_owned(),
-                (*ty).to_owned(),
-                *notnull,
-                default.map(str::to_owned),
-                *pk,
-                *hidden,
-            )
-        })
-        .collect();
+    let columns: Vec<SqliteColumn> = sqlx::query_as("PRAGMA table_xinfo(steve_schema_migrations)")
+        .fetch_all(pool)
+        .await?;
+    let expected_columns = expected_sqlite_columns(&SQLITE_V1_LEDGER_COLUMNS);
     // INTEGER PRIMARY KEY DESC has the same columns but is not a rowid alias.
     let ordinary_primary_keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_index_list('steve_schema_migrations') WHERE origin = 'pk'",
@@ -193,6 +202,7 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
         sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM steve_schema_migrations")
             .fetch_one(pool)
             .await?;
+    let expected_application_columns = expected_sqlite_columns(&SQLITE_V1_APPLICATION_COLUMNS);
 
     if current < 1 {
         let mut tx = pool.begin().await?;
@@ -206,6 +216,13 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
         )
         .execute(&mut *tx)
         .await?;
+        let application_columns: Vec<SqliteColumn> =
+            sqlx::query_as("PRAGMA table_xinfo(steve_background_events)")
+                .fetch_all(&mut *tx)
+                .await?;
+        if application_columns != expected_application_columns {
+            anyhow::bail!("SQLite application column shape does not match v1");
+        }
         sqlx::query(
             "INSERT INTO steve_schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
         )
@@ -215,6 +232,14 @@ async fn migrate_sqlite(pool: &SqlitePool) -> Result<()> {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+    } else {
+        let application_columns: Vec<SqliteColumn> =
+            sqlx::query_as("PRAGMA table_xinfo(steve_background_events)")
+                .fetch_all(pool)
+                .await?;
+        if application_columns != expected_application_columns {
+            anyhow::bail!("SQLite application column shape does not match v1");
+        }
     }
 
     Ok(())
