@@ -108,6 +108,9 @@ pub(crate) struct ChatCompletionReply {
     pub(crate) attempts: Vec<RequestAttempt>,
 }
 
+pub(crate) type TerminalAttemptCallback =
+    Arc<dyn Fn(&Request, &str, &RequestAttempt) + Send + Sync>;
+
 impl IntoResponse for ChatCompletionReply {
     fn into_response(self) -> Response {
         match self.body {
@@ -143,9 +146,18 @@ pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn handle_chat_completions_with_upstream(
     body: &[u8],
     upstream: &OpenAiUpstream,
+) -> ChatCompletionReply {
+    handle_chat_completions_with_upstream_and_terminal(body, upstream, Arc::new(|_, _, _| {})).await
+}
+
+pub(crate) async fn handle_chat_completions_with_upstream_and_terminal(
+    body: &[u8],
+    upstream: &OpenAiUpstream,
+    on_terminal: TerminalAttemptCallback,
 ) -> ChatCompletionReply {
     let mut handoff = match parse_chat_completions(body) {
         Ok(handoff) => handoff,
@@ -165,10 +177,16 @@ pub(crate) async fn handle_chat_completions_with_upstream(
     let request: Value = serde_json::from_slice(body).expect("validated JSON");
     if handoff.stream {
         let attempt = Arc::new(Mutex::new(handoff.attempt));
+        let terminal = StreamAttempt {
+            attempt,
+            request: handoff.request.clone(),
+            model: handoff.model.clone(),
+            on_terminal,
+        };
         let cancel = CancelToken::new();
         let gate = ReplayGate::new();
         let mut pending = PendingAttempt {
-            attempt: attempt.clone(),
+            terminal: terminal.clone(),
             cancel: cancel.clone(),
             armed: true,
         };
@@ -183,17 +201,16 @@ pub(crate) async fn handle_chat_completions_with_upstream(
                     status: StatusCode::OK,
                     body: ChatCompletionReplyBody::Stream(Body::from_stream(AttemptBody {
                         inner: body.into_data_stream(),
-                        attempt: attempt.clone(),
+                        terminal: terminal.clone(),
                     })),
                     request: Some(handoff.request),
                     model: Some(handoff.model),
                     requested_stream: handoff.stream,
-                    attempts: vec![attempt.lock().expect("attempt lock").clone()],
+                    attempts: vec![terminal.attempt.lock().expect("attempt lock").clone()],
                 }
             }
             Err(error) => {
-                pending.armed = false;
-                finish_attempt(&attempt, AttemptStatus::UpstreamError);
+                pending.finish(AttemptStatus::UpstreamError);
                 let status = if matches!(error, UpstreamError::Timeout { .. }) {
                     StatusCode::GATEWAY_TIMEOUT
                 } else {
@@ -212,7 +229,7 @@ pub(crate) async fn handle_chat_completions_with_upstream(
                     request: Some(handoff.request),
                     model: Some(handoff.model),
                     requested_stream: handoff.stream,
-                    attempts: vec![attempt.lock().expect("attempt lock").clone()],
+                    attempts: vec![terminal.attempt.lock().expect("attempt lock").clone()],
                 }
             }
         };
@@ -277,10 +294,13 @@ pub(crate) async fn handle_chat_completions_with_upstream(
     }
 }
 
-fn finish_attempt(attempt: &Arc<Mutex<RequestAttempt>>, status: AttemptStatus) {
+fn finish_attempt(
+    attempt: &Arc<Mutex<RequestAttempt>>,
+    status: AttemptStatus,
+) -> Option<RequestAttempt> {
     let mut attempt = attempt.lock().expect("attempt lock");
     if attempt.finished_at.is_some() {
-        return;
+        return None;
     }
     attempt.status = status;
     attempt.finished_at = Some(Utc::now());
@@ -291,26 +311,50 @@ fn finish_attempt(attempt: &Arc<Mutex<RequestAttempt>>, status: AttemptStatus) {
         finished_at = ?attempt.finished_at,
         "chat completions upstream attempt finished"
     );
+    Some(attempt.clone())
+}
+
+#[derive(Clone)]
+struct StreamAttempt {
+    attempt: Arc<Mutex<RequestAttempt>>,
+    request: Request,
+    model: String,
+    on_terminal: TerminalAttemptCallback,
+}
+
+impl StreamAttempt {
+    fn finish(&self, status: AttemptStatus) {
+        if let Some(attempt) = finish_attempt(&self.attempt, status) {
+            (self.on_terminal)(&self.request, &self.model, &attempt);
+        }
+    }
 }
 
 struct PendingAttempt {
-    attempt: Arc<Mutex<RequestAttempt>>,
+    terminal: StreamAttempt,
     cancel: CancelToken,
     armed: bool,
+}
+
+impl PendingAttempt {
+    fn finish(&mut self, status: AttemptStatus) {
+        self.armed = false;
+        self.terminal.finish(status);
+    }
 }
 
 impl Drop for PendingAttempt {
     fn drop(&mut self) {
         if self.armed {
             self.cancel.cancel();
-            finish_attempt(&self.attempt, AttemptStatus::Cancelled);
+            self.terminal.finish(AttemptStatus::Cancelled);
         }
     }
 }
 
 struct AttemptBody {
     inner: BodyDataStream,
-    attempt: Arc<Mutex<RequestAttempt>>,
+    terminal: StreamAttempt,
 }
 
 impl Stream for AttemptBody {
@@ -320,10 +364,8 @@ impl Stream for AttemptBody {
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_next(cx);
         match &result {
-            Poll::Ready(None) => finish_attempt(&this.attempt, AttemptStatus::Success),
-            Poll::Ready(Some(Err(_))) => {
-                finish_attempt(&this.attempt, AttemptStatus::UpstreamError)
-            }
+            Poll::Ready(None) => this.terminal.finish(AttemptStatus::Success),
+            Poll::Ready(Some(Err(_))) => this.terminal.finish(AttemptStatus::UpstreamError),
             _ => {}
         }
         result
@@ -332,7 +374,7 @@ impl Stream for AttemptBody {
 
 impl Drop for AttemptBody {
     fn drop(&mut self) {
-        finish_attempt(&self.attempt, AttemptStatus::Cancelled);
+        self.terminal.finish(AttemptStatus::Cancelled);
     }
 }
 
@@ -591,7 +633,12 @@ mod tests {
         let attempt = Arc::new(Mutex::new(handoff.attempt));
         let body = AttemptBody {
             inner: Body::empty().into_data_stream(),
-            attempt: Arc::clone(&attempt),
+            terminal: StreamAttempt {
+                attempt: Arc::clone(&attempt),
+                request: handoff.request,
+                model: handoff.model,
+                on_terminal: Arc::new(|_, _, _| {}),
+            },
         };
 
         drop(body);

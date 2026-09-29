@@ -686,7 +686,15 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
     };
 
     let reply = if let Some(upstream) = &state.openai_upstream {
-        openai_chat::handle_chat_completions_with_upstream(&body, upstream).await
+        let deferred = state.deferred.clone();
+        openai_chat::handle_chat_completions_with_upstream_and_terminal(
+            &body,
+            upstream,
+            Arc::new(move |request, model, attempt| {
+                offer_chat_terminal_event(&deferred, request, model, attempt);
+            }),
+        )
+        .await
     } else {
         openai_chat::handle_chat_completions(&body)
     };
@@ -710,24 +718,7 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
                 "chat completions upstream attempt finished"
             );
             if !reply.requested_stream {
-                let provider = (!attempt.provider.is_empty() && attempt.provider != "unassigned")
-                    .then_some(attempt.provider.as_str());
-                let account = (!attempt.account.is_empty() && attempt.account != "unassigned")
-                    .then_some(attempt.account.as_str());
-                state.deferred.accounting(
-                    "chat.attempt.terminal.v1",
-                    json!({
-                        "request_id": request.id,
-                        "attempt_id": attempt.id,
-                        "request_created_at": request.created_at,
-                        "model": model,
-                        "provider": provider,
-                        "account": account,
-                        "status": attempt.status,
-                        "started_at": attempt.started_at,
-                        "finished_at": finished_at,
-                    }),
-                );
+                offer_chat_terminal_event(&state.deferred, request, model, attempt);
             }
         }
     }
@@ -737,6 +728,32 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
     } else {
         response
     }
+}
+
+fn offer_chat_terminal_event(
+    deferred: &DeferredQueues,
+    request: &crate::proxy::Request,
+    model: &str,
+    attempt: &crate::proxy::RequestAttempt,
+) {
+    let provider = (!attempt.provider.is_empty() && attempt.provider != "unassigned")
+        .then_some(attempt.provider.as_str());
+    let account = (!attempt.account.is_empty() && attempt.account != "unassigned")
+        .then_some(attempt.account.as_str());
+    deferred.accounting(
+        "chat.attempt.terminal.v1",
+        json!({
+            "request_id": request.id,
+            "attempt_id": attempt.id,
+            "request_created_at": request.created_at,
+            "model": model,
+            "provider": provider,
+            "account": account,
+            "status": attempt.status,
+            "started_at": attempt.started_at,
+            "finished_at": attempt.finished_at,
+        }),
+    );
 }
 
 async fn echo(
