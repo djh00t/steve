@@ -12,6 +12,13 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::time::Instant;
 
+#[derive(Clone, Copy)]
+enum ExtraColumn {
+    None,
+    Stored(&'static str),
+    Generated,
+}
+
 #[tokio::test]
 async fn database_backend_contract() {
     run_database_backend_contract(None).await;
@@ -25,122 +32,260 @@ async fn database_backend_contract() {
 
 #[tokio::test]
 async fn sqlite_rejects_migration_ledger_drift() {
-    for (case, rows) in [
-        ("valid v1", vec![(1_i64, "m0_foundation")]),
-        ("name drift", vec![(1_i64, "m0_changed")]),
+    for (case, rows, should_ready, expected_error) in [
+        ("valid v1", vec![(1_i64, "m0_foundation")], true, ""),
+        (
+            "name drift",
+            vec![(1_i64, "m0_changed")],
+            false,
+            "SQLite migration ledger is not the known v1 prefix",
+        ),
         (
             "gap and future version",
             vec![(1_i64, "m0_foundation"), (3_i64, "v0003_future")],
+            false,
+            "SQLite migration ledger is not the known v1 prefix",
         ),
     ] {
-        let temp = tempdir().expect("create SQLite temp directory");
-        let database_path = temp.path().join("seeded.db");
-        let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(&database_url)
-            .await
-            .expect("connect to seeded SQLite database");
-        sqlx::query(
-            "CREATE TABLE steve_schema_migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at TEXT NOT NULL
-            )",
+        run_sqlite_migration_case(
+            case,
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL",
+            &rows,
+            should_ready,
+            expected_error,
+            ExtraColumn::None,
         )
-        .execute(&pool)
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn sqlite_rejects_migration_ledger_column_drift() {
+    for (case, ledger_schema, rows, should_ready, expected_error, extra) in [
+        (
+            "valid v1",
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL",
+            vec![(1_i64, "m0_foundation")],
+            true,
+            "",
+            ExtraColumn::None,
+        ),
+        (
+            "nullable name",
+            "version INTEGER PRIMARY KEY, name TEXT, applied_at TEXT NOT NULL",
+            vec![(1_i64, "m0_foundation")],
+            false,
+            "column shape",
+            ExtraColumn::None,
+        ),
+        (
+            "extra column",
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL, extra TEXT",
+            vec![(1_i64, "m0_foundation")],
+            false,
+            "column shape",
+            ExtraColumn::Stored("ordinary-extra-sentinel"),
+        ),
+        (
+            "generated extra column",
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL, extra TEXT GENERATED ALWAYS AS (name || '-generated') VIRTUAL",
+            vec![(1_i64, "m0_foundation")],
+            false,
+            "column shape",
+            ExtraColumn::Generated,
+        ),
+        (
+            "wrong type",
+            "version TEXT PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL",
+            vec![(1_i64, "m0_foundation")],
+            false,
+            "column shape",
+            ExtraColumn::None,
+        ),
+        (
+            "default",
+            "version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT 'now'",
+            vec![(1_i64, "m0_foundation")],
+            false,
+            "column shape",
+            ExtraColumn::None,
+        ),
+        (
+            "wrong primary key",
+            "version INTEGER, name TEXT NOT NULL PRIMARY KEY, applied_at TEXT NOT NULL",
+            vec![(1_i64, "m0_foundation")],
+            false,
+            "column shape",
+            ExtraColumn::None,
+        ),
+        (
+            "descending ordinary primary key",
+            "version INTEGER PRIMARY KEY DESC, name TEXT NOT NULL, applied_at TEXT NOT NULL",
+            vec![],
+            false,
+            "column shape",
+            ExtraColumn::None,
+        ),
+    ] {
+        run_sqlite_migration_case(case, ledger_schema, &rows, should_ready, expected_error, extra)
+            .await;
+    }
+}
+
+async fn run_sqlite_migration_case(
+    case: &str,
+    ledger_schema: &str,
+    rows: &[(i64, &str)],
+    should_ready: bool,
+    expected_error: &str,
+    extra: ExtraColumn,
+) {
+    let temp = tempdir().expect("create SQLite temp directory");
+    let database_path = temp.path().join("seeded.db");
+    let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
         .await
-        .expect("create migration ledger");
-        sqlx::query(
-            "CREATE TABLE steve_background_events (
+        .expect("connect to seeded SQLite database");
+    sqlx::query(&format!(
+        "CREATE TABLE steve_schema_migrations ({ledger_schema})"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create migration ledger");
+    sqlx::query(
+        "CREATE TABLE steve_background_events (
                 id TEXT PRIMARY KEY,
                 kind TEXT NOT NULL,
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )",
-        )
-        .execute(&pool)
-        .await
-        .expect("create application table");
-        for &(version, name) in &rows {
-            sqlx::query(
-                "INSERT INTO steve_schema_migrations(version, name, applied_at)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(version)
-            .bind(name)
-            .bind("2026-09-28T00:00:00Z")
-            .execute(&pool)
-            .await
-            .expect("seed migration row");
-        }
-        sqlx::query(
-            "INSERT INTO steve_background_events(id, kind, payload, created_at)
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind("preserve-me")
-        .bind("fixture")
-        .bind("payload")
-        .bind("2026-09-28T00:00:00Z")
-        .execute(&pool)
-        .await
-        .expect("seed application data");
-        pool.close().await;
-
-        let mut steve =
-            SteveProcess::start_with_database_url(&database_url).expect("start Steve process");
-        let ready = steve.wait_ready(Duration::from_secs(15)).await;
-        if case == "valid v1" {
-            assert!(ready.is_ok(), "valid v1 must reach readiness");
-            drop(steve);
-        } else {
-            let error = match ready {
-                Ok(_) => panic!("drifted migration ledger must block readiness"),
-                Err(error) => error,
-            };
-            assert!(error.contains("migration"), "{case}: {error}");
-        }
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(&database_url)
-            .await
-            .expect("reconnect to seeded SQLite database");
-        let actual_rows: Vec<(i64, String, String)> = sqlx::query_as(
-            "SELECT version, name, applied_at FROM steve_schema_migrations ORDER BY version",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("query migration ledger");
-        let actual_events: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT id, kind, payload, created_at FROM steve_background_events
-             ORDER BY id, kind, payload, created_at",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("query application data");
-        let expected_rows: Vec<_> = rows
-            .iter()
-            .map(|(version, name)| {
-                (
-                    *version,
-                    (*name).to_owned(),
-                    "2026-09-28T00:00:00Z".to_owned(),
+    )
+    .execute(&pool)
+    .await
+    .expect("create application table");
+    for &(version, name) in rows {
+        match extra {
+            ExtraColumn::Stored(value) => {
+                sqlx::query(
+                    "INSERT INTO steve_schema_migrations(version, name, applied_at, extra)
+                         VALUES (?, ?, ?, ?)",
                 )
-            })
-            .collect();
-        assert_eq!(actual_rows, expected_rows);
-        assert_eq!(
-            actual_events,
-            vec![(
-                "preserve-me".to_owned(),
-                "fixture".to_owned(),
-                "payload".to_owned(),
-                "2026-09-28T00:00:00Z".to_owned(),
-            )]
-        );
-        pool.close().await;
+                .bind(version)
+                .bind(name)
+                .bind("2026-09-28T00:00:00Z")
+                .bind(value)
+                .execute(&pool)
+                .await
+                .expect("seed migration row");
+            }
+            ExtraColumn::None | ExtraColumn::Generated => {
+                sqlx::query(
+                    "INSERT INTO steve_schema_migrations(version, name, applied_at)
+                         VALUES (?, ?, ?)",
+                )
+                .bind(version)
+                .bind(name)
+                .bind("2026-09-28T00:00:00Z")
+                .execute(&pool)
+                .await
+                .expect("seed migration row");
+            }
+        }
     }
+    sqlx::query(
+        "INSERT INTO steve_background_events(id, kind, payload, created_at)
+             VALUES (?, ?, ?, ?)",
+    )
+    .bind("preserve-me")
+    .bind("fixture")
+    .bind("payload")
+    .bind("2026-09-28T00:00:00Z")
+    .execute(&pool)
+    .await
+    .expect("seed application data");
+    pool.close().await;
+
+    let mut steve =
+        SteveProcess::start_with_database_url(&database_url).expect("start Steve process");
+    let ready = steve.wait_ready(Duration::from_secs(15)).await;
+    if should_ready {
+        assert!(ready.is_ok(), "valid v1 must reach readiness");
+        drop(steve);
+    } else {
+        let error = match ready {
+            Ok(_) => panic!("drifted migration ledger must block readiness"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Steve exited"), "{case}: {error}");
+        assert!(error.contains(expected_error), "{case}: {error}");
+    }
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("reconnect to seeded SQLite database");
+    let actual_rows = match extra {
+        ExtraColumn::None => {
+            let rows: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT CAST(version AS TEXT), name, applied_at
+                     FROM steve_schema_migrations ORDER BY version",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("query migration ledger");
+            rows.into_iter()
+                .map(|(version, name, applied_at)| (version, name, applied_at, None))
+                .collect::<Vec<_>>()
+        }
+        ExtraColumn::Stored(_) | ExtraColumn::Generated => {
+            let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+                "SELECT CAST(version AS TEXT), name, applied_at, extra
+                     FROM steve_schema_migrations ORDER BY version",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("query migration ledger");
+            rows.into_iter()
+                .map(|(version, name, applied_at, extra)| (version, name, applied_at, Some(extra)))
+                .collect::<Vec<_>>()
+        }
+    };
+    let actual_events: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT id, kind, payload, created_at FROM steve_background_events
+             ORDER BY id, kind, payload, created_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("query application data");
+    let expected_rows: Vec<_> = rows
+        .iter()
+        .map(|(version, name)| {
+            (
+                version.to_string(),
+                (*name).to_owned(),
+                "2026-09-28T00:00:00Z".to_owned(),
+                match extra {
+                    ExtraColumn::None => None,
+                    ExtraColumn::Stored(value) => Some(value.to_owned()),
+                    ExtraColumn::Generated => Some(format!("{name}-generated")),
+                },
+            )
+        })
+        .collect();
+    assert_eq!(actual_rows, expected_rows);
+    assert_eq!(
+        actual_events,
+        vec![(
+            "preserve-me".to_owned(),
+            "fixture".to_owned(),
+            "payload".to_owned(),
+            "2026-09-28T00:00:00Z".to_owned(),
+        )]
+    );
+    pool.close().await;
 }
 
 type EventRow = (String, String, String, String);
