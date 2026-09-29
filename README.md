@@ -107,6 +107,8 @@ Invalid JSON or a missing or empty required field returns HTTP 400 with the Stev
 
 ## Provider health
 
+For HTTPS upstreams signed by a private CA, set `server.upstream_ca_bundle` to a PEM CA bundle. Steve adds every certificate to its built-in WebPKI roots for OpenAI, Anthropic, and provider health requests. Relative paths use the process working directory. The bundle is read once at startup; unreadable, empty, or malformed bundles prevent readiness, and updates require a restart. Without this option, public WebPKI roots remain in use.
+
 `GET /api/v1/providers/health` is available on the management listener. It probes each configured OpenAI and Anthropic provider route (`/v1/chat/completions` and `/v1/messages`) on demand with a 500 ms timeout. HTTP 2xx, 3xx, and other 4xx responses (including 401 and 405) are reachable; HTTP 404, HTTP 500 or higher, transport failures, and timeouts are `unhealthy`. An omitted upstream is reported as `unconfigured`. The endpoint returns HTTP 200 when all configured providers are healthy and HTTP 503 otherwise; a probe already in progress returns HTTP 429 with `status: "busy"`. The response contains only the overall and per-provider statuses and never includes URLs or credentials.
 
 ## Contributing

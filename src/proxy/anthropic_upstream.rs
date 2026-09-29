@@ -66,13 +66,6 @@ impl AnthropicUpstream {
     /// `timeout` bounds the non-streaming call and, for SSE, the wait for
     /// response headers. SSE body reads are not cut off by that timeout.
     pub fn new(base_url: impl Into<String>, timeout: Duration) -> Result<Self, AnthropicError> {
-        let base_url = normalize_base_url(base_url.into())?;
-        if timeout.is_zero() {
-            return Err(AnthropicError::Config {
-                message: "timeout must be greater than zero".into(),
-            });
-        }
-
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             // A cancelled SSE body must not be returned to the pool.
@@ -81,6 +74,20 @@ impl AnthropicUpstream {
             .map_err(|err| AnthropicError::Config {
                 message: format!("http client: {err}"),
             })?;
+        Self::with_client(base_url, timeout, http)
+    }
+
+    pub(crate) fn with_client(
+        base_url: impl Into<String>,
+        timeout: Duration,
+        http: reqwest::Client,
+    ) -> Result<Self, AnthropicError> {
+        let base_url = normalize_base_url(base_url.into())?;
+        if timeout.is_zero() {
+            return Err(AnthropicError::Config {
+                message: "timeout must be greater than zero".into(),
+            });
+        }
 
         Ok(Self {
             base_url,

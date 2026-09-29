@@ -25,7 +25,7 @@ impl SteveProcess {
     }
 
     pub fn start_with_database_url(database_url: &str) -> io::Result<Self> {
-        Self::start_with_options(None, None, 60, None, None, Some(database_url))
+        Self::start_with_options(None, None, 60, None, None, Some(database_url), None)
     }
 
     pub fn start_with_upstream_urls(
@@ -47,12 +47,38 @@ impl SteveProcess {
             None,
             None,
             None,
+            None,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn start_with_upstream_ca_bundle(
+        openai_upstream_url: Option<&str>,
+        anthropic_upstream_url: Option<&str>,
+        ca_bundle: Option<&Path>,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            openai_upstream_url,
+            anthropic_upstream_url,
+            60,
+            None,
+            None,
+            None,
+            ca_bundle,
         )
     }
 
     #[allow(dead_code)]
     pub fn start_with_object_store(endpoint: &str, history_capacity: usize) -> io::Result<Self> {
-        Self::start_with_options(None, None, 60, Some(endpoint), Some(history_capacity), None)
+        Self::start_with_options(
+            None,
+            None,
+            60,
+            Some(endpoint),
+            Some(history_capacity),
+            None,
+            None,
+        )
     }
 
     fn start_with_options(
@@ -62,6 +88,7 @@ impl SteveProcess {
         object_store_endpoint: Option<&str>,
         history_capacity: Option<usize>,
         database_url: Option<&str>,
+        ca_bundle: Option<&Path>,
     ) -> io::Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path();
@@ -79,6 +106,12 @@ impl SteveProcess {
             server_config.push_str(&format!(
                 "anthropic_upstream_url = {}\n",
                 toml::Value::String(url.into())
+            ));
+        }
+        if let Some(path) = ca_bundle {
+            server_config.push_str(&format!(
+                "upstream_ca_bundle = {}\n",
+                toml::Value::String(path.display().to_string())
             ));
         }
         let object_storage = if let Some(endpoint) = object_store_endpoint {

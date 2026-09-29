@@ -121,18 +121,28 @@ struct ProviderProbeState {
 }
 
 impl ProviderProbeState {
+    #[cfg(test)]
     fn new(
         openai_url: Option<String>,
         anthropic_url: Option<String>,
     ) -> std::result::Result<Self, reqwest::Error> {
-        Ok(Self {
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        Ok(Self::with_client(openai_url, anthropic_url, client))
+    }
+
+    fn with_client(
+        openai_url: Option<String>,
+        anthropic_url: Option<String>,
+        client: reqwest::Client,
+    ) -> Self {
+        Self {
+            client,
             probe_gate: Arc::new(Semaphore::new(1)),
             openai_url,
             anthropic_url,
-        })
+        }
     }
 }
 
@@ -221,23 +231,49 @@ pub async fn run(
     );
 
     let counters = Arc::new(RequestCounters::default());
+    let certificates = if let Some(path) = &cfg.server.upstream_ca_bundle {
+        let pem = std::fs::read(path)
+            .with_context(|| format!("reading upstream CA bundle {}", path.display()))?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+            .with_context(|| format!("parsing upstream CA bundle {}", path.display()))?;
+        if certificates.is_empty() {
+            anyhow::bail!("empty upstream CA bundle {}", path.display());
+        }
+        certificates
+    } else {
+        Vec::new()
+    };
+    let mut normal_builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    let mut anthropic_builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(0);
+    for certificate in certificates {
+        normal_builder = normal_builder.add_root_certificate(certificate.clone());
+        anthropic_builder = anthropic_builder.add_root_certificate(certificate);
+    }
+    let normal_http = normal_builder
+        .build()
+        .context("building upstream HTTP client")?;
+    let anthropic_http = anthropic_builder
+        .build()
+        .context("building Anthropic HTTP client")?;
     let openai_upstream = cfg
         .server
         .openai_upstream_url
         .as_ref()
-        .map(|url| OpenAiUpstream::new(url, Duration::from_secs(30)))
+        .map(|url| OpenAiUpstream::with_client(url, Duration::from_secs(30), normal_http.clone()))
         .transpose()?;
     let anthropic_upstream = cfg
         .server
         .anthropic_upstream_url
         .as_ref()
-        .map(|url| AnthropicUpstream::new(url, Duration::from_secs(30)))
+        .map(|url| AnthropicUpstream::with_client(url, Duration::from_secs(30), anthropic_http))
         .transpose()?;
-    let provider_probe = ProviderProbeState::new(
+    let provider_probe = ProviderProbeState::with_client(
         cfg.server.openai_upstream_url.clone(),
         cfg.server.anthropic_upstream_url.clone(),
-    )
-    .context("building provider health client")?;
+        normal_http,
+    );
     let state = Arc::new(AppState {
         lifecycle: lifecycle.clone(),
         deferred,
