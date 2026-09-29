@@ -22,7 +22,7 @@ Use Ratatui TestBackend and Rust unit tests for rendered output and key-event ha
 
 **Future shell command:** `cargo test -p steve-tui stv_m7_03_acceptance`, introduced and qualified by #293 with its workspace member. It is unavailable on this base.
 
-**Future composed command:** `cargo test -p steve-tui remote_dashboard_renders_system_version`. It is **unavailable until implementation adds that test/module**; it must not be treated as passing evidence on this base. The existing hosted Ubuntu quality job runs `make quality-gates`, which includes `make test`. When #293 introduces the workspace member, it must include both the root crate and `crates/steve-tui` in `workspace.default-members` so those default Cargo commands actually exercise the new crate; verify the named tests execute. No separate test framework is proposed.
+**Future composed command:** `cargo test -p steve-tui remote_dashboard_renders_system_version`. It is **unavailable until implementation adds that test/module**; it must not be treated as passing evidence on this base. On `main` pushes, the hosted Ubuntu quality job runs `make quality-gates`, which includes `make test`; on PRs it runs `make check`. When #293 introduces the workspace member, it must include both the root crate and `crates/steve-tui` in `workspace.default-members` so those default Cargo commands actually exercise the new crate; verify the named tests execute. No separate test framework is proposed.
 
 ## Evidence and boundary
 
