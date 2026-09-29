@@ -5,6 +5,7 @@ import http.client
 import importlib.util
 import json
 import os
+import socket
 from pathlib import Path
 import subprocess
 import sys
@@ -16,6 +17,7 @@ from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("m1_release_gate.py")
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("m1_release_gate", SCRIPT)
 gate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gate)
@@ -51,6 +53,95 @@ class ReleaseGateTests(unittest.TestCase):
             gate.stop_process_group(child)
         self.assertEqual(child.wait.call_count, 2)
         self.assertTrue(all(call.kwargs.get("timeout") == 2 for call in child.wait.call_args_list))
+
+    def test_sdk_provisions_its_configured_root_before_serve(self):
+        calls = []
+        def spawn(command, **kwargs):
+            calls.append(command)
+            if command[-1] == "serve":
+                import tomllib
+                config = tomllib.loads(Path(command[2]).read_text())
+                root = config["queues"]["accounting_journal"]
+                self.assertIn([command[0], "accounting", "provision", "--root", root], calls[:-1])
+            return mock.Mock()
+        def provision(command, **kwargs):
+            calls.append(command)
+            self.assertTrue(kwargs["check"])
+            self.assertGreater(kwargs["timeout"], 0)
+        with tempfile.TemporaryDirectory() as temp:
+            binary = Path(temp) / "candidate"
+            binary.touch()
+            with (
+                mock.patch.object(sys, "argv", ["sdk_smoke.py", "--binary", str(binary)]),
+                mock.patch.object(sdk, "check_sdk"),
+                mock.patch.object(sdk, "ready_address", return_value="127.0.0.1:1"),
+                mock.patch.object(sdk, "anthropic_smoke"),
+                mock.patch.object(sdk, "stop"),
+                mock.patch.object(sdk.subprocess, "Popen", side_effect=spawn),
+                mock.patch.object(sdk.subprocess, "run", side_effect=provision),
+            ):
+                sdk.main()
+
+    def test_hosted_evidence_rejects_head_change_during_checks(self):
+        before = {"headRefOid": "abc", "url": "https://github.example/pr/619"}
+        after = dict(before, headRefOid="changed")
+        checks = [{"name": name, "bucket": "pass"} for name in gate.REQUIRED_HOSTED_CHECKS]
+        with mock.patch.object(gate, "json_command", side_effect=[before, checks, after]):
+            evidence = gate.hosted_qualification(Path("/"), "abc")
+        self.assertEqual(evidence["status"], "FAIL")
+        self.assertEqual(evidence["head_before"], before)
+        self.assertEqual(evidence["head_after"], after)
+
+    @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
+    def test_browser_disconnect_cancels_active_gate_and_retains_failure(self):
+        self.check_browser_disconnect(False)
+
+    @unittest.skipUnless(os.name == "posix", "process groups require POSIX")
+    def test_browser_disconnect_cancels_captured_preflight_command(self):
+        self.check_browser_disconnect(True)
+
+    def check_browser_disconnect(self, captured):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            pid_file = root / "child.pid"
+            output = root / "evidence.json"
+            run = gate.GateRun(root, "abc", output, 60, Path("/srv/accounting"))
+            code = (
+                "import pathlib, subprocess, time; "
+                "p=subprocess.Popen(['sleep','60']); "
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(p.pid)); "
+                "time.sleep(60)"
+            )
+            if captured:
+                run._run = lambda: gate.captured_command([sys.executable, "-c", code], root, timeout=60, owner=run)
+            else:
+                run._run = lambda: run._run_step("active", [sys.executable, "-c", code], os.environ.copy())
+            server, token = gate.create_server(run)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = socket.create_connection(server.server_address)
+            host = f"127.0.0.1:{server.server_port}"
+            try:
+                connection.sendall((f"POST /run HTTP/1.1\r\nHost: {host}\r\nOrigin: http://{host}\r\nX-M1-Capability: {token}\r\nContent-Length: 2\r\n\r\n{{}}").encode())
+                deadline = time.monotonic() + 3
+                while not pid_file.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(pid_file.exists())
+                connection.close()
+                deadline = time.monotonic() + 4
+                while not output.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(output.exists(), "disconnect did not persist failure")
+                self.assertEqual(json.loads(output.read_text())["functional"], "FAIL")
+                self.assertTrue(run._cancelled.is_set())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid_file.read_text()), 0)
+            finally:
+                connection.close()
+                run.cancel()
+                server.shutdown()
+                server.server_close()
+                thread.join(2)
 
     def test_sdk_cleanup_never_uses_unbounded_wait(self):
         child = mock.Mock(returncode=None)
@@ -163,6 +254,7 @@ class ReleaseGateTests(unittest.TestCase):
             {"status": "PASS", "source_sha": "abc"},
             {"status": "PASS", "source_sha": "abc"},
             "abc",
+            mutations={"status": "PASS", "source_sha": "abc"},
         )
         self.assertEqual(functional, "PASS")
         self.assertTrue(eligible)
@@ -183,9 +275,22 @@ class ReleaseGateTests(unittest.TestCase):
             {"status": "PASS", "source_sha": "abc"},
             "abc",
             {"status": "PRESENT", "external_stop_verified": False},
+            mutations={"status": "PASS", "source_sha": "abc"},
         )
         self.assertEqual(functional, "PASS")
         self.assertFalse(eligible)
+
+    def test_generic_mutation_green_cannot_substitute_for_exact_m1_outcomes(self):
+        passed = {"status": "PASS", "source_sha": "abc"}
+        self.assertFalse(gate.verdicts([{"status": "PASS"}], passed, passed, "abc")[1])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "mutations.json"
+            for value in ({"status": "PASS", "source_sha": "abc"},
+                          {"source_head": "abc", "source_dirty": False, "status": "caught", "faults": {}},
+                          {"source_head": "other", "source_dirty": False, "status": "caught", "faults": {}}):
+                path.write_text(json.dumps(value))
+                with self.assertRaises(RuntimeError):
+                    gate.load_mutation_qualification(path, "abc")
 
     def test_page_uses_text_content_and_does_not_embed_command_output(self):
         hostile = "<img src=x onerror=alert(1)>"
@@ -442,7 +547,7 @@ class ReleaseGateTests(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$*\" in\n"
                 "  *'pr view 619'* ) printf '%s\\n' '{\"headRefOid\":\"abc\",\"url\":\"https://github.example/pr/619\"}' ;;\n"
-                "  *'pr checks 619'* ) printf '%s\\n' '[{\"bucket\":\"pass\",\"name\":\"quality\",\"state\":\"SUCCESS\"},{\"bucket\":\"pass\",\"name\":\"mutation\",\"state\":\"SUCCESS\"}]' ;;\n"
+                "  *'pr checks 619'* ) printf '%s\\n' '[{\"bucket\":\"pass\",\"name\":\"quality\",\"state\":\"SUCCESS\"},{\"bucket\":\"pass\",\"name\":\"mutation\",\"state\":\"SUCCESS\"},{\"bucket\":\"pass\",\"name\":\"m1-mutation\",\"state\":\"SUCCESS\"}]' ;;\n"
                 "  * ) exit 2 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -475,7 +580,7 @@ class ReleaseGateTests(unittest.TestCase):
             env["PATH"] = f"{root}:{env['PATH']}"
             evidence = gate.hosted_qualification(root, "abc", env)
             self.assertEqual(evidence["status"], "UNKNOWN")
-            self.assertEqual(evidence["missing_required_checks"], ["mutation"])
+            self.assertEqual(evidence["missing_required_checks"], ["m1-mutation", "mutation"])
 
     @unittest.skipUnless(os.name == "posix", "fake gh executable requires POSIX")
     def test_hosted_evidence_rejects_wrong_head_before_check_state(self):
@@ -564,6 +669,26 @@ class ReleaseGateTests(unittest.TestCase):
                 str(deployment),
             )
 
+            for field in ("source_sha", "binary_sha256", "binary_path", "deployment_path",
+                          "canonical_deployment_path", "target_parent", "requested_target_parent",
+                          "probe_path", "platform", "filesystem", "target_device", "probe_device", "intended_device"):
+                for invalid in (None, "", [], True):
+                    with self.subTest(field=field, invalid=invalid):
+                        broken = dict(evidence)
+                        if invalid is None:
+                            broken.pop(field)
+                        else:
+                            broken[field] = invalid
+                        qualification.write_text(json.dumps(broken))
+                        with self.assertRaises(RuntimeError):
+                            gate.load_target_qualification(qualification, "abc", gate.sha256(binary), deployment)
+            broken = dict(evidence)
+            for field in ("target_device", "probe_device", "intended_device"):
+                broken.pop(field)
+            qualification.write_text(json.dumps(broken))
+            with self.assertRaises(RuntimeError):
+                gate.load_target_qualification(qualification, "abc", gate.sha256(binary), deployment)
+
             del evidence["tool_versions"]
             qualification.write_text(json.dumps(evidence), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "tool versions"):
@@ -642,82 +767,53 @@ class ReleaseGateTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(RuntimeError, "deployment path"):
+            with self.assertRaises(RuntimeError):
                 gate.load_target_qualification(
                     path, "abc", "binary-hash", Path("/srv/steve/accounting")
                 )
 
     def test_adoption_manifest_surfaces_unverified_operator_assertion(self):
+        # Exact MaintenanceAssertionInput and persisted MaintenanceAssertion contract.
         with tempfile.TemporaryDirectory() as temp:
-            assertion = Path(temp) / "maintenance.json"
-            manifest = Path(temp) / "adoption.json"
+            root = Path(temp)
+            assertion = root / "maintenance.json"
+            manifest = root / "adoption.json"
             fields = {
-                "source_path": "/legacy/accounting.jsonl",
-                "source_host": "legacy-host",
-                "assertion_time": "2026-09-29T00:00:00Z",
-                "supervisor_context": "systemd steve.service",
-                "claimed_stop_disable_action": "stopped and disabled",
+                "workload_identity": "legacy-steve", "host": "legacy-host",
+                "source": "/legacy/accounting.jsonl", "stopped": True,
+                "restart_disabled": True, "observed_at": "2026-09-29T00:00:00Z",
+                "command_or_exported_status": "systemctl stop and disable steve",
             }
-            assertion.write_text(json.dumps(fields) + "\n", encoding="utf-8")
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "maintenance_assertion": fields,
-                        "maintenance_assertion_sha256": gate.sha256(assertion),
-                        "maintenance_assertion_path": str(assertion),
-                    }
-                ),
-                encoding="utf-8",
-            )
+            assertion.write_text(json.dumps(fields) + "\n")
+            persisted = dict(fields, path=str(assertion), digest=gate.sha256(assertion),
+                             assertion_kind="operator_supplied_unauthenticated")
+            value = {"format_version": 1, "source": fields["source"],
+                     "maintenance_assertion": persisted}
+            def save():
+                manifest.write_text(json.dumps(value))
+                manifest.with_suffix(".json.sha256").write_text(gate.sha256(manifest))
+            save()
             evidence = gate.load_adoption_manifest(manifest)
             self.assertEqual(evidence["fields"], fields)
             self.assertEqual(evidence["digest"], gate.sha256(assertion))
             self.assertFalse(evidence["external_stop_verified"])
-            self.assertEqual(evidence["source"], "operator_supplied")
-
-            tampered = dict(fields, source_host="other-host")
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "maintenance_assertion": tampered,
-                        "maintenance_assertion_sha256": gate.sha256(assertion),
-                        "maintenance_assertion_path": str(assertion),
-                    }
-                ),
-                encoding="utf-8",
-            )
+            self.assertEqual(gate.adoption_evidence(root)["status"], "PRESENT")
+            for name in persisted:
+                with self.subTest(missing=name):
+                    value["maintenance_assertion"] = {k: v for k, v in persisted.items() if k != name}
+                    save()
+                    with self.assertRaises(RuntimeError):
+                        gate.load_adoption_manifest(manifest)
+            value["maintenance_assertion"] = dict(persisted, host="tampered")
+            save()
             with self.assertRaisesRegex(RuntimeError, "fields do not match"):
                 gate.load_adoption_manifest(manifest)
-
-            fields.pop("supervisor_context")
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "maintenance_assertion": fields,
-                        "maintenance_assertion_sha256": gate.sha256(assertion),
-                        "maintenance_assertion_path": str(assertion),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(RuntimeError, "supervisor_context"):
-                gate.load_adoption_manifest(manifest)
-
-            fields["supervisor_context"] = "systemd steve.service"
-            fields["assertion_time"] = "yesterday"
-            assertion.write_text(json.dumps(fields) + "\n", encoding="utf-8")
-            manifest.write_text(
-                json.dumps(
-                    {
-                        "maintenance_assertion": fields,
-                        "maintenance_assertion_sha256": gate.sha256(assertion),
-                        "maintenance_assertion_path": str(assertion),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(RuntimeError, "assertion_time"):
-                gate.load_adoption_manifest(manifest)
+            manifest.unlink()
+            with self.assertRaises(OSError):
+                gate.adoption_evidence(root)
+            with mock.patch.dict(os.environ, {"M1_ADOPTION_MANIFEST": str(manifest)}):
+                with self.assertRaises(OSError):
+                    gate.adoption_evidence(root)
 
     def test_gate_preflight_failure_always_writes_fail_json(self):
         with tempfile.TemporaryDirectory() as temp:

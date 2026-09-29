@@ -238,7 +238,11 @@ def main():
             config = root / "steve.toml"
             db_path = root / "steve.db"
             objects = root / "objects"
-            journal = root / "accounting-overflow.jsonl"
+            journal = root / "accounting"
+            subprocess.run(
+                [str(binary), "accounting", "provision", "--root", str(journal)],
+                env=env, check=True, timeout=30, capture_output=True, text=True,
+            )
             config.write_text(
                 "\n".join(
                     [
@@ -292,6 +296,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, RuntimeError, TimeoutError) as error:
+    except (OSError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
         print(f"SDK smoke failed: {error}", file=sys.stderr)
         sys.exit(1)

@@ -91,10 +91,7 @@ other test failures remain errors.
 `result.json` records the source HEAD, dirty-tree flag, stage exit codes and
 selection counts; `baseline.log`, `fault.log`, and patch/build logs are retained.
 A dirty source tree is recorded as such and does not represent an exact-head
-claim. In CI, `make check` creates an untracked root `Cargo.lock`; the workflow
-uses a temporary Git exclude for only that generated path during source-state
-measurement and keeps the lock in the disposable source copy. No tracked source
-changes are excluded. Run `python3 -B scripts/test_qualify_buffering.py` to
+claim. `Cargo.lock` is tracked and copied with the candidate; dirty-source detection excludes no lockfile changes. Run `python3 -B scripts/test_qualify_buffering.py` to
 verify SIGTERM cleanup with a child process. It checks that the error result
 and logs remain while processes and temporary source/target data are removed.
 
@@ -141,3 +138,38 @@ future retry implementation. If streaming retries/failover are introduced, that
 producer must add a real-daemon attempted-replay scenario; the focused gate test
 alone is insufficient for that changed behavior. No duplicate endpoint or test
 framework is added just to manufacture a replay path today.
+
+## M1 accounting faults
+
+The dedicated `m1-mutation` job always checks out the immutable candidate SHA and
+qualifies three reviewed patches using `scripts/qualify_m1_mutations.py`:
+
+| Fault | Exact selected test | Required assertion |
+| --- | --- | --- |
+| Emit success before SSE terminates | `chat_stream_terminal_accounting` | `pending stream must not be accounted` |
+| Disable the shared incident admission guard | `accounting::tests::failed_incident_publication_still_blocks_local_admission` | `local admission reopened during durable publication retry` |
+| Remove a replay journal before proving completion | `journal_partial_tail_recovery` | `retained journal` |
+
+The patches live under `tests/mutations/m1-*.patch`; these transformations are
+reviewed patches because they change emission timing, remove both admission
+guards, or add premature file removal. Each runs in a disposable source copy
+using the existing buffering runner's process-group cleanup and 600-second
+command bound, two build jobs, an isolated target directory, and offline Cargo.
+An inherited `STEVE_TEST_BINARY` is removed. Every fault must compile, have one
+passing baseline test, and fail that same test with Cargo exit 101 and its named
+assertion. Timeouts, unviable builds, zero selections, unrelated failures, and
+surviving faults do not qualify. The runner records actual outcomes and validates
+a clean unchanged source HEAD before reporting qualification.
+
+```sh
+python3 -B scripts/test_qualify_m1_mutations.py
+python3 -B scripts/qualify_m1_mutations.py --check-patches --expected-sha "$(git rev-parse HEAD)" --output /tmp/steve-m1-patch-check
+python3 -B scripts/qualify_m1_mutations.py --expected-sha "$(git rev-parse HEAD)" --output /tmp/steve-m1-mutations
+```
+
+`--check-patches` records `not_run`, even when every patch applies. Self-tests and
+patch checks do not establish caught outcomes. CI uploads the result and logs as
+`m1-mutation-<SHA>`; the gate consumes `target/m1-mutation-result.json` and requires
+all three exact-head outcomes as well as the dedicated hosted check. Generic
+`mutation` green cannot replace this evidence. No caught result is claimed by
+this document; review the artifact for the candidate being accepted.

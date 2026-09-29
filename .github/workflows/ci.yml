@@ -45,6 +45,7 @@ jobs:
         run: '"$RUNNER_TEMP/steve-sdk-venv/bin/python" scripts/sdk_smoke.py --provider all --binary target/debug/steve'
 
   m1-release-gate:
+    needs: m1-mutation
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -72,6 +73,15 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Download exact-candidate M1 mutation evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: m1-mutation-${{ env.M1_EXPECTED_SHA }}
+          path: target/m1-mutations
+      - name: Verify M1 mutation outcomes
+        run: |
+          python3 -B scripts/qualify_m1_mutations.py --verify target/m1-mutations/result.json --expected-sha "$M1_EXPECTED_SHA"
+          cp target/m1-mutations/result.json target/m1-mutation-result.json
       - name: Run exact-candidate M1 functional gate
         run: make m1-release-gate
       - name: Upload M1 gate evidence
@@ -198,6 +208,37 @@ jobs:
       - uses: actions/checkout@v5
       - run: docker build -t steve:test .
 
+  m1-mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      M1_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare locked dependencies
+        run: cargo fetch --locked
+      - name: Check M1 mutation runner
+        run: |
+          python3 -B scripts/test_qualify_m1_mutations.py
+          PYTHONOPTIMIZE=1 python3 -B scripts/test_qualify_m1_mutations.py
+      - name: Qualify all three M1 faults at the exact candidate
+        run: |
+          python3 -B scripts/qualify_m1_mutations.py --output "$RUNNER_TEMP/steve-m1-mutations" --expected-sha "$M1_EXPECTED_SHA"
+          python3 -B scripts/qualify_m1_mutations.py --verify "$RUNNER_TEMP/steve-m1-mutations/result.json" --expected-sha "$M1_EXPECTED_SHA"
+      - name: Retain exact-candidate M1 mutation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-mutation-${{ env.M1_EXPECTED_SHA }}
+          path: |
+            ${{ runner.temp }}/steve-m1-mutations/result.json
+            ${{ runner.temp }}/steve-m1-mutations/**/*.log
+          if-no-files-found: error
+
   mutation:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -304,13 +345,7 @@ jobs:
         timeout-minutes: 45
         shell: bash
         run: |
-          exclude_file="$RUNNER_TEMP/steve-git-exclude"
-          # make check generates this untracked lock; keep it in the copied source but out of dirty-source detection.
-          printf '/Cargo.lock\n' > "$exclude_file"
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0=core.excludesFile \
-          GIT_CONFIG_VALUE_0="$exclude_file" \
-            python3 -B scripts/qualify_buffering.py --output "$RUNNER_TEMP/steve-buffering"
+          python3 -B scripts/qualify_buffering.py --output "$RUNNER_TEMP/steve-buffering"
           python3 - "$RUNNER_TEMP/steve-buffering/result.json" <<'PY'
           import json
           import os

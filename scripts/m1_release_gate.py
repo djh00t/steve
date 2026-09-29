@@ -10,6 +10,8 @@ import os
 from pathlib import Path
 import platform
 import secrets
+import select
+import socket
 import signal
 import stat
 import subprocess
@@ -20,11 +22,13 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import webbrowser
 
+from qualify_m1_mutations import validate_result as validate_mutations
+
 
 OUTPUT_LIMIT = 64 * 1024
 DEFAULT_STEP_TIMEOUT = 180
 COMMAND_TIMEOUT = 30
-REQUIRED_HOSTED_CHECKS = {"mutation"}
+REQUIRED_HOSTED_CHECKS = {"mutation", "m1-mutation"}
 TARGET_PROBE = "steve-m1-target-v1"
 TARGET_CHECKS = {
     "exclusive_lock",
@@ -42,7 +46,9 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def captured_command(command, cwd, timeout=COMMAND_TIMEOUT, env=None, accepted=(0,)):
+def captured_command(command, cwd, timeout=COMMAND_TIMEOUT, env=None, accepted=(0,), owner=None):
+    if owner is not None and owner._cancelled.is_set():
+        raise KeyboardInterrupt
     process = subprocess.Popen(
         [str(part) for part in command],
         cwd=cwd,
@@ -52,6 +58,8 @@ def captured_command(command, cwd, timeout=COMMAND_TIMEOUT, env=None, accepted=(
         text=True,
         start_new_session=os.name == "posix",
     )
+    if owner is not None:
+        owner._process_started(process)
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as error:
@@ -62,7 +70,13 @@ def captured_command(command, cwd, timeout=COMMAND_TIMEOUT, env=None, accepted=(
             pass
         raise RuntimeError(f"command timed out after {timeout}s: {command}") from error
     finally:
-        stop_process_group(process)
+        try:
+            stop_process_group(process)
+        finally:
+            if owner is not None:
+                owner._process_finished(process)
+    if owner is not None and owner._cancelled.is_set():
+        raise KeyboardInterrupt
     require(
         process.returncode in accepted,
         stderr.strip() or stdout.strip() or f"command failed: {command}",
@@ -70,19 +84,19 @@ def captured_command(command, cwd, timeout=COMMAND_TIMEOUT, env=None, accepted=(
     return stdout
 
 
-def command_output(command, cwd, timeout=COMMAND_TIMEOUT, env=None):
-    return captured_command(command, cwd, timeout, env).strip()
+def command_output(command, cwd, timeout=COMMAND_TIMEOUT, env=None, owner=None):
+    return captured_command(command, cwd, timeout, env, owner=owner).strip()
 
 
-def candidate_evidence(repo, expected_sha):
-    source_sha = command_output(["git", "rev-parse", "HEAD"], repo)
+def candidate_evidence(repo, expected_sha, owner=None):
+    source_sha = command_output(["git", "rev-parse", "HEAD"], repo, owner=owner)
     require(source_sha == expected_sha, f"candidate SHA {source_sha} does not match {expected_sha}")
     dirty = command_output(
-        ["git", "status", "--porcelain", "--untracked-files=all"], repo
+        ["git", "status", "--porcelain", "--untracked-files=all"], repo, owner=owner
     )
     require(not dirty, "candidate source must be clean")
     captured_command(
-        ["git", "ls-files", "--error-unmatch", "Cargo.lock"], repo
+        ["git", "ls-files", "--error-unmatch", "Cargo.lock"], repo, owner=owner
     )
     return {
         "source_sha": source_sha,
@@ -174,12 +188,13 @@ def run_step(name, command, cwd, timeout, env, process_started=None, process_fin
     return result
 
 
-def json_command(command, cwd, env=None, accepted=(0,), timeout=COMMAND_TIMEOUT):
-    return json.loads(captured_command(command, cwd, timeout, env, accepted))
+def json_command(command, cwd, env=None, accepted=(0,), timeout=COMMAND_TIMEOUT, owner=None):
+    return json.loads(captured_command(command, cwd, timeout, env, accepted, owner))
 
 
-def hosted_qualification(repo, source_sha, env=None):
+def hosted_qualification(repo, source_sha, env=None, owner=None):
     url = None
+    pull_request = head_after = None
     try:
         pull_request = json_command(
             [
@@ -194,7 +209,9 @@ def hosted_qualification(repo, source_sha, env=None):
             ],
             repo,
             env,
+            owner=owner,
         )
+        require(isinstance(pull_request, dict), "PR head response must be an object")
         head = pull_request["headRefOid"]
         url = pull_request["url"]
     except (OSError, RuntimeError, KeyError, json.JSONDecodeError) as error:
@@ -203,6 +220,8 @@ def hosted_qualification(repo, source_sha, env=None):
             "source_sha": source_sha,
             "pull_request": 619,
             "url": url,
+            "head_before": pull_request,
+            "head_after": head_after,
             "error": str(error),
         }
     if head != source_sha:
@@ -212,6 +231,8 @@ def hosted_qualification(repo, source_sha, env=None):
             "expected_sha": source_sha,
             "pull_request": 619,
             "url": url,
+            "head_before": pull_request,
+            "head_after": head_after,
             "error": "PR #619 head does not match the candidate",
         }
     try:
@@ -230,6 +251,7 @@ def hosted_qualification(repo, source_sha, env=None):
             repo,
             env,
             (0, 1, 8),
+            owner=owner,
         )
     except (OSError, RuntimeError, KeyError, json.JSONDecodeError) as error:
         return {
@@ -237,6 +259,26 @@ def hosted_qualification(repo, source_sha, env=None):
             "source_sha": source_sha,
             "pull_request": 619,
             "url": url,
+            "head_before": pull_request,
+            "head_after": head_after,
+            "error": str(error),
+        }
+    try:
+        head_after = json_command(
+            ["gh", "pr", "view", "619", "--repo", "djh00t/steve", "--json", "headRefOid,url"],
+            repo, env, owner=owner,
+        )
+        require(isinstance(head_after, dict), "PR head response must be an object")
+        if head_after.get("headRefOid") != head:
+            return {
+                "status": "FAIL", "source_sha": source_sha, "pull_request": 619,
+                "url": url, "head_before": pull_request, "head_after": head_after,
+                "required_checks": checks, "error": "PR head changed while reading checks",
+            }
+    except (OSError, RuntimeError, KeyError, json.JSONDecodeError) as error:
+        return {
+            "status": "UNKNOWN", "source_sha": source_sha, "pull_request": 619,
+            "url": url, "head_before": pull_request, "head_after": head_after,
             "error": str(error),
         }
     try:
@@ -250,6 +292,8 @@ def hosted_qualification(repo, source_sha, env=None):
             "source_sha": source_sha,
             "pull_request": 619,
             "url": url,
+            "head_before": pull_request,
+            "head_after": head_after,
             "error": str(error),
         }
     missing = sorted(REQUIRED_HOSTED_CHECKS - {check.get("name") for check in checks})
@@ -267,6 +311,8 @@ def hosted_qualification(repo, source_sha, env=None):
         "pull_request": 619,
         "url": url,
         "required_checks": checks,
+        "head_before": pull_request,
+        "head_after": head_after,
         "missing_required_checks": missing,
     }
 
@@ -462,6 +508,20 @@ def load_target_qualification(path, source_sha, binary_hash, deployment_path):
         value = json.load(source)
     require(isinstance(value, dict), f"qualification must be an object: {path}")
     require(value.get("probe") == TARGET_PROBE, "target qualification probe is missing or unknown")
+    for name in ("source_sha", "binary_sha256", "binary_path", "deployment_path",
+                 "canonical_deployment_path", "requested_target_parent", "target_parent",
+                 "probe_path", "platform", "filesystem"):
+        require(isinstance(value.get(name), str) and value[name].strip(),
+                f"target qualification {name} must be a nonempty string")
+    for name in ("binary_path", "deployment_path", "canonical_deployment_path",
+                 "requested_target_parent", "target_parent", "probe_path"):
+        require(Path(value[name]).is_absolute(), f"target qualification {name} must be absolute")
+    for name in ("target_device", "intended_device", "probe_device"):
+        require(type(value.get(name)) is int and value[name] >= 0,
+                f"target qualification {name} must be a device identity")
+    require(len(value["binary_sha256"]) == 64
+            and all(c in "0123456789abcdef" for c in value["binary_sha256"]),
+            "target qualification binary hash is invalid")
     require(value.get("source_sha") == source_sha, "target qualification SHA does not match")
     require(value.get("binary_sha256") == binary_hash, "target qualification binary does not match")
     require(
@@ -475,7 +535,7 @@ def load_target_qualification(path, source_sha, binary_hash, deployment_path):
         "target qualification probe is on a different filesystem",
     )
     require(
-        value.get("probe_path") not in {str(deployment_path), value.get("target_parent")},
+        value.get("probe_path") not in {str(deployment_path), value.get("canonical_deployment_path"), value.get("target_parent")},
         "target qualification used the deployment path as its probe",
     )
     require(
@@ -517,17 +577,25 @@ def load_target_qualification(path, source_sha, binary_hash, deployment_path):
     return value
 
 
-def verdicts(steps, hosted, target, source_sha, adoption=None):
+def verdicts(steps, hosted, target, source_sha, adoption=None, mutations=None):
     functional = "PASS" if steps and all(step["status"] == "PASS" for step in steps) else "FAIL"
     eligible = functional == "PASS" and all(
         evidence is not None
         and evidence.get("status") == "PASS"
         and evidence.get("source_sha") == source_sha
-        for evidence in (hosted, target)
+        for evidence in (hosted, target, mutations)
     )
     if adoption and adoption.get("status") == "PRESENT":
         eligible = eligible and adoption.get("external_stop_verified") is True
     return functional, eligible
+
+
+def load_mutation_qualification(path, source_sha):
+    """Load only complete, clean, exact-candidate M1 mutation outcomes."""
+    value = json.loads(path.read_text(encoding="utf-8"))
+    require(isinstance(value, dict), "M1 mutation evidence must be an object")
+    validate_mutations(value, source_sha)
+    return {"status": "PASS", "source_sha": source_sha, "outcomes": value}
 
 
 def write_evidence(path, evidence):
@@ -545,8 +613,8 @@ def sha256(path):
     return digest.hexdigest()
 
 
-def version(command, cwd):
-    return command_output(command, cwd)
+def version(command, cwd, owner=None):
+    return command_output(command, cwd, owner=owner)
 
 
 def installed_sdks():
@@ -573,65 +641,56 @@ def postgres_prerequisite(env):
     }
 
 
+def adoption_evidence(deployment_path):
+    """Discover Rust adoption evidence or fail closed when explicitly required."""
+    configured = os.environ.get("M1_ADOPTION_MANIFEST")
+    path = Path(configured) if configured else deployment_path / "adoption.json"
+    # A retained digest is also evidence that adoption is expected, even if JSON vanished.
+    if configured or path.exists() or path.is_symlink() or path.with_suffix(".json.sha256").exists():
+        return load_adoption_manifest(path)
+    return {"status": "NOT_APPLICABLE"}
+
+
 def load_adoption_manifest(path):
-    with path.open(encoding="utf-8") as source:
-        manifest = json.load(source)
+    """Verify the persisted Rust manifest and its unauthenticated assertion."""
+    data = path.read_bytes()
+    require(path.with_suffix(".json.sha256").read_text().strip() == hashlib.sha256(data).hexdigest(),
+            "adoption manifest digest does not match")
+    manifest = json.loads(data)
     require(isinstance(manifest, dict), "adoption manifest must be an object")
     fields = manifest.get("maintenance_assertion")
     require(isinstance(fields, dict), "maintenance_assertion must be an object")
-    required = (
-        "source_path",
-        "source_host",
-        "assertion_time",
-        "supervisor_context",
-        "claimed_stop_disable_action",
-    )
-    for name in required:
-        require(
-            isinstance(fields.get(name), str) and fields[name].strip(),
-            f"maintenance assertion is missing {name}",
-        )
+    required = ("workload_identity", "host", "source", "observed_at", "command_or_exported_status")
+    for name in (*required, "path", "digest", "assertion_kind"):
+        require(isinstance(fields.get(name), str) and fields[name].strip(),
+                f"maintenance assertion is missing {name}")
+    require(fields["assertion_kind"] == "operator_supplied_unauthenticated", "unknown assertion kind")
+    require(fields.get("stopped") is True and fields.get("restart_disabled") is True,
+            "maintenance assertion stop/disable claim is incomplete")
+    require(manifest.get("source") == fields["source"], "maintenance assertion source does not match")
     try:
-        assertion_time = datetime.fromisoformat(
-            fields["assertion_time"].replace("Z", "+00:00")
-        )
+        observed_at = datetime.fromisoformat(fields["observed_at"].replace("Z", "+00:00"))
     except ValueError as error:
-        raise RuntimeError("maintenance assertion assertion_time is invalid") from error
-    require(
-        assertion_time.tzinfo is not None,
-        "maintenance assertion assertion_time must include a timezone",
-    )
-    digest = manifest.get("maintenance_assertion_sha256")
-    require(
-        isinstance(digest, str)
-        and len(digest) == 64
-        and all(character in "0123456789abcdef" for character in digest),
-        "maintenance assertion digest is invalid",
-    )
-    assertion_path = Path(manifest.get("maintenance_assertion_path", ""))
+        raise RuntimeError("maintenance assertion observed_at is invalid") from error
+    require(observed_at.tzinfo is not None, "maintenance assertion observed_at requires a timezone")
+    digest = fields["digest"]
+    require(len(digest) == 64 and all(c in "0123456789abcdef" for c in digest),
+            "maintenance assertion digest is invalid")
+    assertion_path = Path(fields["path"])
     require(assertion_path.is_absolute(), "maintenance assertion path must be absolute")
-    require(assertion_path.is_file(), "maintenance assertion file is missing")
     assertion_bytes = assertion_path.read_bytes()
-    require(
-        hashlib.sha256(assertion_bytes).hexdigest() == digest,
-        "maintenance assertion digest does not match",
-    )
-    try:
-        assertion_fields = json.loads(assertion_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise RuntimeError("maintenance assertion is not valid JSON") from error
-    require(isinstance(assertion_fields, dict), "maintenance assertion must be an object")
-    require(
-        all(assertion_fields.get(name) == fields[name] for name in required),
-        "maintenance assertion manifest fields do not match the digested assertion",
-    )
+    require(hashlib.sha256(assertion_bytes).hexdigest() == digest,
+            "maintenance assertion digest does not match")
+    assertion_fields = json.loads(assertion_bytes)
+    names = (*required, "stopped", "restart_disabled")
+    require(isinstance(assertion_fields, dict)
+            and all(type(assertion_fields.get(name)) is type(fields[name])
+                    and assertion_fields[name] == fields[name] for name in names),
+            "maintenance assertion manifest fields do not match the digested assertion")
     return {
-        "status": "PRESENT",
-        "manifest_path": str(path.resolve()),
-        "assertion_path": str(assertion_path),
-        "digest": digest,
-        "fields": {name: fields[name] for name in required},
-        "source": "operator_supplied",
+        "status": "PRESENT", "manifest_path": str(path.resolve()),
+        "assertion_path": str(assertion_path), "digest": digest,
+        "fields": {name: fields[name] for name in names}, "source": "operator_supplied",
         "external_stop_verified": False,
         "operator_prerequisite": "External legacy-writer stop/disable remains unverified",
     }
@@ -782,6 +841,8 @@ class GateRun:
             self._started = True
         try:
             self.result = self._run()
+            if self._cancelled.is_set():
+                raise KeyboardInterrupt
             return self.result
         except KeyboardInterrupt:
             self.result = failure_evidence(self.expected_sha, "M1 release gate interrupted")
@@ -809,7 +870,7 @@ class GateRun:
         env = os.environ.copy()
         env["PYTHONOPTIMIZE"] = "1"
         try:
-            evidence.update(candidate_evidence(self.repo, self.expected_sha))
+            evidence.update(candidate_evidence(self.repo, self.expected_sha, owner=self))
             target_dir = self.repo / "target" / f"m1-candidate-{self.expected_sha[:12]}"
             binary = target_dir / "debug" / ("steve.exe" if os.name == "nt" else "steve")
             build = self._run_step(
@@ -827,7 +888,7 @@ class GateRun:
             evidence["steps"].append(build)
             require(build["status"] == "PASS", "candidate build failed")
             require(binary.is_file(), f"candidate binary missing: {binary}")
-            candidate_evidence(self.repo, self.expected_sha)
+            candidate_evidence(self.repo, self.expected_sha, owner=self)
             env = candidate_environment(binary)
             postgres = postgres_prerequisite(env)
             if postgres:
@@ -837,20 +898,13 @@ class GateRun:
                 {
                     "binary_path": str(binary.resolve()),
                     "binary_sha256": sha256(binary),
-                    "rustc": version(["rustc", "-Vv"], self.repo),
-                    "cargo": version([os.environ.get("CARGO", "cargo"), "--version"], self.repo),
+                    "rustc": version(["rustc", "-Vv"], self.repo, owner=self),
+                    "cargo": version([os.environ.get("CARGO", "cargo"), "--version"], self.repo, owner=self),
                     "python": sys.version,
                     "sdks": installed_sdks(),
                 }
             )
-            adoption_manifest = os.environ.get("M1_ADOPTION_MANIFEST")
-            default_manifest = self.deployment_path / "adoption-manifest.json"
-            if adoption_manifest or default_manifest.is_file():
-                evidence["legacy_adoption"] = load_adoption_manifest(
-                    Path(adoption_manifest) if adoption_manifest else default_manifest
-                )
-            else:
-                evidence["legacy_adoption"] = {"status": "NOT_APPLICABLE"}
+            evidence["legacy_adoption"] = adoption_evidence(self.deployment_path)
             with tempfile.TemporaryDirectory(prefix="steve-m1-accounting-") as temp:
                 accounting_root = Path(temp).resolve() / "accounting"
                 for name, command in fixed_steps(binary, accounting_root):
@@ -863,7 +917,7 @@ class GateRun:
                 {"name": "gate_preflight", "status": "FAIL", "error": str(error)}
             )
 
-        hosted = hosted_qualification(self.repo, self.expected_sha, env)
+        hosted = hosted_qualification(self.repo, self.expected_sha, env, owner=self)
         target_path = self.repo / "target" / "m1-target-qualification.json"
         try:
             target = load_target_qualification(
@@ -879,18 +933,26 @@ class GateRun:
                 "path": str(target_path),
                 "error": str(error),
             }
+        mutation_path = self.repo / "target" / "m1-mutation-result.json"
+        try:
+            mutations = load_mutation_qualification(mutation_path, self.expected_sha)
+        except (OSError, RuntimeError, ValueError, TypeError) as error:
+            mutations = {"status": "UNKNOWN", "source_sha": self.expected_sha,
+                         "path": str(mutation_path), "error": str(error)}
         functional, eligible = verdicts(
             evidence["steps"],
             hosted,
             target,
             self.expected_sha,
             evidence.get("legacy_adoption"),
+            mutations,
         )
         evidence.update(
             {
                 "functional": functional,
                 "release_eligible": eligible,
                 "hosted_evidence": hosted,
+                "mutation_qualification": mutations,
                 "target_qualification": target,
                 "operator_acceptance_required": True,
             }
@@ -991,17 +1053,35 @@ def create_server(gate_run):
                     self.reject(409, "M1 gate already ran")
                     return
                 run_started = True
+            finished = threading.Event()
+
+            def watch_disconnect():
+                while not finished.wait(0.1):
+                    try:
+                        readable, _, _ = select.select([self.connection], [], [], 0)
+                        if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                            gate_run.cancel()
+                            return
+                    except OSError:
+                        gate_run.cancel()
+                        return
+
+            watcher = threading.Thread(target=watch_disconnect, daemon=True)
+            watcher.start()
             try:
                 result = gate_run.run_once()
-            except KeyboardInterrupt:
+                payload = json.dumps(result).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except (KeyboardInterrupt, BrokenPipeError, ConnectionResetError):
+                gate_run.cancel()
                 self.close_connection = True
-                return
-            payload = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
+            finally:
+                finished.set()
+                watcher.join()
 
     return ThreadingHTTPServer(("127.0.0.1", 0), Handler), token
 
