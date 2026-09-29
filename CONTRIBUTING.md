@@ -58,9 +58,9 @@ acceptance test separately. Existing contributors using `core.hooksPath=.githook
 pick up the revised hook after pulling this change. `make hooks` enables these
 repository hooks for a new checkout.
 
-The current CI workflow runs its broad gates on pull requests and pushes to
-`main`, so feature-branch PR updates receive hosted checks once. Feature branches
-without a PR do not receive hosted CI; run `make check` locally. See [the
+The current CI workflow runs PR checks on pull requests and broad quality and
+container gates after merge to `main`. Feature branches without a PR do not
+receive hosted CI; run `make check` locally. See [the
 testing policy](docs/testing.md) for acceptance, E2E, mutation evidence, and
 rollout gates.
 
@@ -78,7 +78,7 @@ packages are gated by their named producer package.
 - Branch from `main`.
 - Prefer [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `chore:`).
 - Keep each pull request focused. Link the issue (`Fixes #N` or `Closes #N`) so it closes on merge.
-- CI must pass. On Ubuntu that is `make quality-gates`, plus PostgreSQL `steve doctor`, the moto S3 doctor, and `docker build`. macOS runs `make check`. Windows runs the same fmt, clippy, and cargo check commands.
+- PR CI must pass. Ubuntu runs `make check`, official SDK smoke, and PostgreSQL/Moto doctor and backend parity checks; macOS runs `make check`, and Windows runs the same fmt, clippy, and cargo check commands. After merge, `main` runs `make quality-gates` and `docker build` as well.
 
 ## Project documents
 
