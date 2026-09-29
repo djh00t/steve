@@ -27,7 +27,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant},
@@ -808,13 +808,7 @@ fn cancel_body_on_forced_shutdown(
     cancelled: watch::Receiver<bool>,
 ) -> Response {
     let (parts, body) = response.into_parts();
-    Response::from_parts(
-        parts,
-        Body::new(CancelledBody {
-            inner: Some(body),
-            cancelled: active_work_cancelled(cancelled),
-        }),
-    )
+    Response::from_parts(parts, Body::new(CancelledBody::new(body, cancelled)))
 }
 
 fn active_work_cancelled(
@@ -830,8 +824,24 @@ fn active_work_cancelled(
 }
 
 struct CancelledBody {
-    inner: Option<Body>,
-    cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
+    inner: Arc<Mutex<Option<Body>>>,
+    cancellation: tokio::task::JoinHandle<()>,
+}
+
+impl CancelledBody {
+    fn new(body: Body, cancelled: watch::Receiver<bool>) -> Self {
+        let inner = Arc::new(Mutex::new(Some(body)));
+        let cancellable = inner.clone();
+        let cancellation = tokio::spawn(async move {
+            active_work_cancelled(cancelled).await;
+            let body = cancellable.lock().expect("cancelled body").take();
+            drop(body);
+        });
+        Self {
+            inner,
+            cancellation,
+        }
+    }
 }
 
 impl HttpBody for CancelledBody {
@@ -843,28 +853,42 @@ impl HttpBody for CancelledBody {
         cx: &mut TaskContext<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        if this.cancelled.as_mut().poll(cx).is_ready() {
-            this.inner.take();
-            return Poll::Ready(None);
-        }
-        let Some(inner) = this.inner.as_mut() else {
+        let mut inner = this.inner.lock().expect("cancelled body");
+        let Some(body) = inner.as_mut() else {
             return Poll::Ready(None);
         };
-        let result = Pin::new(inner).poll_frame(cx);
+        let result = Pin::new(body).poll_frame(cx);
         if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
-            this.inner.take();
+            let body = inner.take();
+            drop(inner);
+            this.cancellation.abort();
+            drop(body);
         }
         result
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.as_ref().is_none_or(HttpBody::is_end_stream)
+        self.inner
+            .lock()
+            .expect("cancelled body")
+            .as_ref()
+            .is_none_or(HttpBody::is_end_stream)
     }
 
     fn size_hint(&self) -> SizeHint {
         self.inner
+            .lock()
+            .expect("cancelled body")
             .as_ref()
             .map_or_else(SizeHint::default, HttpBody::size_hint)
+    }
+}
+
+impl Drop for CancelledBody {
+    fn drop(&mut self) {
+        self.cancellation.abort();
+        let body = self.inner.lock().expect("cancelled body").take();
+        drop(body);
     }
 }
 

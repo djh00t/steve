@@ -787,6 +787,162 @@ async fn management_drain_timeout_cancels_chat_body_before_accounting_closes() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn management_drain_timeout_cancels_backpressured_chat_without_downstream_poll() {
+    use tokio::io::AsyncWriteExt;
+    use upstream::{ControlledUpstream, Tail};
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("accounting-root");
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            temp.path().join("backpressured-stream-timeout.db").display()
+        );
+        assert!(
+            provision(&root).status.success(),
+            "provision accounting root"
+        );
+        let pool = prepare_sqlite(&database_url).await;
+        let first = bytes::Bytes::from(vec![b'x'; 64 * 1024 * 1024]);
+        let mut upstream = ControlledUpstream::start(
+            "/v1/chat/completions",
+            first,
+            Tail::Bytes(b"data: [DONE]\n\n".as_slice().into()),
+        )
+        .await
+        .expect("start backpressured Chat upstream");
+        let mut process = SteveProcess::start_with_stream_shutdown_fixture(
+            &upstream.url(),
+            &database_url,
+            &root,
+            1,
+            100,
+            500,
+            25,
+        )
+        .expect("start backpressured-stream shutdown fixture");
+        let listeners = process
+            .wait_ready(Duration::from_secs(10))
+            .await
+            .expect("backpressured-stream fixture ready");
+        let socket = tokio::net::TcpSocket::new_v4().expect("create downstream socket");
+        socket
+            .set_recv_buffer_size(1024)
+            .expect("limit downstream receive buffer");
+        let mut downstream = socket
+            .connect(listeners.inference)
+            .await
+            .expect("connect non-reading downstream");
+        let body = json!({
+            "model":"steve-test-model",
+            "messages":[{"role":"user","content":"backpressure until drain deadline"}],
+            "stream":true
+        })
+        .to_string();
+        downstream
+            .write_all(
+                format!(
+                    "POST /v1/chat/completions HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                    listeners.inference,
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write non-reading Chat request");
+        upstream
+            .wait_for_request(Duration::from_secs(3))
+            .await
+            .expect("backpressured Chat request reached upstream");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let management = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("management client");
+        let drain_started = Instant::now();
+        trigger_shutdown(
+            &mut process,
+            listeners.management,
+            ShutdownTrigger::Management,
+        )
+        .await;
+        upstream
+            .wait_for_body_drop(Duration::from_secs(2))
+            .await
+            .expect("backpressured upstream body was not cancelled by the shared deadline");
+        assert!(
+            drain_started.elapsed() < Duration::from_secs(2),
+            "backpressured body outlived the one-second drain deadline"
+        );
+        assert!(!upstream.tail_was_sent());
+
+        let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let terminal = sqlite_events(&database_url)
+                    .await
+                    .into_iter()
+                    .filter(|row| row.1 == "chat.attempt.terminal.v1")
+                    .collect::<Vec<_>>();
+                if terminal.len() == 1 {
+                    break terminal.into_iter().next().expect("one terminal event");
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("backpressured Chat terminal accounting was not persisted");
+        assert_eq!(
+            serde_json::from_str::<Value>(&terminal.2).expect("terminal payload")["status"],
+            "cancelled"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            sqlite_events(&database_url)
+                .await
+                .iter()
+                .filter(|row| row.1 == "chat.attempt.terminal.v1")
+                .count(),
+            1,
+            "backpressured Chat terminal accounting must be exact-once"
+        );
+
+        assert!(process.is_running().expect("management timeout stays alive"));
+        let ready = management
+            .get(format!("http://{}/health/ready", listeners.management))
+            .send()
+            .await
+            .expect("backpressured timeout readiness");
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let ready: Value = ready.json().await.expect("backpressured readiness JSON");
+        assert_eq!(ready["status"], "not_ready");
+        assert_eq!(ready["phase"], "draining");
+        assert_eq!(latest_generation_state(&root)["phase"], "unclean");
+
+        let signal_started = Instant::now();
+        process
+            .send_sigterm()
+            .expect("stop backpressured management drain");
+        let status = process
+            .wait_for_exit(Duration::from_secs(3))
+            .await
+            .expect("backpressured management process exits without an orphan");
+        assert!(
+            signal_started.elapsed() < Duration::from_secs(2),
+            "shutdown coordinator did not complete within the shared bound"
+        );
+        assert!(!status.success(), "drain timeout must remain non-success");
+        drop(downstream);
+        pool.close().await;
+    })
+    .await
+    .expect("backpressured management drain scenario exceeded 20 seconds");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn shutdown_preparation_failure_cancels_held_chat_before_accounting_closes() {
     use tokio_stream::StreamExt;
     use upstream::{ControlledUpstream, Tail};
