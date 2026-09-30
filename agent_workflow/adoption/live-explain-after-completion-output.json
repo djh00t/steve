@@ -1,0 +1,89 @@
+{
+  "base_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+  "candidate_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+  "dependencies": [],
+  "execution": {
+    "capability": {
+      "effort": "medium",
+      "model": "gpt-6-luna"
+    },
+    "check_ids": [
+      "workflow-demo"
+    ],
+    "next_step": "review",
+    "next_step_class": "independent-review",
+    "route": "delegated",
+    "steps": [
+      "verify",
+      "review",
+      "integrate",
+      "handoff"
+    ],
+    "transitions": [
+      {
+        "from": "verify",
+        "on": "passed",
+        "to": "review"
+      },
+      {
+        "from": "review",
+        "on": "passed",
+        "to": "integrate"
+      },
+      {
+        "from": "integrate",
+        "on": "passed",
+        "to": "handoff"
+      },
+      {
+        "from": "verify",
+        "on": "failed",
+        "to": "diagnose"
+      }
+    ],
+    "unavailable_reason": null
+  },
+  "fingerprint": "3d72eb5cdf859fb63ba83b5143cb566c547aca3ef144cbf0dbcc427785dec652",
+  "mode": "live",
+  "next_step": "review",
+  "ok": true,
+  "reasons": [],
+  "schema_version": 1,
+  "sources": [
+    {
+      "complete": true,
+      "errors": [],
+      "facet": "git",
+      "observed_at": "2026-09-30T10:44:13.359763Z",
+      "project": "steve"
+    },
+    {
+      "complete": true,
+      "errors": [],
+      "facet": "ledger",
+      "observed_at": "2026-09-30T10:44:13.359763Z",
+      "project": "steve"
+    },
+    {
+      "complete": true,
+      "errors": [],
+      "facet": "ownership",
+      "observed_at": "2026-09-30T10:44:13.359763Z",
+      "project": "steve"
+    },
+    {
+      "complete": true,
+      "errors": [],
+      "facet": "tracker",
+      "observed_at": "2026-09-30T10:44:13.359763Z",
+      "project": "steve"
+    }
+  ],
+  "status": "READY",
+  "target": {
+    "object_id": "623",
+    "object_type": "issue",
+    "project": "djh00t/steve",
+    "source_type": "github"
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "profile_id": "steve-delivery-reset-v1-be0a0e1",
+  "projects": {
+    "steve": {
+      "tracker": {
+        "source_type": "github",
+        "project": "djh00t/steve",
+        "dependency_source": "workflow-json",
+        "acceptance_actors": [
+          "djh00t"
+        ]
+      },
+      "git": {
+        "source_type": "github",
+        "project": "djh00t/steve",
+        "default_branch": "main",
+        "release_branch": "codex/delivery-reset"
+      },
+      "ledger": {
+        "packages_path": "/Users/djh/.agents/workflow/steve/delivery-reset/pre-adoption-ownership.json",
+        "active_path": "/Users/djh/.agents/workflow/steve/delivery-reset/active-wp.json",
+        "reader": "existing-ledger-v1"
+      },
+      "lifecycle_sources": {
+        "WF-": "tracker-acceptance"
+      }
+    }
+  },
+  "coordination_root": "/Users/djh/.agents/workflow/steve/delivery-reset",
+  "max_source_age_seconds": 300,
+  "checks": {
+    "workflow-demo": {
+      "command": "python3 -m agent_workflow.demo",
+      "cwd": ".",
+      "environment": {},
+      "evidence_scope": "local"
+    },
+    "dispatch-inventory": {
+      "command": "python3 scripts/test_dispatch_work_packages.py",
+      "cwd": ".",
+      "environment": {},
+      "evidence_scope": "local"
+    },
+    "steve-check": {
+      "command": "make check",
+      "cwd": ".",
+      "environment": {},
+      "evidence_scope": "local"
+    }
+  },
+  "capabilities": [
+    {
+      "model": "gpt-6-luna",
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "model": "gpt-6.1-sol",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ]
+    },
+    {
+      "model": "gpt-6-astra",
+      "efforts": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ]
+    }
+  ],
+  "protected_resources": [
+    "workflow-adoption-bootstrap",
+    "workflow-adoption-review",
+    "dispatch-inventory",
+    "m1-accounting",
+    "shared-release-integration"
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "mode": "live",
+  "target": {
+    "source_type": "github",
+    "project": "djh00t/steve",
+    "object_type": "issue",
+    "object_id": "623"
+  },
+  "expected_fingerprint": "3d72eb5cdf859fb63ba83b5143cb566c547aca3ef144cbf0dbcc427785dec652",
+  "attempt_id": "steve-wf-adopt-01-verify-20260930t103638z",
+  "owner": "/root",
+  "authority_reference": "user-authorized portable workflow adoption task, 2026-09-30",
+  "base_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+  "candidate_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+  "route": "delegated",
+  "step": "verify"
+}

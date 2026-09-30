@@ -1,0 +1,23 @@
+{
+  "attempt_id": "steve-wf-adopt-01-verify-20260930t103638z",
+  "base_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+  "candidate_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+  "fingerprint": "3d72eb5cdf859fb63ba83b5143cb566c547aca3ef144cbf0dbcc427785dec652",
+  "mode": "live",
+  "ok": true,
+  "owned_paths": [
+    "workflow_evidence/WF-ADOPT-01-review.json"
+  ],
+  "package": {
+    "object_id": "623",
+    "object_type": "issue",
+    "project": "djh00t/steve",
+    "revision": "046aa6b8213314730e7ccf29c351207abe8f474790bc1d771f77a2a06797caaf",
+    "source_type": "github"
+  },
+  "resources": [
+    "workflow-adoption-review"
+  ],
+  "schema_version": 1,
+  "state": "intent"
+}

@@ -1,0 +1,9 @@
+{
+  "attempt_id": "steve-wf-adopt-01-verify-20260930t103638z",
+  "mode": "live",
+  "ok": true,
+  "receipt_id": "steve-wf-adopt-01-dispatch-review-portable-adoption",
+  "released": false,
+  "schema_version": 1,
+  "state": "recorded"
+}

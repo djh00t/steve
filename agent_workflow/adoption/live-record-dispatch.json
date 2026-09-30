@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "mode": "live",
+  "attempt_id": "steve-wf-adopt-01-verify-20260930t103638z",
+  "owner": "/root",
+  "package_revision": "046aa6b8213314730e7ccf29c351207abe8f474790bc1d771f77a2a06797caaf",
+  "base_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+  "candidate_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+  "receipt": {
+    "receipt_id": "steve-wf-adopt-01-dispatch-review-portable-adoption",
+    "stage": "dispatch",
+    "external_object": {
+      "source_type": "codex-native",
+      "project": "djh00t/steve",
+      "object_type": "task",
+      "object_id": "/root/review_portable_adoption",
+      "revision": "/root/review_portable_adoption"
+    },
+    "result": "running",
+    "observed_at": "2026-09-30T10:38:57Z",
+    "evidence": {
+      "step": "verify",
+      "result": "unknown",
+      "candidate_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+      "base_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+      "artifact": "codex-task:/root/review_portable_adoption"
+    }
+  }
+}

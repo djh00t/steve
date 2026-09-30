@@ -1,0 +1,51 @@
+{
+  "dependencies": [],
+  "fingerprint": "7ca4e325001c62472403f27b5de072ff3f1d477cfe6ce1f2628f63af7eda506c",
+  "mode": "live",
+  "next_step": "wait",
+  "ok": true,
+  "reasons": [
+    {
+      "attempt_id": "steve-wf-adopt-01-verify-20260930t103638z",
+      "code": "ACTIVE_CLAIM"
+    }
+  ],
+  "schema_version": 1,
+  "sources": [
+    {
+      "complete": true,
+      "errors": [],
+      "facet": "git",
+      "observed_at": "2026-09-30T10:40:25.900293Z",
+      "project": "steve"
+    },
+    {
+      "complete": true,
+      "errors": [],
+      "facet": "ledger",
+      "observed_at": "2026-09-30T10:40:25.900293Z",
+      "project": "steve"
+    },
+    {
+      "complete": true,
+      "errors": [],
+      "facet": "ownership",
+      "observed_at": "2026-09-30T10:40:25.900293Z",
+      "project": "steve"
+    },
+    {
+      "complete": true,
+      "errors": [],
+      "facet": "tracker",
+      "observed_at": "2026-09-30T10:40:25.900293Z",
+      "project": "steve"
+    }
+  ],
+  "status": "BLOCKED",
+  "target": {
+    "object_id": "623",
+    "object_type": "issue",
+    "project": "djh00t/steve",
+    "source_type": "github"
+  }
+}
