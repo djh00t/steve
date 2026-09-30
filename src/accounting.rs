@@ -10,7 +10,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
@@ -5441,11 +5440,11 @@ fn effective_actor_identity() -> Result<String> {
         .into_iter()
         .find(|path| Path::new(path).is_file())
         .context("qualified system id executable is unavailable")?;
-    let uid = Command::new(id)
+    let uid = std::process::Command::new(id)
         .arg("-u")
         .output()
         .context("reading effective operator uid")?;
-    let account = Command::new(id)
+    let account = std::process::Command::new(id)
         .arg("-un")
         .output()
         .context("reading effective operator account")?;
@@ -5507,6 +5506,22 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 fn set_readonly_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o400))
+        .with_context(|| format!("setting retained backup read-only at {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    bail!(
+        "private accounting roots are unsupported on this platform until qualified: {}",
+        path.display()
+    )
+}
+
+#[cfg(not(unix))]
+fn set_readonly_file(path: &Path) -> Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(path, permissions)
         .with_context(|| format!("setting retained backup read-only at {}", path.display()))
 }
 
@@ -6575,20 +6590,4 @@ mod tests {
         };
         assert!(error.to_string().contains("unknown"), "{error:#}");
     }
-}
-
-#[cfg(not(unix))]
-fn ensure_private_directory(path: &Path) -> Result<()> {
-    bail!(
-        "private accounting roots are unsupported on this platform until qualified: {}",
-        path.display()
-    )
-}
-
-#[cfg(not(unix))]
-fn set_readonly_file(path: &Path) -> Result<()> {
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_readonly(true);
-    fs::set_permissions(path, permissions)
-        .with_context(|| format!("setting retained backup read-only at {}", path.display()))
 }

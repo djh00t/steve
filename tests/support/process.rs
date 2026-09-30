@@ -430,6 +430,15 @@ impl SteveProcess {
         }
     }
 
+    #[cfg(not(unix))]
+    #[allow(dead_code)]
+    pub fn send_sigterm(&mut self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SIGTERM is unavailable on this platform",
+        ))
+    }
+
     #[allow(dead_code)]
     pub async fn wait_for_exit(&mut self, timeout: Duration) -> Result<ExitStatus, String> {
         let deadline = Instant::now() + timeout;
