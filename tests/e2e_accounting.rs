@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, sqlite::SqlitePoolOptions};
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -86,6 +87,35 @@ fn sha256(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn write_checked_fixture(path: &Path, value: &Value) {
+    let bytes = serde_json::to_vec_pretty(value).expect("serialize checked fixture");
+    fs::write(path, &bytes).expect("write checked fixture");
+    fs::write(format!("{}.sha256", path.display()), sha256(&bytes))
+        .expect("write checked fixture checksum");
+}
+
+fn accounting_root_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn collect(root: &Path, directory: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(directory).expect("read accounting evidence directory") {
+            let path = entry.expect("accounting evidence entry").path();
+            if path.is_dir() {
+                collect(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root)
+                        .expect("accounting evidence below root")
+                        .to_owned(),
+                    fs::read(&path).expect("read accounting evidence bytes"),
+                );
+            }
+        }
+    }
+
+    let mut files = BTreeMap::new();
+    collect(root, root, &mut files);
+    files
 }
 
 fn write_maintenance_assertion(source: &Path, path: &Path) {
@@ -2399,6 +2429,371 @@ async fn accounting_disposition_is_auditable_and_publicly_redacted() {
         .await
         .expect("uncovered active status JSON");
     assert_eq!(status["accounting_incident"]["state"], "unreconciled");
+}
+
+async fn assert_ordinary_conflict_resolution(authoritative: &str) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("accounting-root");
+    let database_path = temp.path().join(format!("ordinary-{authoritative}.db"));
+    let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+    let config = temp.path().join("offline.toml");
+    assert!(
+        provision(&root).status.success(),
+        "provision accounting root"
+    );
+    write_offline_config(&config, &database_url, &root);
+    let pool = prepare_sqlite(&database_url).await;
+    let mut process =
+        SteveProcess::start_with_database_and_accounting(&database_url, &root, 50, 200, 25)
+            .expect("start ordinary conflict process");
+    let listeners = process
+        .wait_ready(Duration::from_secs(10))
+        .await
+        .expect("ordinary conflict process ready");
+    let mut lock = pool.acquire().await.expect("acquire SQLite writer");
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *lock)
+        .await
+        .expect("hold SQLite writer");
+    let request = json!({"value":{"authority":authoritative,"side":"journal"}});
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/api/v1/test/echo", listeners.inference))
+        .json(&request)
+        .send()
+        .await
+        .expect("send ordinary conflict event");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let (journal, journal_bytes) = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some((journal, bytes)) =
+                generation_journals(&root).into_iter().find_map(|journal| {
+                    let bytes = fs::read(&journal).expect("read ordinary conflict journal");
+                    (!bytes.is_empty()).then_some((journal, bytes))
+                })
+            {
+                break (journal, bytes);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("ordinary event reached durable journal");
+    let event: Value = serde_json::from_slice(
+        journal_bytes
+            .strip_suffix(b"\n")
+            .expect("journal frame newline"),
+    )
+    .expect("ordinary journal event");
+    let event_id = event["id"].as_str().expect("ordinary event id");
+    let database_payload =
+        json!({"value":{"authority":authoritative,"side":"database"}}).to_string();
+    sqlx::query(
+        "INSERT INTO steve_background_events(id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
+    )
+    .bind(event_id)
+    .bind(event["kind"].as_str().expect("ordinary event kind"))
+    .bind(&database_payload)
+    .bind(
+        event["created_at"]
+            .as_str()
+            .expect("ordinary event timestamp"),
+    )
+    .execute(&mut *lock)
+    .await
+    .expect("seed ordinary conflicting row");
+    sqlx::query("COMMIT")
+        .execute(&mut *lock)
+        .await
+        .expect("publish ordinary conflicting row");
+    drop(lock);
+
+    process
+        .send_sigterm()
+        .expect("stop ordinary conflict process");
+    process
+        .wait_for_exit(Duration::from_secs(5))
+        .await
+        .expect("ordinary conflict process exits");
+    let generation_id = journal
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .expect("ordinary generation id");
+    let state_path = root
+        .join("generations")
+        .join(format!("{generation_id}.state.json"));
+    let before_state: Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("ordinary generation state"))
+            .expect("valid ordinary generation state");
+    assert!(
+        matches!(before_state["phase"].as_str(), Some("draining" | "unclean")),
+        "ordinary shutdown did not publish a completion-bearing replay phase"
+    );
+    assert_eq!(before_state["admitted_count"], 1);
+    assert_eq!(before_state["worker_completed_count"], 1);
+    assert_eq!(before_state["journal_synced_count"], 1);
+    assert_eq!(before_state["database_committed_count"], 0);
+
+    let conflict = incident(&root);
+    assert_eq!(conflict["state"], "blocked");
+    assert_eq!(conflict["cause"], "replay_content_conflict");
+    let incident_id = conflict["incident_id"].as_str().expect("incident id");
+    let revision = conflict["revision"].as_u64().expect("incident revision");
+    let revision_string = revision.to_string();
+
+    let audit_bytes = fs::read(root.join("audit.json")).expect("audit evidence");
+    fs::write(root.join(".audit.json.staging"), &audit_bytes)
+        .expect("stage untouched audit evidence");
+    fs::write(
+        root.join(".audit.json.sha256.staging"),
+        sha256(&audit_bytes),
+    )
+    .expect("stage untouched audit checksum");
+    let before_audit = accounting_root_bytes(&root);
+    let audited = configured_accounting(
+        &config,
+        "audit",
+        &[
+            ("--root", root.to_str().expect("root path")),
+            ("--incident", incident_id),
+            ("--revision", &revision_string),
+        ],
+    );
+    assert!(
+        audited.status.success(),
+        "unresolved conflict audit failed: {}",
+        String::from_utf8_lossy(&audited.stderr)
+    );
+    let audited: Value =
+        serde_json::from_slice(&audited.stdout).expect("unresolved conflict audit JSON");
+    assert_eq!(audited["operation"], "inspect_conflict");
+    assert_eq!(audited["incident_id"], incident_id);
+    assert_eq!(audited["revision"], revision);
+    assert_eq!(
+        audited["conflicts"]
+            .as_array()
+            .expect("audited conflicts")
+            .len(),
+        1
+    );
+    let audited_conflict = &audited["conflicts"][0];
+    assert_eq!(audited_conflict["event_id"], event_id);
+    assert_eq!(audited_conflict["generation_id"], generation_id);
+    let snapshot_path = PathBuf::from(
+        audited_conflict["conflict_snapshot_ref"]
+            .as_str()
+            .expect("conflict snapshot path"),
+    );
+    let snapshot_bytes = fs::read(&snapshot_path).expect("protected conflict snapshot");
+    let snapshot: Value =
+        serde_json::from_slice(&snapshot_bytes).expect("protected conflict snapshot JSON");
+    for field in [
+        "journal_offset",
+        "journal_length",
+        "journal_record_digest",
+        "source",
+        "existing",
+        "existing_row_digest",
+        "verification_id",
+        "backend",
+        "transaction_isolation",
+        "read_evidence",
+        "observed_at",
+    ] {
+        assert_eq!(
+            audited_conflict[field], snapshot[field],
+            "audit field {field}"
+        );
+    }
+    assert_eq!(audited_conflict["source"]["id"], event["id"]);
+    assert_eq!(audited_conflict["source"]["kind"], event["kind"]);
+    assert_eq!(
+        audited_conflict["source"]["payload"],
+        event["payload"].to_string()
+    );
+    assert_eq!(
+        audited_conflict["source"]["created_at"],
+        event["created_at"]
+    );
+    assert_eq!(audited_conflict["existing"]["payload"], database_payload);
+    assert_eq!(
+        audited_conflict["conflict_snapshot_digest"],
+        sha256(&snapshot_bytes)
+    );
+    let coordination: Value = serde_json::from_slice(
+        &fs::read(root.join("coordination.json")).expect("coordination evidence"),
+    )
+    .expect("coordination JSON");
+    assert_eq!(audited["coverage"], coordination["coverage"]);
+    assert_eq!(
+        accounting_root_bytes(&root),
+        before_audit,
+        "read-only audit changed protected root bytes"
+    );
+
+    let resolved = configured_accounting(
+        &config,
+        "resolve-conflict",
+        &[
+            ("--root", root.to_str().expect("root path")),
+            ("--incident", incident_id),
+            ("--revision", &revision_string),
+            ("--event-id", event_id),
+            ("--authoritative", authoritative),
+            ("--evidence-ref", "ticket://m1/ordinary-conflict-resolution"),
+        ],
+    );
+    assert!(
+        resolved.status.success(),
+        "ordinary conflict resolution failed: {}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    let resolved: Value =
+        serde_json::from_slice(&resolved.stdout).expect("ordinary resolution JSON");
+    assert_eq!(resolved["state"], "clear");
+    let after_state: Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("resolved ordinary state"))
+            .expect("valid resolved ordinary state");
+    assert_eq!(after_state["phase"], "reconciled");
+    for field in [
+        "admitted_count",
+        "worker_completed_count",
+        "journal_synced_count",
+    ] {
+        assert_eq!(after_state[field], before_state[field], "preserve {field}");
+    }
+    assert_eq!(after_state["database_committed_count"], 1);
+    let row = sqlite_events(&database_url).await;
+    assert_eq!(row.len(), 1);
+    assert_eq!(
+        row[0].2,
+        if authoritative == "journal" {
+            event["payload"].to_string()
+        } else {
+            database_payload
+        }
+    );
+    let completed_revision = resolved["revision"]
+        .as_u64()
+        .expect("completed revision")
+        .to_string();
+    let completed = configured_accounting(
+        &config,
+        "audit",
+        &[
+            ("--root", root.to_str().expect("root path")),
+            ("--incident", incident_id),
+            ("--revision", &completed_revision),
+        ],
+    );
+    assert!(completed.status.success());
+    let completed: Value = serde_json::from_slice(&completed.stdout).expect("completed audit JSON");
+    assert_eq!(completed["operation"], "resolve_conflict");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn ordinary_generation_conflict_resolves_with_journal_authority() {
+    assert_ordinary_conflict_resolution("journal").await;
+}
+
+#[tokio::test]
+async fn ordinary_generation_conflict_resolves_with_database_authority() {
+    assert_ordinary_conflict_resolution("database").await;
+}
+
+#[tokio::test]
+async fn failed_replay_rebinds_after_read_only_generation_on_restart() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("failed-replay.jsonl");
+    let root = temp.path().join("accounting-root");
+    let assertion = temp.path().join("maintenance-assertion.json");
+    let database_path = temp.path().join("failed-replay.db");
+    let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
+    let adoption = adopt_fixture(&source, &root, &assertion, REPLAY_EVENT_ONE);
+    let pool = prepare_sqlite(&database_url).await;
+    sqlx::query(
+        "CREATE TRIGGER fail_replay BEFORE INSERT ON steve_background_events
+         WHEN NEW.id = '01995200-0000-7000-8000-000000000101'
+         BEGIN SELECT RAISE(FAIL, 'forced replay failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .expect("install replay failure trigger");
+    let mut blocked = incident(&root);
+    blocked["revision"] = json!(blocked["revision"].as_u64().expect("incident revision") + 1);
+    blocked["state"] = json!("blocked");
+    blocked["incident_id"] = json!("019d2400-0000-7000-8000-000000000001");
+    blocked["first_observed_at"] = json!("2026-09-30T00:00:00Z");
+    blocked["cause"] = json!("primary_and_journal_unavailable");
+    write_checked_fixture(&root.join("incident.json"), &blocked);
+
+    let mut failed =
+        SteveProcess::start_with_database_and_accounting(&database_url, &root, 50, 200, 25)
+            .expect("start failed replay process");
+    failed
+        .wait_ready(Duration::from_secs(10))
+        .await
+        .expect("failed replay publishes read-only management process");
+    let manifest_path = root
+        .join("generations")
+        .join(format!("{}.replay.json", generation_id(&adoption)));
+    let failed_manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("failed replay manifest"))
+            .expect("failed replay manifest JSON");
+    assert!(matches!(
+        failed_manifest["receipts"][0]["outcome"].as_str(),
+        Some("failed" | "unknown")
+    ));
+    let original_source_revision = failed_manifest["source_coordination_revision"]
+        .as_u64()
+        .expect("failed replay source coordination revision");
+    let advanced_coordination: Value = serde_json::from_slice(
+        &fs::read(root.join("coordination.json")).expect("advanced coordination"),
+    )
+    .expect("advanced coordination JSON");
+    assert!(
+        advanced_coordination["revision"]
+            .as_u64()
+            .expect("advanced coordination revision")
+            > original_source_revision,
+        "read-only generation did not advance coordination"
+    );
+    drop(failed);
+    sqlx::query("DROP TRIGGER fail_replay")
+        .execute(&pool)
+        .await
+        .expect("recover replay database");
+
+    let mut restarted =
+        SteveProcess::start_with_database_and_accounting(&database_url, &root, 50, 500, 25)
+            .expect("restart recovered replay process");
+    restarted
+        .wait_ready(Duration::from_secs(10))
+        .await
+        .expect("recovered replay restart publishes management process");
+    let recovered_manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("recovered replay manifest"))
+            .expect("recovered replay manifest JSON");
+    assert_eq!(recovered_manifest["receipts"][0]["outcome"], "inserted");
+    assert!(
+        recovered_manifest["source_coordination_revision"]
+            .as_u64()
+            .expect("rebound coordination revision")
+            > original_source_revision
+    );
+    let completed: Value =
+        serde_json::from_slice(&fs::read(root.join("adoption.json")).expect("completed adoption"))
+            .expect("completed adoption JSON");
+    assert_eq!(completed["state"], "complete");
+    assert_eq!(sqlite_events(&database_url).await.len(), 1);
+    restarted
+        .send_sigterm()
+        .expect("stop recovered replay process");
+    restarted
+        .wait_for_exit(Duration::from_secs(5))
+        .await
+        .expect("recovered replay process exits");
+    pool.close().await;
 }
 
 #[tokio::test]

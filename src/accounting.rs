@@ -1774,23 +1774,8 @@ async fn resolve_conflict(
             if receipt.resolution_ref.is_some() && !resumable_publication {
                 continue;
             }
-            let snapshot_path = PathBuf::from(
-                receipt
-                    .conflict_snapshot_ref
-                    .as_deref()
-                    .context("conflict receipt is missing its protected snapshot")?,
-            );
-            let snapshot: RecordedConflictSnapshot = read_checked(&snapshot_path)?;
-            if receipt.conflict_snapshot_digest.as_deref()
-                != Some(digest(&fs::read(&snapshot_path)?).as_str())
-                || snapshot.installation_id != installation.installation_id
-                || snapshot.generation_id != receipt.generation_id
-                || snapshot.journal_offset != receipt.offset
-                || snapshot.journal_length != receipt.length
-                || snapshot.journal_record_digest != receipt.record_digest
-                || snapshot.source.id != event_id
-                || snapshot.existing.id != event_id
-            {
+            let snapshot = load_validated_conflict_snapshot(&root, &installation, receipt)?;
+            if snapshot.source.id != event_id || snapshot.existing.id != event_id {
                 bail!("protected conflict evidence does not match its replay receipt");
             }
             validate_same_id_conflict_sides(
@@ -1821,25 +1806,6 @@ async fn resolve_conflict(
     }
     let (manifest_path, mut manifest, receipt_index, snapshot) =
         selected.context("unresolved conflict receipt was not found")?;
-    let journal_bytes = fs::read(generation_journal_path(&root, &snapshot.generation_id))?;
-    let parsed = parse_journal(&journal_bytes);
-    let frame = parsed
-        .frames
-        .iter()
-        .find(|frame| frame.offset == snapshot.journal_offset)
-        .context("protected conflict no longer has its journal frame")?;
-    let source_payload: Value = serde_json::from_str(&snapshot.source.payload)
-        .context("conflict source payload changed")?;
-    if frame.length != snapshot.journal_length
-        || frame.digest != snapshot.journal_record_digest
-        || frame.event.id != snapshot.source.id
-        || frame.event.kind != snapshot.source.kind
-        || frame.event.payload != source_payload
-        || frame.event.created_at != snapshot.source.created_at
-    {
-        bail!("protected conflict journal side changed");
-    }
-
     let current = read_background_row(database, event_id).await?;
     let final_row = if authoritative == "journal" {
         if current != snapshot.existing && current != snapshot.source {
@@ -1861,8 +1827,13 @@ async fn resolve_conflict(
     let state_already_published = resolved_state.phase == GenerationPhase::Reconciled
         && resolved_state.revision == manifest.source_generation_revision.saturating_add(1);
     if (!state_already_published
-        && (resolved_state.phase != GenerationPhase::Adopting
-            || resolved_state.revision != manifest.source_generation_revision))
+        && (!matches!(
+            resolved_state.phase,
+            GenerationPhase::Active
+                | GenerationPhase::Draining
+                | GenerationPhase::Unclean
+                | GenerationPhase::Adopting
+        ) || resolved_state.revision != manifest.source_generation_revision))
         || manifest.parser_result != "complete"
         || manifest.complete_record_count != manifest.receipts.len() as u64
     {
@@ -1881,14 +1852,42 @@ async fn resolve_conflict(
                     && receipt.resolved_authoritative.is_some())
         });
     let mut resolved_coordination = coordination.clone();
-    if generation_resolved && !state_already_published {
+    let completion_barrier = if generation_resolved && !state_already_published {
+        match resolved_state.phase {
+            GenerationPhase::Adopting => {
+                resolved_state.admitted_count = Some(0);
+                resolved_state.worker_completed_count = Some(0);
+                resolved_state.journal_synced_count = Some(manifest.complete_record_count);
+                resolved_state.database_committed_count = Some(manifest.complete_record_count);
+                true
+            }
+            GenerationPhase::Draining | GenerationPhase::Unclean => {
+                let admitted = resolved_state
+                    .admitted_count
+                    .context("conflict generation lost admitted completion evidence")?;
+                let committed = resolved_state
+                    .database_committed_count
+                    .context("conflict generation lost database completion evidence")?
+                    .saturating_add(manifest.complete_record_count);
+                if resolved_state.worker_completed_count == Some(admitted)
+                    && resolved_state.journal_synced_count == Some(manifest.complete_record_count)
+                    && committed == admitted
+                {
+                    resolved_state.database_committed_count = Some(committed);
+                    true
+                } else {
+                    false
+                }
+            }
+            GenerationPhase::Active | GenerationPhase::Reconciled => false,
+        }
+    } else {
+        state_already_published
+    };
+    if completion_barrier && !state_already_published {
         resolved_state.revision = resolved_state.revision.saturating_add(1);
         resolved_state.phase = GenerationPhase::Reconciled;
         resolved_state.last_complete_record_boundary = Some(manifest.complete_boundary);
-        resolved_state.admitted_count = Some(0);
-        resolved_state.worker_completed_count = Some(0);
-        resolved_state.journal_synced_count = Some(manifest.complete_record_count);
-        resolved_state.database_committed_count = Some(manifest.complete_record_count);
         resolved_state.replay_manifest = Some(manifest_path.display().to_string());
         resolved_state.updated_at = Utc::now().to_rfc3339();
         resolved_coordination.revision = resolved_coordination.revision.saturating_add(1);
@@ -1990,7 +1989,7 @@ async fn resolve_conflict(
         receipt.updated_at = Utc::now().to_rfc3339();
         persist_replay_manifest(&manifest_path, &mut manifest)?;
     }
-    if generation_resolved && !state_already_published {
+    if completion_barrier && !state_already_published {
         resolved_state.replay_manifest_digest = Some(digest(&fs::read(&manifest_path)?));
         write_checked(
             &generation_state_path(&root, &resolved_state.generation_id),
@@ -1998,7 +1997,7 @@ async fn resolve_conflict(
         )?;
         write_checked(&root.join("coordination.json"), &resolved_coordination)?;
     }
-    if generation_resolved {
+    if completion_barrier {
         let adoption_path = root.join("adoption.json");
         if adoption_path.exists() {
             let mut adoption: Adoption = read_checked(&adoption_path)?;
@@ -2070,6 +2069,68 @@ fn validate_same_id_conflict_sides(
         *database_row = Some(snapshot.existing.clone());
     }
     Ok(())
+}
+
+fn load_validated_conflict_snapshot(
+    root: &Path,
+    installation: &Installation,
+    receipt: &ReplayReceipt,
+) -> Result<RecordedConflictSnapshot> {
+    let snapshot_path = PathBuf::from(
+        receipt
+            .conflict_snapshot_ref
+            .as_deref()
+            .context("conflict receipt is missing its protected snapshot")?,
+    );
+    let snapshot: RecordedConflictSnapshot = read_checked(&snapshot_path)?;
+    let journal = fs::read(generation_journal_path(root, &snapshot.generation_id))?;
+    let parsed = parse_journal(&journal);
+    let frame = parsed
+        .frames
+        .iter()
+        .find(|frame| frame.offset == snapshot.journal_offset)
+        .context("protected conflict no longer has its journal frame")?;
+    let source_payload: Value = serde_json::from_str(&snapshot.source.payload)
+        .context("conflict source payload changed")?;
+    if receipt.outcome != ReplayOutcome::DuplicateConflict
+        || receipt.conflict_snapshot_digest.as_deref()
+            != Some(digest(&fs::read(&snapshot_path)?).as_str())
+        || receipt.database_evidence_ref.as_deref() != Some(snapshot.verification_id.as_str())
+        || snapshot_path
+            != conflict_snapshot_path(
+                root,
+                &snapshot.generation_id,
+                snapshot.journal_offset,
+                snapshot.journal_length,
+                &snapshot.journal_record_digest,
+            )
+        || snapshot.format_version != FORMAT_VERSION
+        || snapshot.installation_id != installation.installation_id
+        || snapshot.generation_id != receipt.generation_id
+        || snapshot.journal_offset != receipt.offset
+        || snapshot.journal_length != receipt.length
+        || snapshot.journal_record_digest != receipt.record_digest
+        || snapshot.existing_row_digest != digest(&serde_json::to_vec(&snapshot.existing)?)
+        || snapshot.existing.id != receipt.event_id
+        || snapshot.verification_id.is_empty()
+        || snapshot.backend.is_empty()
+        || snapshot.transaction_isolation.is_empty()
+        || snapshot.read_evidence
+            != format!(
+                "{}:{}:{}",
+                snapshot.backend, snapshot.transaction_isolation, snapshot.verification_id
+            )
+        || frame.length != snapshot.journal_length
+        || frame.digest != snapshot.journal_record_digest
+        || frame.event.id != snapshot.source.id
+        || frame.event.kind != snapshot.source.kind
+        || frame.event.payload != source_payload
+        || frame.event.created_at != snapshot.source.created_at
+        || receipt.content_digest != event_content_digest(&frame.event)?
+    {
+        bail!("protected conflict evidence does not match its replay receipt");
+    }
+    Ok(snapshot)
 }
 
 async fn read_background_row(
@@ -2278,19 +2339,79 @@ fn audit_incident(root: &Path, incident_id: &str, revision: u64) -> Result<Value
     let root = resolve_accounting_root(root)?;
     let lock = open_coordination_lock(&root)?;
     lock_with_timeout(&lock, LOCK_TIMEOUT)?;
-    recover_checked_publications(&root)?;
-    let _installation = load_provisioned_root_locked(&root)?;
+    let installation = load_provisioned_root_locked(&root)?;
     let records: Vec<AuditRecord> = read_checked(&root.join("audit.json"))?;
-    let record = records
-        .into_iter()
-        .find(|record| {
-            record.incident_id == incident_id
-                && record.revision == revision
-                && record.operation != "prepare_conflict_resolution"
-        })
-        .context("accounting audit record was not found")?;
+    if let Some(record) = records.into_iter().find(|record| {
+        record.incident_id == incident_id
+            && record.revision == revision
+            && record.operation != "prepare_conflict_resolution"
+    }) {
+        File::unlock(&lock).context("unlocking accounting coordination")?;
+        return Ok(serde_json::to_value(record)?);
+    }
+
+    let incident: Incident = read_checked(&root.join("incident.json"))?;
+    if incident.incident_id.as_deref() != Some(incident_id)
+        || incident.revision != revision
+        || !matches!(
+            incident.state,
+            IncidentState::Blocked | IncidentState::Unreconciled
+        )
+    {
+        bail!("accounting audit record was not found");
+    }
+    let coordination: Coordination = read_checked(&root.join("coordination.json"))?;
+    let mut conflicts = Vec::new();
+    for entry in fs::read_dir(root.join("generations"))? {
+        let path = entry?.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".replay.json"))
+        {
+            continue;
+        }
+        let manifest: ReplayManifest = read_checked(&path)?;
+        validate_manifest_summary(&manifest)?;
+        for receipt in manifest.receipts.iter().filter(|receipt| {
+            receipt.outcome == ReplayOutcome::DuplicateConflict && receipt.resolution_ref.is_none()
+        }) {
+            let snapshot = load_validated_conflict_snapshot(&root, &installation, receipt)?;
+            conflicts.push(serde_json::json!({
+                "generation_id": receipt.generation_id,
+                "event_id": receipt.event_id,
+                "content_digest": receipt.content_digest,
+                "journal_offset": snapshot.journal_offset,
+                "journal_length": snapshot.journal_length,
+                "journal_record_digest": snapshot.journal_record_digest,
+                "source": snapshot.source,
+                "existing": snapshot.existing,
+                "existing_row_digest": snapshot.existing_row_digest,
+                "verification_id": snapshot.verification_id,
+                "backend": snapshot.backend,
+                "transaction_isolation": snapshot.transaction_isolation,
+                "read_evidence": snapshot.read_evidence,
+                "observed_at": snapshot.observed_at,
+                "database_evidence_ref": receipt.database_evidence_ref,
+                "database_evidence_at": receipt.database_evidence_at,
+                "conflict_snapshot_ref": receipt.conflict_snapshot_ref,
+                "conflict_snapshot_digest": receipt.conflict_snapshot_digest,
+            }));
+        }
+    }
+    if conflicts.is_empty() {
+        bail!("accounting audit record was not found");
+    }
     File::unlock(&lock).context("unlocking accounting coordination")?;
-    Ok(serde_json::to_value(record)?)
+    Ok(serde_json::json!({
+        "format_version": FORMAT_VERSION,
+        "installation_id": installation.installation_id,
+        "operation": "inspect_conflict",
+        "incident_id": incident_id,
+        "revision": revision,
+        "coverage": coordination.coverage,
+        "conflicts": conflicts,
+    }))
 }
 
 fn append_audit(root: &Path, record: AuditRecord) -> Result<()> {
@@ -2731,6 +2852,7 @@ fn adopt_legacy(source: &Path, root: &Path, maintenance_assertion: &Path) -> Res
             &state,
             &parsed,
             serde_json::json!({"backend":"offline_adoption"}),
+            true,
         )?;
         let manifest_digest = digest(&fs::read(&manifest_path)?);
         state.revision += 1;
@@ -3054,6 +3176,7 @@ async fn reconcile_generation(
         state,
         &parsed,
         database_durability,
+        !policy.allow_unclean_completion,
     )?;
     File::unlock(&coordination_lock).context("unlocking accounting coordination")?;
 
@@ -3169,6 +3292,7 @@ fn load_or_create_replay_manifest(
     state: &GenerationState,
     parsed: &ParsedJournal,
     database_durability: Value,
+    refresh_coordination: bool,
 ) -> Result<ReplayManifest> {
     let tail_offset = parsed.torn_tail.as_ref().map(|tail| tail.offset);
     let tail_length = parsed.torn_tail.as_ref().map_or(0, |tail| tail.length);
@@ -3178,7 +3302,7 @@ fn load_or_create_replay_manifest(
         if manifest.format_version != FORMAT_VERSION
             || manifest.installation_id != installation.installation_id
             || manifest.generation_id != state.generation_id
-            || manifest.source_coordination_revision != coordination.revision
+            || manifest.source_coordination_revision > coordination.revision
             || manifest.source_generation_revision != state.revision
             || manifest.journal_length != state.journal_length
             || manifest.journal_evidence_digest != state.journal_evidence_digest
@@ -3226,7 +3350,15 @@ fn load_or_create_replay_manifest(
             .context("manifest has no parent")?
             .parent()
             .context("generations has no parent")?;
-        if recover_conflict_receipts(root, installation, parsed, &mut manifest)? {
+        let mut changed = recover_conflict_receipts(root, installation, parsed, &mut manifest)?;
+        if manifest.source_coordination_revision != coordination.revision && !refresh_coordination {
+            bail!("replay manifest does not match frozen journal evidence");
+        }
+        if manifest.source_coordination_revision != coordination.revision {
+            manifest.source_coordination_revision = coordination.revision;
+            changed = true;
+        }
+        if changed {
             persist_replay_manifest(path, &mut manifest)?;
         }
         return Ok(manifest);
@@ -3739,8 +3871,11 @@ fn verify_replay_publication_snapshot(root: &Path, manifest: &ReplayManifest) ->
     let coordination: Coordination = read_checked(&root.join("coordination.json"))?;
     let state: GenerationState =
         read_checked(&generation_state_path(root, &manifest.generation_id))?;
+    let published: ReplayManifest =
+        read_checked(&replay_manifest_path(root, &manifest.generation_id))?;
     let journal = fs::read(generation_journal_path(root, &manifest.generation_id))?;
     if coordination.revision != manifest.source_coordination_revision
+        || published.revision != manifest.revision
         || state.revision != manifest.source_generation_revision
         || !matches!(
             state.phase,
@@ -5000,7 +5135,11 @@ fn verify_root_inventory(root: &Path) -> Result<()> {
             .file_name()
             .into_string()
             .map_err(|_| anyhow::anyhow!("accounting root contains a non-UTF-8 artifact"))?;
-        if !allowed.contains(&name) {
+        if !allowed.contains(&name)
+            && !(name.ends_with(".staging")
+                && checked_staging_target(&name)
+                    .is_some_and(|target| checked_target_allowed(target, false)))
+        {
             bail!("unknown accounting ownership artifact {name}");
         }
     }
@@ -5815,6 +5954,7 @@ mod tests {
             &state,
             &parsed,
             durability.clone(),
+            true,
         )
         .expect("initial manifest");
         conflict_receipt(
@@ -5842,6 +5982,7 @@ mod tests {
             &state,
             &parsed,
             durability,
+            true,
         )
         .expect("recover manifest");
 
@@ -5947,7 +6088,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_publication_waits_for_coordination_lock() {
+    fn replay_publication_waits_for_lock_and_rejects_stale_revision() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = temp.path().join("accounting");
         AccountingCoordinator::provision(&root).expect("provision");
@@ -5988,8 +6129,10 @@ mod tests {
             &state,
             &parse_journal(b""),
             serde_json::json!({"backend":"sqlite"}),
+            true,
         )
         .expect("manifest");
+        let mut stale = manifest.clone();
         manifest.retry_exhausted = true;
         let before = fs::read(&manifest_path).expect("manifest bytes");
         let lock = open_coordination_lock(&root).expect("coordination lock");
@@ -6009,7 +6152,17 @@ mod tests {
             .join()
             .expect("publisher thread")
             .expect("publish after lock release");
-        assert_ne!(fs::read(&manifest_path).expect("manifest bytes"), before);
+        let published = fs::read(&manifest_path).expect("published manifest bytes");
+        assert_ne!(published, before);
+        stale.retry_exhausted = true;
+        assert!(
+            publish_replay_manifest(&root, &manifest_path, &mut stale).is_err(),
+            "stale in-flight manifest revision overwrote newer evidence"
+        );
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest after stale publication"),
+            published
+        );
     }
 
     #[test]
