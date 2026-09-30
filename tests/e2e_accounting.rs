@@ -4132,10 +4132,36 @@ async fn postgres_replay_detects_conflicting_duplicate() {
     let mut process =
         SteveProcess::start_with_database_and_accounting(&database_url, &root, 200, 1_000, 50)
             .expect("start PostgreSQL conflict Steve");
-    process
+    let listeners = process
         .wait_ready(Duration::from_secs(5))
         .await
-        .expect_err("conflicting duplicate must prevent readiness");
+        .expect("conflicting duplicate keeps management available");
+    let client = reqwest::Client::new();
+    let conflict_incident = incident(&root);
+    assert_eq!(conflict_incident["state"], "blocked");
+    assert_eq!(conflict_incident["cause"], "replay_content_conflict");
+    let ready = client
+        .get(format!("http://{}/health/ready", listeners.management))
+        .send()
+        .await
+        .expect("conflict readiness response");
+    assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let ready: Value = ready.json().await.expect("conflict readiness JSON");
+    assert_eq!(ready["status"], "not_ready");
+    assert_eq!(ready["accounting_incident"]["state"], "unreconciled");
+    assert_eq!(
+        ready["accounting_incident"]["cause"],
+        "prior_incident_unreconciled"
+    );
+    assert_eq!(
+        client
+            .get(format!("http://{}/health/live", listeners.management))
+            .send()
+            .await
+            .expect("conflict liveness response")
+            .status(),
+        reqwest::StatusCode::OK
+    );
 
     let stored: (String, String, String, String) = sqlx::query_as(
         "SELECT id, kind, payload, created_at
