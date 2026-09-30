@@ -3,6 +3,9 @@ mod process;
 #[allow(dead_code)]
 #[path = "support/upstream.rs"]
 mod upstream;
+#[allow(dead_code)]
+#[path = "support/upstream_tls.rs"]
+mod upstream_tls;
 
 use process::SteveProcess;
 use serde_json::{json, Value};
@@ -16,6 +19,125 @@ enum ExtraColumn {
     None,
     Stored(&'static str),
     Generated,
+}
+
+#[tokio::test]
+async fn stv_prov_32_acceptance() {
+    use axum::{routing::post, Router};
+    use upstream::{ControlledUpstream, Tail};
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let request = json!({
+            "model": "steve-test-model",
+            "messages": [{"role": "user", "content": "secure hello"}],
+            "temperature": 0.25
+        });
+        let upstream_response = json!({
+            "id": "chatcmpl_tls_fixture",
+            "object": "chat.completion",
+            "model": "steve-test-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "secure response"},
+                "finish_reason": "stop"
+            }]
+        });
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let response_for_route = upstream_response.clone();
+        let fixture = upstream_tls::TlsFixture::start(Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |method: axum::http::Method,
+                      uri: axum::http::Uri,
+                      axum::Json(body): axum::Json<Value>| {
+                    let request_tx = request_tx.clone();
+                    let response = response_for_route.clone();
+                    async move {
+                        request_tx
+                            .send((method, uri.path().to_owned(), body))
+                            .await
+                            .expect("capture HTTPS request");
+                        axum::Json(response)
+                    }
+                },
+            ),
+        ))
+        .await
+        .expect("start HTTPS OpenAI fixture");
+        let upstream_url = fixture.url();
+        let mut steve = SteveProcess::start_with_upstream_ca_bundle(
+            Some(&upstream_url),
+            None,
+            Some(std::path::Path::new("tests/fixtures/tls/ca.pem")),
+        )
+        .expect("start Steve with HTTPS OpenAI upstream");
+        let listeners = steve
+            .wait_ready(Duration::from_secs(15))
+            .await
+            .expect("Steve listeners become ready");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .expect("build ingress client");
+        let response = client
+            .post(format!(
+                "http://{}/v1/chat/completions",
+                listeners.inference
+            ))
+            .json(&request)
+            .send()
+            .await
+            .expect("request Chat Completions through HTTPS upstream");
+        let status = response.status();
+        let body: Value = response.json().await.expect("HTTPS response JSON");
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(body, upstream_response);
+        let (method, path, captured) = request_rx.recv().await.expect("captured HTTPS request");
+        assert_eq!(method, axum::http::Method::POST);
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(captured, request);
+        drop(steve);
+        fixture.shutdown().await.expect("HTTPS fixture shutdown");
+
+        let response_bytes = serde_json::to_vec(&upstream_response).expect("encode HTTP response");
+        let mut http_fixture = ControlledUpstream::start(
+            "/v1/chat/completions",
+            response_bytes,
+            Tail::Bytes(bytes::Bytes::new()),
+        )
+        .await
+        .expect("start HTTP OpenAI fixture");
+        http_fixture.release_tail();
+        let mut steve = SteveProcess::start_with_upstream_urls(Some(&http_fixture.url()), None)
+            .expect("start Steve with HTTP OpenAI upstream");
+        let listeners = steve
+            .wait_ready(Duration::from_secs(15))
+            .await
+            .expect("Steve listeners become ready for HTTP");
+        let response = client
+            .post(format!(
+                "http://{}/v1/chat/completions",
+                listeners.inference
+            ))
+            .json(&request)
+            .send()
+            .await
+            .expect("request Chat Completions through HTTP upstream");
+        let status = response.status();
+        let body: Value = response.json().await.expect("HTTP response JSON");
+        assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+        assert_eq!(body, upstream_response);
+        assert_eq!(
+            http_fixture
+                .wait_for_request(Duration::from_secs(5))
+                .await
+                .expect("captured HTTP request"),
+            request
+        );
+    })
+    .await
+    .expect("STV-PROV-32 acceptance exceeded 30 seconds");
 }
 
 #[tokio::test]
