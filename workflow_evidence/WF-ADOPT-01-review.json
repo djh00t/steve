@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "issue": "https://github.com/djh00t/steve/issues/623",
+  "review": {
+    "reviewer": "independent delegated reviewer",
+    "reviewed_at": "2026-09-30",
+    "candidate_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+    "base_sha": "e389c86b801c2ea7a5acd96f3d45e917c5175f7c",
+    "brief_revision": "046aa6b8213314730e7ccf29c351207abe8f474790bc1d771f77a2a06797caaf",
+    "fingerprint_claimed": "3d72eb5cdf859fb63ba83b5143cb566c547aca3ef144cbf0dbcc427785dec652",
+    "attempt_id": "steve-wf-adopt-01-verify-20260930t103638z",
+    "owner": "/root",
+    "scope": "workflow_evidence/WF-ADOPT-01-review.json"
+  },
+  "criteria": {
+    "C1": {
+      "result": "passed",
+      "evidence": "Compared bytes against agent-brain commit be0a0e1776985ab8119b169692e759fb4b6bb846 using git show for PORTABLE_WORKFLOW.md, WORK_PACKAGE_TEMPLATE.md, .agents/skills/repository-workflow/SKILL.md, agent_workflow/CONTRACT.md, README.md, __main__.py, admission.py, admission_source.py, demo.py, graph.py, journal.py, routing.py, source.py, and the three example JSON files. All 16 files matched exactly. Steve profile is local; agent_workflow/adoption and Steve profile are not upstream copies. No source backlog, source runtime services, or upstream authority/profile data are in the copied set."
+    },
+    "C2": {
+      "result": "passed",
+      "command": "python3 -m agent_workflow.demo",
+      "exit_code": 0,
+      "output": "{\"mode\":\"fixture\",\"ok\":true,\"scenarios\":{\"agent_release_merge\":\"BLOCKED\",\"changed_base\":\"fingerprint invalidated\",\"cleanup\":\"temporary journal removed\",\"failed_check\":\"diagnose -> repair -> verify -> review\",\"interrupted_handoff\":\"uncertain; reservation retained\",\"missing_source\":\"UNKNOWN\",\"no_blind_retry\":\"ATTEMPT_CONFLICT\",\"out_of_order_integration\":\"BLOCKED\",\"overlapping_claim\":\"BLOCKED\",\"ready_chain\":\"READY\",\"receipt_replay\":\"idempotent; one receipt; own claim released\",\"serial_child_integration\":\"two exact child receipts -> HANDOFF\",\"task_routes\":[\"inline\",\"investigation\",\"delegated\"],\"wrong_child_target\":\"BLOCKED\"},\"schema_version\":1}",
+      "covers": ["READY", "BLOCKED", "UNKNOWN", "claim/replay conflict handling", "serial integration", "human HANDOFF", "temporary journal cleanup"]
+    },
+    "C3": {
+      "result": "passed_with_limitations",
+      "evidence": [
+        {
+          "command": "gh issue view 623 --repo djh00t/steve --json title,body,url,state",
+          "result": "Issue #623 is OPEN; live body matches the reviewed brief and its single owned evidence path."
+        },
+        {
+          "command": "python3 -m agent_workflow explain --profile agent_workflow/profiles/steve_delivery_reset.json --input agent_workflow/adoption/live-explain.json",
+          "exit_code": 0,
+          "result": "Live response ok=true, status=BLOCKED, all four Steve facets (git, ledger, ownership, tracker) complete with no errors. It reports ACTIVE_CLAIM for this attempt. The block is consistent with the extant review reservation; it does not establish package readiness."
+        },
+        {
+          "source": "/Users/djh/.agents/workflow/steve/delivery-reset/pre-adoption-ownership.json",
+          "result": "Bridge contains three active, resource-scoped assignments (workflow bootstrap, dispatch inventory, M1 accounting), with owned paths; it carries no issue lifecycle or permission fields. The live journal is /Users/djh/.agents/workflow/steve/delivery-reset/journal.sqlite3, and the profile's active pointer is active-wp.json under the same Steve-only root. The review claim reserves workflow-adoption-review and owns only the review evidence path."
+        },
+        {
+          "source": "REPO_WORKFLOW_PROFILE.md and agent_workflow/profiles/steve_delivery_reset.json",
+          "result": "The profile binds GitHub djh00t/steve, default main, release codex/delivery-reset, checks workflow-demo/dispatch-inventory/steve-check, explicit human merge and deployment/approval limits, and current Steve coordination paths. Existing Rust Makefile and CI are preserved."
+        },
+        {
+          "source": "docs/testing.md, .github/workflows/ci.yml, Makefile",
+          "result": "PR CI runs make check; main push CI runs make quality-gates and container. docs/testing.md explicitly says not to run local make quality-gates or make check-full; both broad gates belong to post-merge main CI."
+        }
+      ],
+      "limitations": [
+        "The live explanation was BLOCKED by the active review claim, so this run verifies source binding and fail-closed ownership, not eligibility/readiness for dispatch.",
+        "The live claim record and explain response do not contain a selected model or reasoning effort. The profile declares gpt-6-luna with medium effort as an available capability, but that alone cannot verify the claimed actual route/model binding."
+      ]
+    }
+  },
+  "overall": "The pinned portable kit and offline workflow demo are verified. Steve source/ownership binding is present and fail-closed. Actual live route model/effort is not independently evidenced by the current claim/evidence interface."
+}

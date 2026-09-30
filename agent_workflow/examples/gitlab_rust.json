@@ -1,0 +1,329 @@
+{
+  "profile": {
+    "schema_version": 1,
+    "profile_id": "gitlab-rust-v1",
+    "projects": {
+      "corelib": {
+        "tracker": {
+          "source_type": "gitlab",
+          "project": "team/corelib",
+          "dependency_source": "workflow-json",
+          "acceptance_actors": [
+            "team-maintainer"
+          ]
+        },
+        "git": {
+          "source_type": "gitlab",
+          "project": "team/corelib",
+          "default_branch": "main",
+          "release_branch": "release/r0"
+        },
+        "ledger": {
+          "packages_path": "fixtures/corelib-packages.json",
+          "active_path": "fixtures/corelib-active.json",
+          "reader": "existing-ledger-v1"
+        },
+        "lifecycle_sources": {
+          "CORE-": "tracker-acceptance",
+          "RUST-": "tracker-acceptance"
+        }
+      },
+      "rustlib": {
+        "tracker": {
+          "source_type": "gitlab",
+          "project": "team/rustlib",
+          "dependency_source": "workflow-json",
+          "acceptance_actors": [
+            "team-maintainer"
+          ]
+        },
+        "git": {
+          "source_type": "gitlab",
+          "project": "team/rustlib",
+          "default_branch": "main",
+          "release_branch": "release/r0"
+        },
+        "ledger": {
+          "packages_path": "fixtures/rustlib-packages.json",
+          "active_path": "fixtures/rustlib-active.json",
+          "reader": "existing-ledger-v1"
+        },
+        "lifecycle_sources": {
+          "CORE-": "tracker-acceptance",
+          "RUST-": "tracker-acceptance"
+        }
+      }
+    },
+    "coordination_root": "/tmp/agent-brain-coordination",
+    "max_source_age_seconds": 300,
+    "checks": {
+      "rust-test": {
+        "command": "cargo test",
+        "cwd": ".",
+        "environment": {}
+      }
+    },
+    "capabilities": [
+      {
+        "model": "gpt-6-sol",
+        "efforts": [
+          "medium"
+        ]
+      }
+    ],
+    "protected_resources": [
+      "shared-runner"
+    ]
+  },
+  "input": {
+    "schema_version": 1,
+    "mode": "fixture",
+    "target": {
+      "source_type": "gitlab",
+      "project": "team/rustlib",
+      "object_type": "issue",
+      "object_id": "9"
+    },
+    "as_of": "2026-09-28T08:01:00Z",
+    "snapshot": {
+      "schema_version": 1,
+      "profile_id": "gitlab-rust-v1",
+      "observed_at": "2026-09-28T08:00:00Z",
+      "sources": [
+        {
+          "project": "corelib",
+          "facet": "tracker",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "corelib",
+          "facet": "git",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "corelib",
+          "facet": "ledger",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "corelib",
+          "facet": "ownership",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "rustlib",
+          "facet": "tracker",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "rustlib",
+          "facet": "git",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "rustlib",
+          "facet": "ledger",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "rustlib",
+          "facet": "ownership",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        }
+      ],
+      "packages": [
+        {
+          "identity": {
+            "source_type": "gitlab",
+            "project": "team/corelib",
+            "object_type": "issue",
+            "object_id": "7",
+            "revision": "core-7-a"
+          },
+          "metadata": {
+            "schema_version": 1,
+            "key": "CORE-7",
+            "kind": "contract",
+            "release": "release/r0",
+            "parent": null,
+            "requires": [],
+            "contracts": [],
+            "owned_paths": [
+              "src/lib.rs"
+            ],
+            "resources": [],
+            "check_ids": [
+              "rust-test"
+            ],
+            "criteria": [
+              {
+                "id": "C1",
+                "expected": "trait contract accepted",
+                "evidence_scope": "local"
+              }
+            ],
+            "acceptance_owner": "team-maintainer",
+            "risk": "low",
+            "uncertainty": "known",
+            "impact": {
+              "paths": [
+                "src/lib.rs"
+              ],
+              "check_ids": [
+                "rust-test"
+              ]
+            },
+            "outcome": "Versioned workflow contract accepted"
+          },
+          "lifecycle": {
+            "state": "accepted",
+            "source": {
+              "source_type": "gitlab",
+              "project": "team/corelib",
+              "object_type": "issue",
+              "object_id": "7"
+            },
+            "acceptance_receipt": {
+              "identity": {
+                "source_type": "gitlab",
+                "project": "team/corelib",
+                "object_type": "issue_comment",
+                "object_id": "accept-7",
+                "revision": "comment-accepted-a"
+              },
+              "author_login": "team-maintainer",
+              "body": "```workflow-acceptance\n{\"schema_version\":1,\"target\":{\"source_type\":\"gitlab\",\"project\":\"team/corelib\",\"object_type\":\"issue\",\"object_id\":\"7\"},\"accepted_revision\":\"core-7-a\",\"status\":\"accepted\",\"artifact\":\"src/lib.rs\",\"candidate_sha\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"base_sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n```",
+              "parent": {
+                "source_type": "gitlab",
+                "project": "team/corelib",
+                "object_type": "issue",
+                "object_id": "7"
+              }
+            },
+            "tracker_state": "closed"
+          }
+        },
+        {
+          "identity": {
+            "source_type": "gitlab",
+            "project": "team/rustlib",
+            "object_type": "issue",
+            "object_id": "9",
+            "revision": "rust-9-b"
+          },
+          "metadata": {
+            "schema_version": 1,
+            "key": "RUST-9",
+            "kind": "implementation",
+            "release": "release/r0",
+            "parent": null,
+            "requires": [
+              {
+                "target": {
+                  "source_type": "gitlab",
+                  "project": "team/corelib",
+                  "object_type": "issue",
+                  "object_id": "7"
+                },
+                "accepted_revision": "core-7-a",
+                "artifact": "src/lib.rs"
+              }
+            ],
+            "contracts": [],
+            "owned_paths": [
+              "src/consumer.rs"
+            ],
+            "resources": [],
+            "check_ids": [
+              "rust-test"
+            ],
+            "criteria": [
+              {
+                "id": "C1",
+                "expected": "consumer uses accepted trait",
+                "evidence_scope": "local"
+              }
+            ],
+            "acceptance_owner": "team-maintainer",
+            "risk": "medium",
+            "uncertainty": "known",
+            "impact": {
+              "paths": [
+                "src/consumer.rs"
+              ],
+              "check_ids": [
+                "rust-test"
+              ]
+            },
+            "outcome": "Consumer implements accepted contract"
+          },
+          "lifecycle": {
+            "state": "open",
+            "source": {
+              "source_type": "gitlab",
+              "project": "team/rustlib",
+              "object_type": "issue",
+              "object_id": "9"
+            },
+            "acceptance_receipt": null,
+            "tracker_state": "open"
+          }
+        }
+      ],
+      "git": [
+        {
+          "project": "corelib",
+          "default_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "release_branch": "release/r0",
+          "release_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "release_pr": null
+        },
+        {
+          "project": "rustlib",
+          "default_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "release_branch": "release/r0",
+          "release_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "release_pr": null
+        }
+      ],
+      "ledger": {
+        "packages": [],
+        "active": null
+      },
+      "claims": [],
+      "receipts": [],
+      "evidence": [
+        {
+          "stage": "verify",
+          "criterion_id": "C1",
+          "result": "passed",
+          "artifact": "run:local-12",
+          "candidate_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "base_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "environment": "linux-rust",
+          "configuration": "cargo-test",
+          "observed_at": "2026-09-28T07:59:00Z",
+          "check_id": "rust-test"
+        }
+      ],
+      "reviews": [],
+      "references": []
+    }
+  }
+}

@@ -1,0 +1,266 @@
+{
+  "profile": {
+    "schema_version": 1,
+    "profile_id": "github-python-v1",
+    "projects": {
+      "agent-brain": {
+        "tracker": {
+          "source_type": "github",
+          "project": "djh00t/agent-brain",
+          "dependency_source": "workflow-json",
+          "acceptance_actors": [
+            "djh00t"
+          ]
+        },
+        "git": {
+          "source_type": "github",
+          "project": "djh00t/agent-brain",
+          "default_branch": "main",
+          "release_branch": "codex/release/r0-dynamic-delivery"
+        },
+        "ledger": {
+          "packages_path": "~/.agents/status-matrices/agent-brain/work-packages.json",
+          "active_path": "~/.agents/status-matrices/agent-brain/active-wp.json",
+          "reader": "existing-ledger-v1"
+        },
+        "lifecycle_sources": {
+          "WF-": "tracker-acceptance",
+          "AB-": "ledger"
+        }
+      }
+    },
+    "coordination_root": "/tmp/agent-brain-coordination",
+    "max_source_age_seconds": 300,
+    "checks": {
+      "workflow": {
+        "command": "make workflow-check",
+        "cwd": ".",
+        "environment": {}
+      }
+    },
+    "capabilities": [
+      {
+        "model": "gpt-6-sol",
+        "efforts": [
+          "medium",
+          "high"
+        ]
+      }
+    ],
+    "protected_resources": [
+      "live-helix",
+      "shared-build"
+    ]
+  },
+  "input": {
+    "schema_version": 1,
+    "mode": "fixture",
+    "target": {
+      "source_type": "github",
+      "project": "djh00t/agent-brain",
+      "object_type": "issue",
+      "object_id": "13"
+    },
+    "as_of": "2026-09-28T08:01:00Z",
+    "snapshot": {
+      "schema_version": 1,
+      "profile_id": "github-python-v1",
+      "observed_at": "2026-09-28T08:00:00Z",
+      "sources": [
+        {
+          "project": "agent-brain",
+          "facet": "tracker",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "agent-brain",
+          "facet": "git",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "agent-brain",
+          "facet": "ledger",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        },
+        {
+          "project": "agent-brain",
+          "facet": "ownership",
+          "observed_at": "2026-09-28T08:00:00Z",
+          "complete": true,
+          "errors": []
+        }
+      ],
+      "packages": [
+        {
+          "identity": {
+            "source_type": "github",
+            "project": "djh00t/agent-brain",
+            "object_type": "issue",
+            "object_id": "12",
+            "revision": "issue-12-rev-a"
+          },
+          "metadata": {
+            "schema_version": 1,
+            "key": "WF-02",
+            "kind": "contract",
+            "release": "codex/release/r0-dynamic-delivery",
+            "parent": null,
+            "requires": [],
+            "contracts": [],
+            "owned_paths": [
+              "agent_workflow/CONTRACT.md"
+            ],
+            "resources": [],
+            "check_ids": [
+              "workflow"
+            ],
+            "criteria": [
+              {
+                "id": "C1",
+                "expected": "versioned contract accepted",
+                "evidence_scope": "local"
+              }
+            ],
+            "acceptance_owner": "djh00t",
+            "risk": "low",
+            "uncertainty": "known",
+            "impact": {
+              "paths": [
+                "agent_workflow/CONTRACT.md"
+              ],
+              "check_ids": [
+                "workflow"
+              ]
+            },
+            "outcome": "Versioned workflow contract accepted"
+          },
+          "lifecycle": {
+            "state": "accepted",
+            "source": {
+              "source_type": "github",
+              "project": "djh00t/agent-brain",
+              "object_type": "issue",
+              "object_id": "12"
+            },
+            "acceptance_receipt": {
+              "identity": {
+                "source_type": "github",
+                "project": "djh00t/agent-brain",
+                "object_type": "issue_comment",
+                "object_id": "accept-12",
+                "revision": "comment-accepted-a"
+              },
+              "author_login": "djh00t",
+              "body": "```workflow-acceptance\n{\"schema_version\":1,\"target\":{\"source_type\":\"github\",\"project\":\"djh00t/agent-brain\",\"object_type\":\"issue\",\"object_id\":\"12\"},\"accepted_revision\":\"issue-12-rev-a\",\"status\":\"accepted\",\"artifact\":\"agent_workflow/CONTRACT.md\",\"candidate_sha\":\"23a6a2195214c903841eb318ec60e30c1546a1a0\",\"base_sha\":\"23a6a2195214c903841eb318ec60e30c1546a1a0\"}\n```",
+              "parent": {
+                "source_type": "github",
+                "project": "djh00t/agent-brain",
+                "object_type": "issue",
+                "object_id": "12"
+              }
+            },
+            "tracker_state": "closed"
+          }
+        },
+        {
+          "identity": {
+            "source_type": "github",
+            "project": "djh00t/agent-brain",
+            "object_type": "issue",
+            "object_id": "13",
+            "revision": "issue-13-rev-b"
+          },
+          "metadata": {
+            "schema_version": 1,
+            "key": "WF-04",
+            "kind": "implementation",
+            "release": "codex/release/r0-dynamic-delivery",
+            "parent": null,
+            "requires": [
+              {
+                "target": {
+                  "source_type": "github",
+                  "project": "djh00t/agent-brain",
+                  "object_type": "issue",
+                  "object_id": "12"
+                },
+                "accepted_revision": "issue-12-rev-a",
+                "artifact": "agent_workflow/CONTRACT.md"
+              }
+            ],
+            "contracts": [],
+            "owned_paths": [
+              "agent_workflow/core.py"
+            ],
+            "resources": [],
+            "check_ids": [
+              "workflow"
+            ],
+            "criteria": [],
+            "acceptance_owner": "djh00t",
+            "risk": "medium",
+            "uncertainty": "known",
+            "impact": {
+              "paths": [
+                "agent_workflow/core.py"
+              ],
+              "check_ids": [
+                "workflow"
+              ]
+            },
+            "outcome": "Consumer implements accepted contract"
+          },
+          "lifecycle": {
+            "state": "open",
+            "source": {
+              "source_type": "github",
+              "project": "djh00t/agent-brain",
+              "object_type": "issue",
+              "object_id": "13"
+            },
+            "acceptance_receipt": null,
+            "tracker_state": "open"
+          }
+        }
+      ],
+      "git": [
+        {
+          "project": "agent-brain",
+          "default_head": "23a6a2195214c903841eb318ec60e30c1546a1a0",
+          "release_branch": "codex/release/r0-dynamic-delivery",
+          "release_head": "23a6a2195214c903841eb318ec60e30c1546a1a0",
+          "release_pr": null
+        }
+      ],
+      "ledger": {
+        "packages": [],
+        "active": null
+      },
+      "claims": [],
+      "receipts": [],
+      "evidence": [
+        {
+          "stage": "verify",
+          "criterion_id": "C1",
+          "result": "passed",
+          "artifact": "run:local-12",
+          "candidate_sha": "23a6a2195214c903841eb318ec60e30c1546a1a0",
+          "base_sha": "23a6a2195214c903841eb318ec60e30c1546a1a0",
+          "environment": "macos-local",
+          "configuration": "python3",
+          "observed_at": "2026-09-28T07:59:00Z",
+          "check_id": "workflow"
+        }
+      ],
+      "reviews": [],
+      "references": []
+    }
+  },
+  "expected_error": "MISSING_CRITERIA"
+}
