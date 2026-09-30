@@ -2,6 +2,14 @@
 
 GitHub issues are the source of detail. The [backlog index](backlog-index.md) links reviewed packages; see the [delivery plan](delivery-plan.md) for phases and combined-head exits and the [contract registry](contracts/README.md) for planned contract artifacts. Workbench is coordination-only; its cards contain short status and issue links.
 
+## Canonical dispatch inventory
+
+[`work-packages.json`](work-packages.json) is the repository-owned reviewed projection. The portable repository workflow tracker is the single mutable authority for claims, transitions and dependency changes; regenerate this projection after those facts change rather than editing it to claim work. It records live issue readiness, reconciled readiness and imported delivery state separately, so a stale issue label is visible without overriding verified dependency evidence. Every package has a stable ID, kind (`leaf` or `coordinator`), predecessor IDs, required accepted input revision, evidence and source policy, owned paths, one-writer assertion, active-minute estimate and exact acceptance command. `null` means the field has not been reconciled and makes the package ineligible; it is never an implied empty list, zero-minute estimate or accepted input.
+
+Run `python3 scripts/dispatch_work_packages.py` for the count and frontier, or add `--json` for the derived FSM and diagnostics. The derivation rejects missing predecessors and cycles, requires every predecessor input to have an exact 40-character accepted revision with evidence on the source base, and conservatively treats exact, path-prefix and glob ownership overlap as a conflict. A closed issue is not product acceptance and cannot remain READY.
+
+`acceptance_command_kind` distinguishes a test the package must introduce from a dependency command it consumes. An introduced selector is a delivery obligation, not passing evidence. A consumed selector must already be verified on the required source before dispatch.
+
 ## A package is one small, complete outcome
 
 Target 5–10 minutes of active development and review by a junior familiar with Rust and the repository, after prerequisites are available. Estimate active work separately from dependency installation, first compilation, CI queues and review waits. This is a sizing target, not a guarantee. If probing or implementation shows more than ten active minutes, split at the next independently testable behaviour before dispatch/continuation; do not disguise a larger package with a ten-minute label.
@@ -44,6 +52,8 @@ Parallel means dependency-independent and write-independent. Packages in the sam
 3. Shared contract and schema decisions land before consumers. For a shared registration file, one integrator owns serialization, but each useful endpoint slice should implement, test and register its route in the same change; do not defer all route registration into a later registration-only wave.
 4. Compute the next wave from merged dependencies and non-overlapping ownership. Test execution alone may run concurrently against isolated processes/data.
 5. The integration owner reruns the composed scenario on the actual combined head. Green isolated PRs do not prove that their merge compiles or behaves correctly.
+
+One named integrator owns each shared path. Each leaf gets its focused acceptance command and review. After the leaves are combined, freeze the candidate SHA and run one broad review and release gate; fixes receive a scoped rereview before the candidate is frozen again. Engineering fixtures and working contract baselines land before runtime consumers. The user receives one combined release demonstration, and the FSM is regenerated after every verified milestone.
 
 Do not start all READY issues at once: select a disjoint set of ownership paths. Use explicit dependencies for ordering, not assumptions in a title. Parent epics remain open until their children and the composed acceptance scenario are accepted.
 

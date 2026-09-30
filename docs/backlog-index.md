@@ -1,10 +1,12 @@
 # Reviewed Steve backlog
 
-Snapshot: 2026-09-27; source base `6630577677f40e4ba6a491074f0c91a57d7ddd6e`.
+Human review snapshot: 2026-09-27. Machine reconciliation: 2026-09-30 from source base `d6516aa45a6ddad4a66a637fad8f3ccee5761661`.
 
 Review tracking: [#60](https://github.com/djh00t/steve/issues/60). GitHub issues contain the complete briefs. The readiness counts below are historical; package rows are current dispatch pointers, so read the linked issue and current merge state before dispatch.
 
 Use the [delivery phases and workstreams](delivery-plan.md), [contract registry](contracts/README.md), [readiness rules](work-packages.md) and [testing policy](testing.md). Estimates are 5–10 active minutes after prerequisites land. BLOCKED leaves require their contract owner to supply exact approved details before dispatch; deferred discovery is not an implementation-ready feature.
+
+The canonical [work-package inventory](work-packages.json) reconciles all 485 tracked package issues with live GitHub state. At this snapshot 422 are open and 63 are closed. Exact predecessor IDs are populated for 426 packages, exact required input evidence for 19, 5-10 minute estimates for 418, executable commands for 168, and owned paths plus one-writer assertions for 22; ten commands are classified as producer-introduced versus consumed and two packages have every dispatch field populated. M2 has 57/63 predecessor lists, 55/63 estimates, 37/63 commands and 8/63 owned-path sets; seven commands are classified, while accepted evidence for unresolved runtime predecessors stays explicitly unknown. The derived frontier is #103: #102 and #72 are accepted and its actual `src/storage/db.rs` ownership and producer check are reconciled, while its live BLOCKED text is retained as a stale source fact. #497 has complete ownership, timebox, command and input evidence, but Anthropic proof PR #621 merged into its parent branch rather than `main`; carryforward PR #622 at exact green head `02a4b51d75476227fd2d6745e85aa9cae2b47664` is ready for review but not merged. Unknown fields remain explicit and ineligible. Closed #495 and #602 no longer inherit stale READY labels; closure remains separate from product acceptance.
 
 ## Second-pass decomposition review
 
@@ -137,7 +139,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | Package | Outcome | Readiness | Prerequisites |
 | --- | --- | --- | --- |
 | [STV-M2-01](https://github.com/djh00t/steve/issues/99) | Coordinate local identity and client-auth contracts | COORDINATION | #500, #501, #502 |
-| [STV-M2-60](https://github.com/djh00t/steve/issues/500) | Propose local principal IDs and relationships | PROPOSED; acceptance/evidence pending | PR #518 merged; explicit acceptance and executable fixture |
+| [STV-M2-60](https://github.com/djh00t/steve/issues/500) | Supply principal IDs, relationships and legacy attribution | ENGINEERING WORKING BASELINE at `893f9c5524cad3ece6275bfa32cb22dee5c71006` | Exact fixture passes; runtime consumers retain their own predecessors and final operator acceptance waits for the combined M2 gate |
 | [STV-M2-61](https://github.com/djh00t/steve/issues/501) | Propose local bootstrap and client credential lifecycle | BLOCKED | #500, #106 |
 | [STV-M2-62](https://github.com/djh00t/steve/issues/502) | Propose inference auth and resolved identity semantics | BLOCKED | #500, #501 |
 | [STV-M2-02](https://github.com/djh00t/steve/issues/100) | Freeze provider account, credentials, access and binding contract | BLOCKED | #99 |
@@ -154,7 +156,7 @@ Start with the real-process harness and independent contract decisions. Complete
 | [STV-M2-11](https://github.com/djh00t/steve/issues/114) | Persist per-account health and rate-limit state | BLOCKED | #101, #113, #103, #104, #73, #72 |
 | [STV-M2-49](https://github.com/djh00t/steve/issues/115) | Add account-pool schema | BLOCKED | #101, #114, #103, #104, #72 |
 | [STV-M2-13](https://github.com/djh00t/steve/issues/118) | Add identity fields to logical request and attempt types | BLOCKED | #99, #105, #108, #107, #72 |
-| [STV-M2-47](https://github.com/djh00t/steve/issues/123) | Persist audit events through one shared writer | BLOCKED | #110, #122, #103, #104, #102, #72 |
+| [STV-M2-47](https://github.com/djh00t/steve/issues/123) | Persist audit events through one shared writer | BLOCKED | #110, #122, #103, #104, #102, #72; live source explicitly says to preserve every prerequisite, including M3 message metadata #122; reconcile the nonexistent `src/storage/migrations.rs` path before dispatch |
 | [STV-M2-06](https://github.com/djh00t/steve/issues/124) | Manage organisation, user and client records | BLOCKED | #99, #105, #109, #110, #123, #107, #72 |
 | [STV-M2-08](https://github.com/djh00t/steve/issues/125) | Manage provider definitions | BLOCKED | #100, #112, #109, #124, #110, #123, #72 |
 | [STV-M2-09](https://github.com/djh00t/steve/issues/126) | Enforce account access before provider selection | BLOCKED | #100, #101, #108, #112, #125, #72 |
