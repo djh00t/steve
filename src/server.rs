@@ -22,19 +22,19 @@ use http_body::{Frame, SizeHint};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    future::Future,
+    future::{self, Future},
     net::SocketAddr,
     pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     signal,
-    sync::{watch, Semaphore},
+    sync::{mpsc, watch, Semaphore},
 };
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
@@ -101,6 +101,31 @@ struct AppState {
     openai_upstream: Option<OpenAiUpstream>,
     anthropic_upstream: Option<AnthropicUpstream>,
     provider_probe: ProviderProbeState,
+    shutdown: mpsc::Sender<ShutdownRequest>,
+    drain_timeout: Duration,
+    active_work_cancelled: watch::Receiver<bool>,
+}
+
+#[derive(Clone, Copy)]
+struct ShutdownRequest {
+    reason: &'static str,
+    deadline: Instant,
+}
+
+impl ShutdownRequest {
+    fn new(reason: &'static str, timeout: Duration) -> Result<Self> {
+        Ok(Self {
+            reason,
+            deadline: Instant::now()
+                .checked_add(timeout)
+                .context("shutdown deadline is out of range")?,
+        })
+    }
+}
+
+struct ShutdownOutcome {
+    request: ShutdownRequest,
+    result: Result<()>,
 }
 
 #[derive(Clone)]
@@ -158,6 +183,7 @@ struct Health {
     phase: Phase,
     inflight: u64,
     admission: Admission,
+    accounting_incident: Value,
 }
 
 #[derive(Serialize)]
@@ -183,6 +209,8 @@ struct Version {
 struct EchoRequest {
     #[serde(default)]
     value: Value,
+    #[serde(default)]
+    hold_response_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -198,6 +226,7 @@ pub async fn run(
     deferred: DeferredQueues,
     lifecycle: Lifecycle,
 ) -> Result<()> {
+    let deferred_shutdown = deferred.clone();
     let inference_addr: SocketAddr = cfg
         .server
         .inference_bind
@@ -313,6 +342,9 @@ pub async fn run(
         cfg.server.anthropic_upstream_url.clone(),
         normal_http,
     );
+    let timeout = Duration::from_secs(cfg.server.drain_timeout_seconds);
+    let (shutdown, shutdown_requests) = mpsc::channel(1);
+    let (active_work_cancel, active_work_cancelled) = watch::channel(false);
     let state = Arc::new(AppState {
         lifecycle: lifecycle.clone(),
         deferred,
@@ -330,6 +362,9 @@ pub async fn run(
         openai_upstream,
         anthropic_upstream,
         provider_probe,
+        shutdown: shutdown.clone(),
+        drain_timeout: timeout,
+        active_work_cancelled,
     });
 
     let inference_app = inference_router(state.clone());
@@ -348,68 +383,224 @@ pub async fn run(
         "Steve ready"
     );
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (inference_shutdown_tx, inference_shutdown_rx) = watch::channel(false);
+    let mut inference = tokio::spawn(async move {
+        axum::serve(inference_listener, inference_app)
+            .with_graceful_shutdown(wait_for_shutdown(inference_shutdown_rx))
+            .await
+    });
+    let inference_abort = inference.abort_handle();
+    let mut management =
+        tokio::spawn(async move { axum::serve(management_listener, management_app).await });
+    let management_abort = management.abort_handle();
     let shutdown_lifecycle = lifecycle.clone();
-    let timeout = Duration::from_secs(cfg.server.drain_timeout_seconds);
-    let signal_tx = shutdown_tx.clone();
+    let mut coordinator = tokio::spawn(async move {
+        coordinate_shutdown(
+            shutdown_requests,
+            shutdown_lifecycle,
+            deferred_shutdown,
+            timeout,
+            inference_shutdown_tx,
+            inference_abort.clone(),
+            active_work_cancel,
+        )
+        .await
+    });
 
-    let inference = axum::serve(inference_listener, inference_app)
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
-    let management = axum::serve(management_listener, management_app)
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx));
-
-    let result = serve_until_drained(
-        async { tokio::try_join!(inference, management).map(|_| ()) },
-        shutdown_signal(),
-        shutdown_lifecycle,
-        timeout,
-        signal_tx,
-    )
-    .await;
-    let _ = shutdown_tx.send(true);
-
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+    let mut coordinator_outcome = None;
+    let mut inference_result = None;
+    let mut management_result = None;
+    let mut server_failure = None;
+    let exit_request = loop {
+        tokio::select! {
+            reason = &mut signal => {
+                break ShutdownRequest::new(reason, timeout)?;
+            }
+            outcome = &mut coordinator, if coordinator_outcome.is_none() => {
+                coordinator_outcome = Some(outcome.map_err(|error| {
+                    anyhow::anyhow!("shutdown coordinator failed: {error}")
+                })?);
+            }
+            result = &mut inference, if inference_result.is_none() => {
+                let result = server_result(result);
+                let unexpected = lifecycle.phase() != Phase::Draining || result.is_err();
+                if unexpected {
+                    server_failure = Some(result.err().map_or_else(
+                        || anyhow::anyhow!("inference server exited before shutdown"),
+                        anyhow::Error::from,
+                    ));
+                    inference_result = Some(Ok(()));
+                    break ShutdownRequest::new("inference_server_exit", timeout)?;
+                }
+                inference_result = Some(result);
+            }
+            result = &mut management, if management_result.is_none() => {
+                let result = server_result(result);
+                server_failure = Some(result.err().map_or_else(
+                    || anyhow::anyhow!("management server exited before shutdown"),
+                    anyhow::Error::from,
+                ));
+                management_result = Some(Ok(()));
+                break ShutdownRequest::new("management_server_exit", timeout)?;
+            }
+        }
+    };
+    lifecycle.drain(exit_request.reason);
+    let _ = shutdown.try_send(exit_request);
+    let outcome = match coordinator_outcome {
+        Some(outcome) => outcome,
+        None => coordinator
+            .await
+            .map_err(|error| anyhow::anyhow!("shutdown coordinator failed: {error}"))?,
+    };
+    let listener_deadline = if outcome.request.reason == "management_api" {
+        exit_request.deadline
+    } else {
+        outcome.request.deadline
+    };
+    management_abort.abort();
+    if outcome.result.is_err() || Instant::now() >= listener_deadline {
+        inference.abort();
+    }
+    let inference_result = match inference_result {
+        Some(result) => result,
+        None => join_server_until(&mut inference, listener_deadline, "inference").await,
+    };
+    let management_result = match management_result {
+        Some(result) => result,
+        None => join_server_until(&mut management, listener_deadline, "management").await,
+    };
     lifecycle.stopped("listeners_exited");
-    result?;
+    if let Some(error) = server_failure {
+        return Err(error);
+    }
+    outcome.result?;
+    inference_result?;
+    management_result?;
     Ok(())
 }
 
-async fn serve_until_drained<S, F>(
-    serving: S,
-    signal: F,
+async fn coordinate_shutdown(
+    mut requests: mpsc::Receiver<ShutdownRequest>,
     lifecycle: Lifecycle,
+    deferred: DeferredQueues,
     timeout: Duration,
-    shutdown_tx: watch::Sender<bool>,
-) -> std::io::Result<()>
-where
-    S: Future<Output = std::io::Result<()>>,
-    F: Future<Output = &'static str>,
-{
-    let drain = async {
-        lifecycle.drain(signal.await);
-        let timed_out = tokio::time::timeout(timeout, lifecycle.wait_for_zero())
+    inference_shutdown: watch::Sender<bool>,
+    inference_abort: tokio::task::AbortHandle,
+    active_work_cancel: watch::Sender<bool>,
+) -> ShutdownOutcome {
+    let request = match requests
+        .recv()
+        .await
+        .context("shutdown request channel closed")
+    {
+        Ok(request) => request,
+        Err(error) => {
+            return ShutdownOutcome {
+                request: ShutdownRequest {
+                    reason: "shutdown_channel_closed",
+                    deadline: Instant::now(),
+                },
+                result: Err(error),
+            }
+        }
+    };
+    let deadline = request.deadline;
+    lifecycle.drain(request.reason);
+
+    if let Err(error) = deferred.prepare_shutdown(deadline).await {
+        cancel_active_work(&active_work_cancel, &lifecycle).await;
+        inference_abort.abort();
+        tokio::task::yield_now().await;
+        let _ = deferred.shutdown(deadline).await;
+        return ShutdownOutcome {
+            request,
+            result: Err(error),
+        };
+    }
+    if let Err(error) = deferred.mark_unclean(deadline).await {
+        cancel_active_work(&active_work_cancel, &lifecycle).await;
+        inference_abort.abort();
+        tokio::task::yield_now().await;
+        let _ = deferred.shutdown(deadline).await;
+        return ShutdownOutcome {
+            request,
+            result: Err(error),
+        };
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let timed_out = remaining.is_zero()
+        || tokio::time::timeout(remaining, lifecycle.wait_for_zero())
             .await
             .is_err();
-        if timed_out {
-            tracing::warn!(
-                event = "drain_timeout",
-                timeout_seconds = timeout.as_secs(),
-                inflight = lifecycle.inflight(),
-                "drain deadline reached"
-            );
-        }
-        let _ = shutdown_tx.send(true);
-        timed_out
-    };
+    let inflight_at_deadline = lifecycle.inflight();
+    if timed_out {
+        tracing::warn!(
+            event = "drain_timeout",
+            timeout_seconds = timeout.as_secs(),
+            inflight = inflight_at_deadline,
+            "drain deadline reached"
+        );
+        cancel_active_work(&active_work_cancel, &lifecycle).await;
+        inference_abort.abort();
+        tokio::task::yield_now().await;
+    } else {
+        let _ = inference_shutdown.send(true);
+    }
 
-    tokio::pin!(serving);
-    tokio::select! {
-        result = &mut serving => result,
-        timed_out = drain => {
-            if timed_out {
-                Ok(())
-            } else {
-                serving.await
-            }
+    let queues = deferred.shutdown(deadline).await;
+    let result = if timed_out {
+        Err(anyhow::anyhow!(
+            "drain deadline reached with {} request(s) in flight",
+            inflight_at_deadline
+        ))
+    } else {
+        queues
+    };
+    ShutdownOutcome { request, result }
+}
+
+async fn cancel_active_work(cancel: &watch::Sender<bool>, lifecycle: &Lifecycle) {
+    cancel.send_replace(true);
+    lifecycle.wait_for_zero().await;
+}
+
+fn server_result(
+    result: std::result::Result<std::io::Result<()>, tokio::task::JoinError>,
+) -> std::io::Result<()> {
+    match result {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(std::io::Error::other(format!(
+            "server task failed: {error}"
+        ))),
+    }
+}
+
+async fn join_server_until(
+    server: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    deadline: Instant,
+    name: &str,
+) -> std::io::Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        server.abort();
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("timed out stopping {name} server"),
+        ));
+    }
+    match tokio::time::timeout(remaining, &mut *server).await {
+        Ok(result) => server_result(result),
+        Err(_) => {
+            server.abort();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("timed out stopping {name} server"),
+            ))
         }
     }
 }
@@ -522,22 +713,26 @@ async fn live(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         phase: state.lifecycle.phase(),
         inflight: state.lifecycle.inflight(),
         admission: admission(&state),
+        accounting_incident: state.deferred.accounting_incident(),
     })
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let accounting_incident = state.deferred.accounting_incident();
+    let incident_ready = !matches!(
+        accounting_incident["state"].as_str(),
+        Some("blocked" | "unreconciled")
+    );
+    let is_ready = state.lifecycle.is_ready() && incident_ready;
     let health = Health {
-        status: if state.lifecycle.is_ready() {
-            "ready"
-        } else {
-            "not_ready"
-        },
+        status: if is_ready { "ready" } else { "not_ready" },
         phase: state.lifecycle.phase(),
         inflight: state.lifecycle.inflight(),
         admission: admission(&state),
+        accounting_incident,
     };
 
-    if state.lifecycle.is_ready() {
+    if is_ready {
         (StatusCode::OK, Json(health)).into_response()
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, Json(health)).into_response()
@@ -567,6 +762,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
         "inference_bind": state.inference_bind,
         "management_bind": state.management_bind,
         "queues": state.deferred.snapshot(),
+        "accounting_incident": state.deferred.accounting_incident(),
     }))
 }
 
@@ -579,60 +775,121 @@ fn admission(state: &AppState) -> Admission {
 
 async fn drain(State(state): State<Arc<AppState>>) -> Json<Value> {
     state.lifecycle.drain("management_api");
+    if let Ok(request) = ShutdownRequest::new("management_api", state.drain_timeout) {
+        let _ = state.shutdown.try_send(request);
+    }
     Json(json!({"phase": "draining"}))
 }
 
 async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
-    let Some(guard) = state.lifecycle.enter() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "draining"})),
-        )
-            .into_response();
-    };
-
     let reply = if let Some(upstream) = &state.anthropic_upstream {
         anthropic_messages::handle_messages_with_upstream(&body, upstream).await
     } else {
         anthropic_messages::handle_messages(&body)
     };
-    let streaming = matches!(
-        &reply.body,
-        anthropic_messages::MessagesReplyBody::Stream(_)
-    );
-    let response = reply.into_response();
-    if streaming {
-        hold_inflight_until_body_end(response, guard)
-    } else {
-        response
-    }
+    reply.into_response()
 }
 
 async fn responses(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
-    let Some(guard) = state.lifecycle.enter() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "draining"})),
-        )
-            .into_response();
-    };
-
     let reply = if let Some(upstream) = &state.openai_upstream {
         openai_responses::handle_responses_with_upstream(&body, upstream).await
     } else {
         openai_responses::handle_responses(&body)
     };
-    let streaming = matches!(&reply.body, openai_responses::ResponsesReplyBody::Stream(_));
-    let response = reply.into_response();
-    if streaming {
-        hold_inflight_until_body_end(response, guard)
-    } else {
-        response
-    }
+    reply.into_response()
 }
 
 fn hold_inflight_until_body_end(response: Response, guard: InflightGuard) -> Response {
     hold_guard_until_body_end(response, guard)
+}
+
+fn cancel_body_on_forced_shutdown(
+    response: Response,
+    cancelled: watch::Receiver<bool>,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, Body::new(CancelledBody::new(body, cancelled)))
+}
+
+fn active_work_cancelled(
+    mut cancelled: watch::Receiver<bool>,
+) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    Box::pin(async move {
+        while !*cancelled.borrow_and_update() {
+            if cancelled.changed().await.is_err() {
+                future::pending::<()>().await;
+            }
+        }
+    })
+}
+
+struct CancelledBody {
+    inner: Arc<Mutex<Option<Body>>>,
+    cancellation: tokio::task::JoinHandle<()>,
+}
+
+impl CancelledBody {
+    fn new(body: Body, cancelled: watch::Receiver<bool>) -> Self {
+        let inner = Arc::new(Mutex::new(Some(body)));
+        let cancellable = inner.clone();
+        let cancellation = tokio::spawn(async move {
+            active_work_cancelled(cancelled).await;
+            let body = cancellable.lock().expect("cancelled body").take();
+            drop(body);
+        });
+        Self {
+            inner,
+            cancellation,
+        }
+    }
+}
+
+impl HttpBody for CancelledBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let mut inner = this.inner.lock().expect("cancelled body");
+        let Some(body) = inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = Pin::new(body).poll_frame(cx);
+        if matches!(&result, Poll::Ready(None | Some(Err(_)))) {
+            let body = inner.take();
+            drop(inner);
+            this.cancellation.abort();
+            drop(body);
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("cancelled body")
+            .as_ref()
+            .is_none_or(HttpBody::is_end_stream)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner
+            .lock()
+            .expect("cancelled body")
+            .as_ref()
+            .map_or_else(SizeHint::default, HttpBody::size_hint)
+    }
+}
+
+impl Drop for CancelledBody {
+    fn drop(&mut self) {
+        self.cancellation.abort();
+        let body = self.inner.lock().expect("cancelled body").take();
+        drop(body);
+    }
 }
 
 fn hold_guard_until_body_end<G: Send + Unpin + 'static>(response: Response, guard: G) -> Response {
@@ -677,55 +934,71 @@ impl<G: Unpin> HttpBody for GuardedBody<G> {
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
-    let Some(guard) = state.lifecycle.enter() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "draining"})),
-        )
-            .into_response();
-    };
-
     let reply = if let Some(upstream) = &state.openai_upstream {
-        openai_chat::handle_chat_completions_with_upstream(&body, upstream).await
+        let deferred = state.deferred.clone();
+        openai_chat::handle_chat_completions_with_upstream_and_terminal(
+            &body,
+            upstream,
+            Arc::new(move |request, model, attempt| {
+                offer_chat_terminal_event(&deferred, request, model, attempt);
+            }),
+        )
+        .await
     } else {
         openai_chat::handle_chat_completions(&body)
     };
-    let streaming = matches!(&reply.body, openai_chat::ChatCompletionReplyBody::Stream(_));
     let attempt_count = reply
         .request
         .as_ref()
         .map_or(0, |request| request.attempts.len());
     for attempt in &reply.attempts {
-        if attempt.finished_at.is_some() {
+        if let (Some(request), Some(model), Some(finished_at)) = (
+            reply.request.as_ref(),
+            reply.model.as_ref(),
+            attempt.finished_at.as_ref(),
+        ) {
             tracing::info!(
                 request_id = %attempt.request_id.0,
                 attempt_id = %attempt.id.0,
                 attempt_count,
                 status = ?attempt.status,
-                finished_at = ?attempt.finished_at,
+                finished_at = ?finished_at,
                 "chat completions upstream attempt finished"
             );
+            if !reply.requested_stream {
+                offer_chat_terminal_event(&state.deferred, request, model, attempt);
+            }
         }
     }
-    let response = reply.into_response();
-    if streaming {
-        hold_inflight_until_body_end(response, guard)
-    } else {
-        response
-    }
+    reply.into_response()
 }
 
-async fn echo(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<EchoRequest>,
-) -> impl IntoResponse {
-    let Some(_guard) = state.lifecycle.enter() else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error":"draining"})),
-        );
-    };
-
+fn offer_chat_terminal_event(
+    deferred: &DeferredQueues,
+    request: &crate::proxy::Request,
+    model: &str,
+    attempt: &crate::proxy::RequestAttempt,
+) {
+    let provider = (!attempt.provider.is_empty() && attempt.provider != "unassigned")
+        .then_some(attempt.provider.as_str());
+    let account = (!attempt.account.is_empty() && attempt.account != "unassigned")
+        .then_some(attempt.account.as_str());
+    deferred.accounting(
+        "chat.attempt.terminal.v1",
+        json!({
+            "request_id": request.id,
+            "attempt_id": attempt.id,
+            "request_created_at": request.created_at,
+            "model": model,
+            "provider": provider,
+            "account": account,
+            "status": attempt.status,
+            "started_at": attempt.started_at,
+            "finished_at": attempt.finished_at,
+        }),
+    );
+}
+async fn echo(State(state): State<Arc<AppState>>, Json(req): Json<EchoRequest>) -> Response {
     let payload = json!({"value": req.value});
     state.deferred.accounting("test.echo", payload.clone());
     state.deferred.telemetry("test.echo", payload.clone());
@@ -733,8 +1006,26 @@ async fn echo(
         format!("test/{}.json", Uuid::now_v7()),
         bytes::Bytes::from(payload.to_string()),
     );
-
-    (StatusCode::OK, Json(payload))
+    let response = (StatusCode::OK, Json(payload.clone())).into_response();
+    let response = if let Some(delay_ms) = req.hold_response_ms {
+        let (parts, _) = response.into_parts();
+        let (sender, receiver) = mpsc::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let _ = sender
+                .send(Ok::<_, std::convert::Infallible>(bytes::Bytes::from(
+                    payload.to_string(),
+                )))
+                .await;
+        });
+        Response::from_parts(
+            parts,
+            Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver)),
+        )
+    } else {
+        response
+    };
+    response
 }
 
 async fn track_requests(
@@ -754,11 +1045,42 @@ async fn admit_inference(
 ) -> Response {
     let exempt = request.method() == axum::http::Method::GET
         && matches!(request.uri().path(), "/health/live" | "/health/ready");
-    if exempt || state.lifecycle.phase() == Phase::Draining {
+    if exempt {
         return next.run(request).await;
     }
+    if state.lifecycle.phase() == Phase::Draining {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "draining"})),
+        )
+            .into_response();
+    }
 
-    let Some(permit) = state.inference_admission.try_acquire() else {
+    let permit = match state
+        .deferred
+        .with_accounting_admission(|| state.inference_admission.try_acquire())
+    {
+        Err(incident) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    ("content-type", "application/json"),
+                    ("cache-control", "no-store"),
+                    ("retry-after", "1"),
+                ],
+                Json(json!({"error":{
+                    "type":"unavailable",
+                    "code":"accounting_incident",
+                    "message":"inference admission stopped by an unresolved accounting incident",
+                    "incident_id":incident["incident_id"],
+                    "state":incident["state"],
+                }})),
+            )
+                .into_response();
+        }
+        Ok(permit) => permit,
+    };
+    let Some(permit) = permit else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [
@@ -770,8 +1092,29 @@ async fn admit_inference(
         )
             .into_response();
     };
+    let Some(inflight) = state.lifecycle.enter() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "draining"})),
+        )
+            .into_response();
+    };
 
-    hold_guard_until_body_end(next.run(request).await, permit)
+    let mut cancelled = active_work_cancelled(state.active_work_cancelled.clone());
+    let response = tokio::select! {
+        biased;
+        _ = &mut cancelled => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "draining"})),
+            ).into_response();
+        }
+        response = next.run(request) => response,
+    };
+    cancel_body_on_forced_shutdown(
+        hold_inflight_until_body_end(hold_guard_until_body_end(response, permit), inflight),
+        state.active_work_cancelled.clone(),
+    )
 }
 
 async fn admit_management(
@@ -871,43 +1214,12 @@ pub(crate) async fn shutdown_signal() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_upstream;
+    use crate::{accounting::AccountingCoordinator, test_upstream};
     use axum::{body::HttpBody, http::Request};
     use http_body_util::BodyExt;
     use std::future::IntoFuture;
     use tokio_stream::{Stream, StreamExt};
     use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn drain_deadline_cancels_stuck_serving_future() {
-        let lifecycle = Lifecycle::new();
-        lifecycle.ready("test");
-        let _guard = lifecycle.enter().unwrap();
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (serve_tx, serve_rx) = tokio::sync::oneshot::channel::<()>();
-        let serving = async move {
-            let _ = serve_rx.await;
-            Ok(())
-        };
-
-        tokio::time::timeout(
-            Duration::from_millis(200),
-            serve_until_drained(
-                serving,
-                async { "test" },
-                lifecycle.clone(),
-                Duration::from_millis(10),
-                shutdown_tx,
-            ),
-        )
-        .await
-        .expect("drain deadline must end the serving wait")
-        .unwrap();
-
-        assert_eq!(lifecycle.phase(), Phase::Draining);
-        assert!(*shutdown_rx.borrow());
-        assert!(serve_tx.is_closed());
-    }
 
     fn tracked_stream_router(
         counters: Arc<RequestCounters>,
@@ -1057,13 +1369,14 @@ mod tests {
     async fn messages_test_state(upstream_url: String) -> (Arc<AppState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
-        cfg.database.url = "sqlite::memory:".into();
+        cfg.database.url = format!(
+            "sqlite://{}?mode=rwc",
+            dir.path().join("steve.db").display()
+        );
         cfg.object_storage.root = dir.path().join("objects").to_string_lossy().into_owned();
-        cfg.queues.accounting_journal = dir
-            .path()
-            .join("accounting.jsonl")
-            .to_string_lossy()
-            .into_owned();
+        let accounting_root = dir.path().join("accounting");
+        AccountingCoordinator::provision(&accounting_root).unwrap();
+        cfg.queues.accounting_journal = accounting_root.to_string_lossy().into_owned();
         let db = Database::connect(&cfg.database).await.unwrap();
         db.migrate().await.unwrap();
         let objects = ObjectStorage::from_config(&cfg.object_storage)
@@ -1075,6 +1388,8 @@ mod tests {
         let lifecycle = Lifecycle::new();
         lifecycle.ready("test");
         let counters = Arc::new(RequestCounters::default());
+        let (shutdown, _shutdown_requests) = mpsc::channel(1);
+        let (_active_work_cancel, active_work_cancelled) = watch::channel(false);
         let state = Arc::new(AppState {
             lifecycle,
             deferred,
@@ -1094,6 +1409,9 @@ mod tests {
                 AnthropicUpstream::new(upstream_url, Duration::from_secs(2)).unwrap(),
             ),
             provider_probe: ProviderProbeState::new(None, None).unwrap(),
+            shutdown,
+            drain_timeout: Duration::from_secs(60),
+            active_work_cancelled,
         });
         (state, dir)
     }
@@ -1529,6 +1847,21 @@ mod tests {
         assert!(body.next().await.is_none());
         waiter.await.unwrap();
         assert_eq!(lifecycle.inflight(), 0);
+    }
+
+    #[tokio::test]
+    async fn server_task_failure_is_propagated_without_waiting_for_a_signal() {
+        let mut server = tokio::spawn(async move {
+            panic!("injected server failure");
+            #[allow(unreachable_code)]
+            Ok::<(), std::io::Error>(())
+        });
+
+        let error = join_server_until(&mut server, Instant::now() + Duration::from_secs(1), "test")
+            .await
+            .expect_err("server panic must be visible");
+
+        assert!(error.to_string().contains("server task failed"), "{error}");
     }
 
     fn models_router(catalogue: Arc<[ModelConfig]>) -> Router {

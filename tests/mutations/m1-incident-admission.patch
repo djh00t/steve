@@ -1,0 +1,15 @@
+--- a/src/accounting.rs
++++ b/src/accounting.rs
+@@ -1227,12 +1227,2 @@
+     pub(crate) fn with_incident_admission<T>(&self, admit: impl FnOnce() -> T) -> Result<T, Value> {
+-        let mut incident = self.incident.lock().expect("accounting incident");
+-        if !refresh_incident(&self.root, &mut incident) {
+-            return Err(fail_closed_incident(&incident));
+-        }
+-        if matches!(
+-            incident.state,
+-            IncidentState::Blocked | IncidentState::Unreconciled
+-        ) {
+-            return Err(public_incident(&incident));
+-        }
+         Ok(admit())

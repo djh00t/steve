@@ -61,11 +61,45 @@ steve usage
 steve migrate
 ```
 
+## Local container
+
+Build the image, create persistent volumes, and run the explicit provisioning
+command once before starting the server:
+
+```sh
+docker build -t steve:dev .
+docker volume create steve-accounting
+docker volume create steve-data
+docker run --rm \
+  --env STEVE_OPERATOR=local-container-operator \
+  --mount source=steve-accounting,target=/var/lib/steve/accounting \
+  --mount source=steve-data,target=/data \
+  steve:dev accounting provision --root /var/lib/steve/accounting
+```
+
+Set `STEVE_OPERATOR` to the identity responsible for this installation; Steve
+records it in the provisioning manifest.
+
+Start the server with the same volumes after provisioning succeeds:
+
+```sh
+docker run --rm \
+  --mount source=steve-accounting,target=/var/lib/steve/accounting \
+  --mount source=steve-data,target=/data \
+  -p 11435:11435 -p 8790:8790 \
+  steve:dev
+```
+
+The image never provisions during `serve`; a missing, incomplete, or corrupt
+accounting root still fails closed.
+
 ## Status
 
 **M0 — clean foundation: done.** It landed on `main` in [PR #1](https://github.com/djh00t/steve/pull/1) (`cbc2c44`). `steve serve` boots with SQLite or PostgreSQL, health and management endpoints respond, and local and S3-compatible object storage share one contract.
 
 **M1 — real proxy hot path: in progress.** Issues [#6](https://github.com/djh00t/steve/issues/6)–[#10](https://github.com/djh00t/steve/issues/10) cover OpenAI and Anthropic ingress, streaming, cancellation, upstream adapters, model listing, and provider health. Chat Completions JSON/SSE, Responses JSON/SSE, and Anthropic Messages JSON/SSE forward to configured local fixtures; streams preserve raw event bytes, cancel upstream work when the client disconnects, and keep request guards until the response body ends. Non-stream Chat Completions includes bounded retry/multi-attempt tracking, and management provider-health probes are implemented. Final M1 acceptance and deferred side-effect integration remain.
+
+The combined candidate gate is runnable with `make m1-release-gate` or the browser-guided `make m1-demo`. Both require `M1_DEPLOYMENT_PATH` and an isolated `STEVE_TEST_POSTGRES_URL`; first create target evidence with `M1_TARGET_PARENT=/existing/deployment/parent M1_DEPLOYMENT_PATH=/intended/accounting/root make m1-target-qualification`. The gate builds with the tracked `Cargo.lock`, routes every Rust scenario through its recorded candidate binary, and keeps functional, hosted, target, legacy-adoption, and operator evidence separate. Operator acceptance is pending and required for every result. Its current candidate status is unaccepted until the combined gate has exact-head hosted evidence and target qualification. Windows/NTFS remains open and unknown under STV-M0-17.
 
 The MVP stays a complete vertical slice. Delivery order is in the [MVP plan](docs/plans/2026-09-26-steve-mvp.md). Protocol and product boundaries are in the [architecture spec](docs/specs/2026-09-26-steve-gateway.md).
 

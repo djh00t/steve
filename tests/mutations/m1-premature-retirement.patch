@@ -1,0 +1,6 @@
+--- a/src/accounting.rs
++++ b/src/accounting.rs
+@@ -3070,2 +3070,3 @@
+
++    fs::remove_file(&journal_path)?;
+     let complete = parsed.malformed.is_empty()
