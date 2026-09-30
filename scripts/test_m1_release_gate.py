@@ -86,7 +86,14 @@ class ReleaseGateTests(unittest.TestCase):
         before = {"headRefOid": "abc", "url": "https://github.example/pr/619"}
         after = dict(before, headRefOid="changed")
         checks = [{"name": name, "bucket": "pass"} for name in gate.REQUIRED_HOSTED_CHECKS]
-        with mock.patch.object(gate, "json_command", side_effect=[before, checks, after]):
+        with (
+            mock.patch.object(gate, "json_command", side_effect=[before, checks, after]),
+            mock.patch.object(
+                gate,
+                "forge_required_policy",
+                return_value={"status": "UNENFORCED", "required_check_names": []},
+            ),
+        ):
             evidence = gate.hosted_qualification(Path("/"), "abc")
         self.assertEqual(evidence["status"], "FAIL")
         self.assertEqual(evidence["head_before"], before)
@@ -543,11 +550,17 @@ class ReleaseGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             gh = root / "gh"
+            checks = json.dumps(
+                [
+                    {"bucket": "pass", "name": name, "state": "SUCCESS"}
+                    for name in sorted(gate.REQUIRED_HOSTED_CHECKS)
+                ]
+            )
             gh.write_text(
                 "#!/bin/sh\n"
                 "case \"$*\" in\n"
                 "  *'pr view 619'* ) printf '%s\\n' '{\"headRefOid\":\"abc\",\"url\":\"https://github.example/pr/619\"}' ;;\n"
-                "  *'pr checks 619'* ) printf '%s\\n' '[{\"bucket\":\"pass\",\"name\":\"quality\",\"state\":\"SUCCESS\"},{\"bucket\":\"pass\",\"name\":\"mutation\",\"state\":\"SUCCESS\"},{\"bucket\":\"pass\",\"name\":\"m1-mutation\",\"state\":\"SUCCESS\"}]' ;;\n"
+                f"  *'pr checks 619'* ) printf '%s\\n' {checks!r} ;;\n"
                 "  * ) exit 2 ;;\n"
                 "esac\n",
                 encoding="utf-8",
@@ -555,11 +568,93 @@ class ReleaseGateTests(unittest.TestCase):
             gh.chmod(0o755)
             env = os.environ.copy()
             env["PATH"] = f"{root}:{env['PATH']}"
-            evidence = gate.hosted_qualification(root, "abc", env)
+            with mock.patch.object(
+                gate,
+                "forge_required_policy",
+                return_value={"status": "UNENFORCED", "required_check_names": []},
+            ):
+                evidence = gate.hosted_qualification(root, "abc", env)
             self.assertEqual(evidence["status"], "PASS")
             self.assertEqual(evidence["source_sha"], "abc")
             self.assertEqual(evidence["pull_request"], 619)
             self.assertEqual(evidence["url"], "https://github.example/pr/619")
+
+    @unittest.skipUnless(os.name == "posix", "fake gh executable requires POSIX")
+    def test_forge_required_policy_reports_authoritative_unenforced(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            gh = root / "gh"
+            gh.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  *'rules/branches/main'* ) printf '%s\\n' '[]' ;;\n"
+                "  *'protection/required_status_checks'* ) printf '%s\\n' 'Branch not protected (HTTP 404)' >&2; exit 1 ;;\n"
+                "  * ) exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{root}:{env['PATH']}"
+            policy = gate.forge_required_policy(root, "main", env)
+            self.assertEqual(policy["status"], "UNENFORCED")
+            self.assertEqual(policy["required_check_names"], [])
+
+    def test_hosted_evidence_fails_a_reviewed_check_without_forge_enforcement(self):
+        before = {"headRefOid": "abc", "url": "https://github.example/pr/619"}
+        checks = [
+            {"bucket": "pass", "name": name}
+            for name in gate.REQUIRED_HOSTED_CHECKS
+        ]
+        next(check for check in checks if check["name"] == "mutation")["bucket"] = "fail"
+        with (
+            mock.patch.object(gate, "json_command", side_effect=[before, checks, before]),
+            mock.patch.object(
+                gate,
+                "forge_required_policy",
+                return_value={"status": "UNENFORCED", "required_check_names": []},
+            ),
+        ):
+            evidence = gate.hosted_qualification(Path("/"), "abc")
+        self.assertEqual(evidence["status"], "FAIL")
+
+    @unittest.skipUnless(os.name == "posix", "fake gh executable requires POSIX")
+    def test_forge_required_policy_rejects_json_error_body(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            gh = root / "gh"
+            gh.write_text(
+                "#!/bin/sh\n"
+                "case \"$*\" in\n"
+                "  *'rules/branches/main'* ) printf '%s\\n' '[]' ;;\n"
+                "  *'protection/required_status_checks'* ) printf '%s\\n' '{\"message\":\"Resource not accessible\"}'; printf '%s\\n' 'gh: Resource not accessible (HTTP 403)' >&2; exit 1 ;;\n"
+                "  * ) exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            gh.chmod(0o755)
+            env = os.environ.copy()
+            env["PATH"] = f"{root}:{env['PATH']}"
+            with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
+                gate.forge_required_policy(root, "main", env)
+
+    def test_hosted_evidence_does_not_waive_missing_forge_required_check(self):
+        before = {"headRefOid": "abc", "url": "https://github.example/pr/619"}
+        checks = [
+            {"name": name, "bucket": "pass"}
+            for name in gate.REQUIRED_HOSTED_CHECKS
+        ]
+        with (
+            mock.patch.object(gate, "json_command", side_effect=[before, checks, before]),
+            mock.patch.object(
+                gate,
+                "forge_required_policy",
+                return_value={"status": "ENFORCED", "required_check_names": ["security"]},
+            ),
+        ):
+            evidence = gate.hosted_qualification(Path("/"), "abc")
+        self.assertEqual(evidence["status"], "UNKNOWN")
+        self.assertEqual(evidence["missing_required_checks"], ["security"])
 
     @unittest.skipUnless(os.name == "posix", "fake gh executable requires POSIX")
     def test_hosted_evidence_requires_targeted_mutation_check(self):
@@ -578,9 +673,17 @@ class ReleaseGateTests(unittest.TestCase):
             gh.chmod(0o755)
             env = os.environ.copy()
             env["PATH"] = f"{root}:{env['PATH']}"
-            evidence = gate.hosted_qualification(root, "abc", env)
+            with mock.patch.object(
+                gate,
+                "forge_required_policy",
+                return_value={"status": "UNENFORCED", "required_check_names": []},
+            ):
+                evidence = gate.hosted_qualification(root, "abc", env)
             self.assertEqual(evidence["status"], "UNKNOWN")
-            self.assertEqual(evidence["missing_required_checks"], ["m1-mutation", "mutation"])
+            self.assertEqual(
+                evidence["missing_required_checks"],
+                sorted(gate.REQUIRED_HOSTED_CHECKS - {"quality"}),
+            )
 
     @unittest.skipUnless(os.name == "posix", "fake gh executable requires POSIX")
     def test_hosted_evidence_rejects_wrong_head_before_check_state(self):
@@ -598,7 +701,12 @@ class ReleaseGateTests(unittest.TestCase):
             gh.chmod(0o755)
             env = os.environ.copy()
             env["PATH"] = f"{root}:{env['PATH']}"
-            evidence = gate.hosted_qualification(root, "abc", env)
+            with mock.patch.object(
+                gate,
+                "forge_required_policy",
+                return_value={"status": "UNENFORCED", "required_check_names": []},
+            ):
+                evidence = gate.hosted_qualification(root, "abc", env)
             self.assertEqual(evidence["status"], "FAIL")
             self.assertEqual(evidence["source_sha"], "other")
 
@@ -626,7 +734,12 @@ class ReleaseGateTests(unittest.TestCase):
             gh.chmod(0o755)
             env = os.environ.copy()
             env["PATH"] = f"{root}:{env['PATH']}"
-            evidence = gate.hosted_qualification(root, "abc", env)
+            with mock.patch.object(
+                gate,
+                "forge_required_policy",
+                return_value={"status": "UNENFORCED", "required_check_names": []},
+            ):
+                evidence = gate.hosted_qualification(root, "abc", env)
             self.assertEqual(evidence["status"], "UNKNOWN")
             self.assertIn("array", evidence["error"])
 

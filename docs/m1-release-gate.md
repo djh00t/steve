@@ -57,10 +57,12 @@ The fixed hosted-evidence step records the PR head and required checks with:
 
 ```sh
 gh pr view 619 --repo djh00t/steve --json headRefOid,url > target/m1-pr-head.json
-gh pr checks 619 --repo djh00t/steve --required --json name,state,bucket,link,workflow > target/m1-hosted-checks.json
+gh pr checks 619 --repo djh00t/steve --json name,state,bucket,link,workflow > target/m1-hosted-checks.json
+gh api repos/djh00t/steve/rules/branches/main > target/m1-forge-required-checks.json
+gh api repos/djh00t/steve/branches/main/protection/required_status_checks > target/m1-legacy-required-checks.json
 ```
 
-The gate re-reads the PR head after checks, retains both head observations, and rejects any change. It requires `headRefOid == git rev-parse HEAD` in both observations and every required check to be complete and passing. Missing `gh` authentication/network access, no reported required-check set, unreadable JSON, a pending/failed/cancelled check, or a head mismatch records hosted evidence as `unknown` or failed and makes release eligibility false.
+The gate re-reads the PR head after both check queries, retains both head observations, and rejects any change. It requires `headRefOid == git rev-parse HEAD` in both observations and evaluates the reviewed M1 check names plus every check enforced by the repository. Every check in that union must exist and pass. A repository with no enforced status-check rule is recorded separately as unenforced; it does not erase passing reviewed workflow evidence. Missing `gh` authentication/network access, a missing reviewed or enforced check, unreadable JSON, a pending/failed/cancelled required check, or a head mismatch records hosted evidence as unknown or failed and makes release eligibility false.
 
 Run `M1_TARGET_PARENT=/existing/deployment/parent M1_DEPLOYMENT_PATH=/intended/accounting/root make m1-target-qualification` on the deployment host. `M1_TARGET_PARENT` is the existing directory or mount where the deployment root will reside; `M1_DEPLOYMENT_PATH` is the intended absolute root beneath it. The command canonicalizes the existing parent and lexically normalizes and validates the intended path without reading or writing that root, creates a new empty private probe directory under the target parent, verifies that the probe and parent are on the same filesystem, runs the destructive process checks only in that probe, and removes it after recording evidence. It must refuse a probe path equal to the intended root or any pre-existing/nonempty probe directory; a live accounting root is never a qualification target.
 

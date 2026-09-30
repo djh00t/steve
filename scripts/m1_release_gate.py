@@ -30,7 +30,16 @@ from qualify_m1_mutations import validate_result as validate_mutations
 OUTPUT_LIMIT = 64 * 1024
 DEFAULT_STEP_TIMEOUT = 180
 COMMAND_TIMEOUT = 30
-REQUIRED_HOSTED_CHECKS = {"mutation", "m1-mutation"}
+REQUIRED_HOSTED_CHECKS = {
+    "quality",
+    "official-sdk",
+    "integrations",
+    "cross-platform (macos-latest)",
+    "cross-platform (windows-latest)",
+    "windows-ntfs-process-semantics",
+    "mutation",
+    "m1-mutation",
+}
 TARGET_PROBE = "steve-m1-target-v1"
 TARGET_CHECKS = {
     "exclusive_lock",
@@ -48,7 +57,15 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def captured_command(command, cwd, timeout=COMMAND_TIMEOUT, env=None, accepted=(0,), owner=None):
+def captured_command(
+    command,
+    cwd,
+    timeout=COMMAND_TIMEOUT,
+    env=None,
+    accepted=(0,),
+    owner=None,
+    include_status=False,
+):
     if owner is not None and owner._cancelled.is_set():
         raise KeyboardInterrupt
     process = subprocess.Popen(
@@ -83,6 +100,8 @@ def captured_command(command, cwd, timeout=COMMAND_TIMEOUT, env=None, accepted=(
         process.returncode in accepted,
         stderr.strip() or stdout.strip() or f"command failed: {command}",
     )
+    if include_status:
+        return stdout, stderr, process.returncode
     return stdout
 
 
@@ -194,6 +213,78 @@ def json_command(command, cwd, env=None, accepted=(0,), timeout=COMMAND_TIMEOUT,
     return json.loads(captured_command(command, cwd, timeout, env, accepted, owner))
 
 
+def forge_required_policy(repo, branch, env=None, owner=None):
+    rules = json_command(
+        [
+            "gh",
+            "api",
+            f"repos/djh00t/steve/rules/branches/{branch}",
+        ],
+        repo,
+        env,
+        owner=owner,
+    )
+    require(
+        isinstance(rules, list) and all(isinstance(rule, dict) for rule in rules),
+        "branch rules response must be an array of objects",
+    )
+    ruleset_names = set()
+    for rule in rules:
+        if rule.get("type") != "required_status_checks":
+            continue
+        required = rule.get("parameters", {}).get("required_status_checks")
+        require(isinstance(required, list), "ruleset required checks must be an array")
+        for check in required:
+            require(isinstance(check, dict) and check.get("context"), "invalid ruleset check")
+            ruleset_names.add(check["context"])
+
+    stdout, stderr, returncode = captured_command(
+        [
+            "gh",
+            "api",
+            f"repos/djh00t/steve/branches/{branch}/protection/required_status_checks",
+        ],
+        repo,
+        env=env,
+        accepted=(0, 1),
+        owner=owner,
+        include_status=True,
+    )
+    legacy_names = set()
+    legacy_protection = None
+    if returncode == 0:
+        require(stdout.strip(), "legacy status-check policy returned no evidence")
+        legacy_protection = json.loads(stdout)
+        require(isinstance(legacy_protection, dict), "legacy status checks must be an object")
+        require(
+            "contexts" in legacy_protection and "checks" in legacy_protection,
+            "legacy status-check policy fields are incomplete",
+        )
+        contexts = legacy_protection["contexts"]
+        checks = legacy_protection["checks"]
+        require(isinstance(contexts, list), "legacy status-check contexts must be an array")
+        require(isinstance(checks, list), "legacy status checks must be an array")
+        legacy_names.update(context for context in contexts if isinstance(context, str))
+        for check in checks:
+            require(isinstance(check, dict) and check.get("context"), "invalid legacy check")
+            legacy_names.add(check["context"])
+    elif not (
+        returncode == 1
+        and "Branch not protected" in stderr
+        and "HTTP 404" in stderr
+    ):
+        raise RuntimeError(stderr.strip() or "legacy status-check policy returned no evidence")
+
+    names = sorted(ruleset_names | legacy_names)
+    return {
+        "status": "ENFORCED" if names else "UNENFORCED",
+        "branch": branch,
+        "required_check_names": names,
+        "rules": rules,
+        "legacy_required_status_checks": legacy_protection,
+    }
+
+
 def hosted_qualification(repo, source_sha, env=None, owner=None):
     url = None
     pull_request = head_after = None
@@ -207,7 +298,7 @@ def hosted_qualification(repo, source_sha, env=None, owner=None):
                 "--repo",
                 "djh00t/steve",
                 "--json",
-                "headRefOid,url",
+                "headRefOid,url,baseRefName",
             ],
             repo,
             env,
@@ -216,6 +307,7 @@ def hosted_qualification(repo, source_sha, env=None, owner=None):
         require(isinstance(pull_request, dict), "PR head response must be an object")
         head = pull_request["headRefOid"]
         url = pull_request["url"]
+        base_ref = pull_request.get("baseRefName", "main")
     except (OSError, RuntimeError, KeyError, json.JSONDecodeError) as error:
         return {
             "status": "UNKNOWN",
@@ -246,7 +338,6 @@ def hosted_qualification(repo, source_sha, env=None, owner=None):
                 "619",
                 "--repo",
                 "djh00t/steve",
-                "--required",
                 "--json",
                 "bucket,name,state,link,workflow",
             ],
@@ -255,6 +346,7 @@ def hosted_qualification(repo, source_sha, env=None, owner=None):
             (0, 1, 8),
             owner=owner,
         )
+        forge_policy = forge_required_policy(repo, base_ref, env, owner)
     except (OSError, RuntimeError, KeyError, json.JSONDecodeError) as error:
         return {
             "status": "UNKNOWN",
@@ -298,13 +390,17 @@ def hosted_qualification(repo, source_sha, env=None, owner=None):
             "head_after": head_after,
             "error": str(error),
         }
-    missing = sorted(REQUIRED_HOSTED_CHECKS - {check.get("name") for check in checks})
-    if not checks or missing:
+    forge_names = set(forge_policy["required_check_names"])
+    expected_names = REQUIRED_HOSTED_CHECKS | forge_names
+    actual_names = {check.get("name") for check in checks}
+    missing = sorted(expected_names - actual_names)
+    required_checks = [check for check in checks if check.get("name") in expected_names]
+    if missing:
         status = "UNKNOWN"
-    elif all(check.get("bucket") == "pass" for check in checks):
-        status = "PASS"
-    elif any(check.get("bucket") in {"fail", "cancel"} for check in checks):
+    elif any(check.get("bucket") in {"fail", "cancel"} for check in required_checks):
         status = "FAIL"
+    elif all(check.get("bucket") == "pass" for check in required_checks):
+        status = "PASS"
     else:
         status = "UNKNOWN"
     return {
@@ -312,7 +408,10 @@ def hosted_qualification(repo, source_sha, env=None, owner=None):
         "source_sha": head,
         "pull_request": 619,
         "url": url,
-        "required_checks": checks,
+        "all_checks": checks,
+        "required_checks": required_checks,
+        "reviewed_required_check_names": sorted(REQUIRED_HOSTED_CHECKS),
+        "forge_required_policy": forge_policy,
         "head_before": pull_request,
         "head_after": head_after,
         "missing_required_checks": missing,
