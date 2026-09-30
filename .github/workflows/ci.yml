@@ -19,6 +19,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make check
         if: github.event_name == 'pull_request'
+      - name: Run native release tests
+        run: |
+          cargo test --locked --all-features --bin steve native_
+          cargo test --locked --all-features --test e2e_native
+        if: github.event_name == 'pull_request'
       - name: Run Linux accounting end-to-end tests
         run: cargo test --locked --test e2e_accounting
         if: github.event_name == 'pull_request'

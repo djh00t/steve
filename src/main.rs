@@ -3,6 +3,8 @@ mod config;
 mod deferred;
 mod lifecycle;
 mod models;
+mod native_release;
+mod native_telemetry;
 mod net;
 mod proxy;
 mod server;
