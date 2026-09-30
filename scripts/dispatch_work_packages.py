@@ -240,6 +240,9 @@ def _field_populated(package: dict[str, Any], field: str) -> bool:
 
 def derive_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
     """Derive diagnostics and one deterministic, write-disjoint frontier."""
+    schema_version = inventory.get("schema_version")
+    if type(schema_version) is not int or schema_version != 1:
+        raise ValueError("inventory schema_version must be integer 1")
     rows = inventory.get("packages")
     if not isinstance(rows, list):
         raise ValueError("inventory packages must be a list")
@@ -255,8 +258,17 @@ def derive_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
     cycle_ids = {package_id for cycle in cycles for package_id in cycle}
     derived: dict[str, dict[str, Any]] = {}
     candidates: list[dict[str, Any]] = []
+    active_packages: list[dict[str, Any]] = []
+    unknown_active_scope: list[str] = []
     for package_id in sorted(packages):
         package = packages[package_id]
+        if package.get("delivery_state") in {"IN_PROGRESS", "CLAIMED"}:
+            active_packages.append(package)
+            paths = package.get("owned_paths")
+            if not isinstance(paths, list) or not paths or not all(
+                isinstance(path, str) and bool(path.strip()) for path in paths
+            ):
+                unknown_active_scope.append(package_id)
         reasons = _metadata_reasons(package, packages, cycle_ids)
         derived[package_id] = {
             "id": package_id,
@@ -269,6 +281,24 @@ def derive_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
             candidates.append(package)
 
     conflicts: list[dict[str, Any]] = []
+    for active in active_packages:
+        if active["id"] in unknown_active_scope:
+            continue
+        for candidate in candidates:
+            overlap = sorted(
+                {
+                    f"{active_path} <> {candidate_path}"
+                    for active_path in active["owned_paths"]
+                    for candidate_path in candidate["owned_paths"]
+                    if paths_conflict(active_path, candidate_path)
+                }
+            )
+            if overlap:
+                conflicts.append(
+                    {"left": active["id"], "right": candidate["id"], "paths": overlap}
+                )
+                derived[active["id"]]["conflicts"].append(candidate["id"])
+                derived[candidate["id"]]["conflicts"].append(active["id"])
     for index, left in enumerate(candidates):
         for right in candidates[index + 1 :]:
             overlap = sorted(
@@ -287,8 +317,16 @@ def derive_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
                 derived[right["id"]]["conflicts"].append(left["id"])
 
     frontier: list[str] = []
-    owned: list[str] = []
+    owned = [
+        path
+        for package in active_packages
+        if package["id"] not in unknown_active_scope
+        for path in package["owned_paths"]
+    ]
     for package in candidates:
+        if unknown_active_scope:
+            derived[package["id"]]["dispatch_state"] = "WAITING_OWNERSHIP"
+            continue
         if any(
             paths_conflict(candidate_path, selected_path)
             for candidate_path in package["owned_paths"]
@@ -351,10 +389,12 @@ def derive_inventory(inventory: dict[str, Any]) -> dict[str, Any]:
                 for reason in item["reasons"]
             ),
             "path_conflicts": len(conflicts),
+            "active_scope_unknown": len(unknown_active_scope),
         },
         "dispatchable_frontier": frontier,
         "cycles": cycles,
         "path_conflicts": conflicts,
+        "active_scope_unknown": unknown_active_scope,
         "packages": list(derived.values()),
     }
 

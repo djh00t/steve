@@ -45,6 +45,31 @@ class DispatchInventoryTests(unittest.TestCase):
         result = derive(package("A", 1))
         self.assertEqual(result["dispatchable_frontier"], ["A"])
 
+    def test_active_known_ownership_reserves_only_overlapping_paths(self) -> None:
+        active = package("ACTIVE", 1, delivery_state="IN_PROGRESS")
+        overlapping = package("OVERLAP", 2, owned_paths=["src/active.rs"])
+        disjoint = package("DISJOINT", 3, owned_paths=["src/other.rs"])
+        result = derive(active, overlapping, disjoint)
+        self.assertEqual(result["dispatchable_frontier"], ["DISJOINT"])
+        overlap_row = next(row for row in result["packages"] if row["id"] == "OVERLAP")
+        self.assertEqual(overlap_row["dispatch_state"], "WAITING_OWNERSHIP")
+
+    def test_unknown_active_scope_blocks_the_entire_frontier(self) -> None:
+        result = derive(
+            package("ACTIVE", 1, delivery_state="CLAIMED", owned_paths=None),
+            package("READY", 2),
+        )
+        self.assertEqual(result["dispatchable_frontier"], [])
+        self.assertEqual(result["active_scope_unknown"], ["ACTIVE"])
+
+    def test_schema_version_must_be_supported_integer_one(self) -> None:
+        for value in (None, "1", 2, True):
+            with self.subTest(schema_version=value):
+                with self.assertRaisesRegex(ValueError, "schema_version"):
+                    derive_inventory(
+                        {"schema_version": value, "packages": [package("A", 1)]}
+                    )
+
     def test_closed_ready_issue_is_not_dispatchable(self) -> None:
         result = derive(package("A", 1, issue_state="CLOSED"))
         self.assertEqual(result["dispatchable_frontier"], [])
