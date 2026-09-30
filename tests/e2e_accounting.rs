@@ -1324,6 +1324,17 @@ async fn accounting_counts_refresh_before_later_worker_timeout() {
 #[cfg(unix)]
 #[tokio::test]
 async fn chat_accounting_does_not_delay_response() {
+    assert_chat_accounting_nonblocking(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chat_accounting_preserves_provisional_unknown_after_journal_timeout() {
+    assert_chat_accounting_nonblocking(true).await;
+}
+
+#[cfg(unix)]
+async fn assert_chat_accounting_nonblocking(force_journal_timeout: bool) {
     use tokio_stream::StreamExt;
     use upstream::{ControlledUpstream, Tail};
 
@@ -1427,6 +1438,14 @@ async fn chat_accounting_does_not_delay_response() {
             "primary accounting queue did not saturate"
         );
 
+        let spilled_echo_id = force_journal_timeout.then(|| {
+            process.log_output().lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|event| event["fields"]["message"] == "accounting event queued for durable journal")
+                .expect("spilled echo queue acknowledgement")["fields"]["event_id"]
+                .as_str().expect("spilled echo event ID").to_owned()
+        });
+
         let response = client
             .post(format!(
                 "http://{}/v1/chat/completions",
@@ -1525,6 +1544,21 @@ async fn chat_accounting_does_not_delay_response() {
             }})
         );
 
+        if let Some(event_id) = &spilled_echo_id {
+            // Observe the first append's real lock timeout before releasing the queued Chat append.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let failed = process.log_output().lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .any(|event| event["fields"]["message"] == "accounting journal write failed"
+                            && event["fields"]["event_id"] == *event_id
+                            && event["fields"]["err"] == "timed out acquiring accounting file lock");
+                    if failed { break; }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.expect("first spilled echo did not reach its journal lock timeout");
+        }
+
         File::unlock(&coordination_lock).expect("release accounting coordination lock");
         sqlx::query("COMMIT")
             .execute(&mut *database_lock)
@@ -1539,13 +1573,17 @@ async fn chat_accounting_does_not_delay_response() {
                     .iter()
                     .filter(|event| event["kind"] == "chat.attempt.terminal.v1")
                     .count();
-                let lost = incident(&root)["payloads"]["outcome_totals"]
-                    ["unrecoverable_lost"]
+                let persisted = incident(&root);
+                let lost = persisted["payloads"]["outcome_totals"]["unrecoverable_lost"]
                     .as_u64()
                     .expect("known incident loss count");
+                let unknown = persisted["payloads"]["provisional"]["unknown"]
+                    .as_u64()
+                    .expect("known provisional unknown count");
+                assert!(unknown <= 1, "only the first spilled echo may have an unknown journal outcome");
                 let rows = sqlite_events(&database_url).await.len() as u64;
-                last_snapshot = Some((rows, durable.len() as u64, journaled, lost));
-                if journaled == 1 && rows + durable.len() as u64 + lost == admitted {
+                last_snapshot = Some((rows, durable.len() as u64, journaled, lost, unknown));
+                if journaled == 1 && lost == 1 && rows + durable.len() as u64 + lost + unknown == admitted {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1554,15 +1592,24 @@ async fn chat_accounting_does_not_delay_response() {
         .await;
         if let Err(elapsed) = settlement {
             match last_snapshot {
-                Some((sqlite_rows, journal_frames, terminal_chat_frames, unrecoverable_lost)) => {
+                Some((sqlite_rows, journal_frames, terminal_chat_frames, unrecoverable_lost, provisional_unknown)) => {
                     panic!(
-                        "journal acknowledgement and accounting outcomes did not settle within {elapsed}: admitted={admitted}, sqlite_rows={sqlite_rows}, journal_frames={journal_frames}, terminal_chat_frames={terminal_chat_frames}, unrecoverable_lost={unrecoverable_lost}"
+                        "journal acknowledgement and accounting outcomes did not settle within {elapsed}: admitted={admitted}, sqlite_rows={sqlite_rows}, journal_frames={journal_frames}, terminal_chat_frames={terminal_chat_frames}, unrecoverable_lost={unrecoverable_lost}, provisional_unknown={provisional_unknown}"
                     );
                 }
                 None => panic!(
                     "journal acknowledgement and accounting outcomes did not settle within {elapsed}: admitted={admitted}, no completed settlement snapshot"
                 ),
             }
+        }
+
+        let persisted = incident(&root);
+        assert_eq!(persisted["state"], "blocked");
+        assert_eq!(persisted["payloads"]["outcome_totals"]["unrecoverable_lost"], 1);
+        if let Some(event_id) = &spilled_echo_id {
+            assert_eq!(persisted["payloads"]["provisional"]["unknown"], 1);
+            assert!(sqlite_events(&database_url).await.iter().all(|row| row.0 != *event_id));
+            assert!(journal_events(&root).iter().all(|event| event["id"] != *event_id));
         }
 
         process.send_sigterm().expect("stop Chat accounting fixture");
