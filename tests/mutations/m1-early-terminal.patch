@@ -1,0 +1,6 @@
+--- a/src/proxy/openai_chat.rs
++++ b/src/proxy/openai_chat.rs
+@@ -199,2 +199,3 @@
+                 pending.armed = false;
++                terminal.finish(AttemptStatus::Success);
+                 ChatCompletionReply {

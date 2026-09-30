@@ -1,5 +1,7 @@
 use std::{
-    fs, io,
+    ffi::OsStr,
+    fs::{self, File, OpenOptions},
+    io,
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -12,11 +14,24 @@ pub struct SteveProcess {
     child: Child,
     _temp: TempDir,
     log_path: PathBuf,
+    startup_lock: Option<File>,
 }
 
+#[derive(Debug)]
 pub struct Listeners {
     pub inference: SocketAddr,
     pub management: SocketAddr,
+}
+
+pub fn acquire_accounting_startup_lock() -> io::Result<File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(std::env::temp_dir().join("steve-e2e-accounting-startup.lock"))?;
+    lock.lock()?;
+    Ok(lock)
 }
 
 impl SteveProcess {
@@ -25,7 +40,18 @@ impl SteveProcess {
     }
 
     pub fn start_with_database_url(database_url: &str) -> io::Result<Self> {
-        Self::start_with_options(None, None, 60, None, None, Some(database_url), None)
+        Self::start_with_options(
+            None,
+            None,
+            60,
+            None,
+            None,
+            Some(database_url),
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn start_with_upstream_urls(
@@ -48,6 +74,9 @@ impl SteveProcess {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -65,6 +94,9 @@ impl SteveProcess {
             None,
             None,
             ca_bundle,
+            None,
+            None,
+            None,
         )
     }
 
@@ -78,9 +110,147 @@ impl SteveProcess {
             Some(history_capacity),
             None,
             None,
+            None,
+            None,
+            None,
         )
     }
 
+    #[allow(dead_code)]
+    pub fn start_with_accounting_root(accounting_root: &Path) -> io::Result<Self> {
+        Self::start_with_options(
+            None,
+            None,
+            60,
+            None,
+            None,
+            None,
+            None,
+            Some(accounting_root),
+            None,
+            None,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn start_with_database_and_accounting(
+        database_url: &str,
+        accounting_root: &Path,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            None,
+            None,
+            60,
+            None,
+            None,
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn start_with_accounting_fault_fixture(
+        openai_upstream_url: Option<&str>,
+        database_url: &str,
+        accounting_root: &Path,
+        accounting_capacity: usize,
+        journal_capacity: usize,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            openai_upstream_url,
+            None,
+            60,
+            None,
+            None,
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            Some((accounting_capacity, journal_capacity)),
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn start_with_shutdown_fixture(
+        database_url: &str,
+        accounting_root: &Path,
+        drain_timeout_seconds: u64,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            None,
+            None,
+            drain_timeout_seconds,
+            None,
+            None,
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn start_with_stream_shutdown_fixture(
+        openai_upstream_url: &str,
+        database_url: &str,
+        accounting_root: &Path,
+        drain_timeout_seconds: u64,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            Some(openai_upstream_url),
+            None,
+            drain_timeout_seconds,
+            None,
+            None,
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            None,
+        )
+    }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub fn start_with_shutdown_and_object_store(
+        database_url: &str,
+        accounting_root: &Path,
+        object_store_endpoint: &str,
+        drain_timeout_seconds: u64,
+        operation_timeout_ms: u64,
+        retry_deadline_ms: u64,
+        retry_interval_ms: u64,
+    ) -> io::Result<Self> {
+        Self::start_with_options(
+            None,
+            None,
+            drain_timeout_seconds,
+            Some(object_store_endpoint),
+            Some(16),
+            Some(database_url),
+            None,
+            Some(accounting_root),
+            Some((operation_timeout_ms, retry_deadline_ms, retry_interval_ms)),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn start_with_options(
         openai_upstream_url: Option<&str>,
         anthropic_upstream_url: Option<&str>,
@@ -89,7 +259,11 @@ impl SteveProcess {
         history_capacity: Option<usize>,
         database_url: Option<&str>,
         ca_bundle: Option<&Path>,
+        accounting_root: Option<&Path>,
+        accounting_retry: Option<(u64, u64, u64)>,
+        accounting_capacity: Option<(usize, usize)>,
     ) -> io::Result<Self> {
+        let startup_lock = acquire_accounting_startup_lock()?;
         let temp = tempfile::tempdir()?;
         let root = temp.path();
         let db_path = root.join("steve.db");
@@ -128,15 +302,51 @@ impl SteveProcess {
         let history = history_capacity
             .map(|capacity| format!("history = {capacity}\n"))
             .unwrap_or_default();
+        let accounting_retry = accounting_retry
+            .map(|(operation, deadline, interval)| {
+                format!(
+                    "accounting_operation_timeout_ms = {operation}\n\
+                     accounting_retry_deadline_ms = {deadline}\n\
+                     accounting_retry_interval_ms = {interval}\n"
+                )
+            })
+            .unwrap_or_default();
+        let accounting_capacity = accounting_capacity
+            .map(|(primary, journal)| {
+                format!("accounting = {primary}\naccounting_journal_queue = {journal}\n")
+            })
+            .unwrap_or_default();
         let database_url = database_url
             .map(str::to_owned)
             .unwrap_or_else(|| format!("sqlite://{}?mode=rwc", db_path.display()));
+        let provision_accounting = accounting_root.is_none();
+        let accounting_root = accounting_root
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.join("accounting"));
+        if provision_accounting {
+            let output = steve_command()
+                .args([
+                    OsStr::new("accounting"),
+                    OsStr::new("provision"),
+                    OsStr::new("--root"),
+                ])
+                .arg(&accounting_root)
+                .output()?;
+            if !output.status.success() {
+                return Err(io::Error::other(format!(
+                    "accounting provision failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+        }
         let config = format!(
             "{server_config}\n[database]\nurl = {}\n\
              {object_storage}\n[queues]\naccounting_journal = {}\n{history}\
+             {accounting_capacity}\
+             {accounting_retry}\
              [logging]\nlevel = \"info\"\njson = true\n",
             toml::Value::String(database_url),
-            toml::Value::String(root.join("accounting-overflow.jsonl").display().to_string()),
+            toml::Value::String(accounting_root.display().to_string()),
         );
         let config_path = root.join("config.toml");
         fs::write(&config_path, config)?;
@@ -152,10 +362,12 @@ impl SteveProcess {
             child,
             _temp: temp,
             log_path,
+            startup_lock: Some(startup_lock),
         })
     }
 
     pub async fn wait_ready(&mut self, timeout: Duration) -> Result<Listeners, String> {
+        let _startup_lock = self.startup_lock.take();
         let deadline = Instant::now() + timeout;
         loop {
             let logs = self.logs();
@@ -218,6 +430,15 @@ impl SteveProcess {
         }
     }
 
+    #[cfg(not(unix))]
+    #[allow(dead_code)]
+    pub fn send_sigterm(&mut self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "SIGTERM is unavailable on this platform",
+        ))
+    }
+
     #[allow(dead_code)]
     pub async fn wait_for_exit(&mut self, timeout: Duration) -> Result<ExitStatus, String> {
         let deadline = Instant::now() + timeout;
@@ -233,6 +454,16 @@ impl SteveProcess {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_running(&mut self) -> io::Result<bool> {
+        Ok(self.child.try_wait()?.is_none())
+    }
+
+    #[allow(dead_code)]
+    pub fn log_output(&self) -> String {
+        self.logs()
     }
 
     pub fn database_path(&self) -> PathBuf {
@@ -258,8 +489,15 @@ impl Drop for SteveProcess {
 }
 
 fn clean_command(config_path: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_steve"));
+    let mut command = steve_command();
     command.arg("--config").arg(config_path).arg("serve");
+    command
+}
+
+pub fn steve_command() -> Command {
+    let binary =
+        std::env::var_os("STEVE_TEST_BINARY").unwrap_or_else(|| env!("CARGO_BIN_EXE_steve").into());
+    let mut command = Command::new(binary);
     for key in std::env::vars_os().map(|(key, _)| key).filter(|key| {
         let key = key.to_string_lossy();
         key.starts_with("STEVE_") || key.starts_with("RUST_LOG")

@@ -21,6 +21,8 @@ jobs:
         if: github.event_name == 'pull_request'
       - run: make quality-gates
         if: github.event_name == 'push'
+      - name: Verify Cargo.lock is unchanged
+        run: git diff --exit-code -- Cargo.lock
 
   official-sdk:
     runs-on: ubuntu-latest
@@ -35,10 +37,131 @@ jobs:
           "$RUNNER_TEMP/steve-sdk-venv/bin/python" -m pip install -r tests/requirements-sdk.txt
           "$RUNNER_TEMP/steve-sdk-venv/bin/python" -c 'from importlib.metadata import version; print("anthropic=" + version("anthropic")); print("openai=" + version("openai"))'
       - name: Build Steve
-        run: cargo build --all-features
+        run: cargo build --locked --all-features
       - name: Exercise official SDKs against local Steve
         timeout-minutes: 2
+        env:
+          PYTHONOPTIMIZE: "1"
         run: '"$RUNNER_TEMP/steve-sdk-venv/bin/python" scripts/sdk_smoke.py --provider all --binary target/debug/steve'
+
+  m1-release-gate:
+    needs: m1-mutation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: steve_m1
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d steve_m1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      M1_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      M1_DEPLOYMENT_PATH: /var/lib/steve/accounting
+      STEVE_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/steve_m1
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download exact-candidate M1 mutation evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: m1-mutation-${{ env.M1_EXPECTED_SHA }}
+          path: target/m1-mutations
+      - name: Verify M1 mutation outcomes
+        run: |
+          python3 -B scripts/qualify_m1_mutations.py --verify target/m1-mutations/result.json --expected-sha "$M1_EXPECTED_SHA"
+          cp target/m1-mutations/result.json target/m1-mutation-result.json
+      - name: Run exact-candidate M1 functional gate
+        run: make m1-release-gate
+      - name: Upload M1 gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-release-gate-${{ env.M1_EXPECTED_SHA }}
+          path: target/m1-release-gate.json
+          if-no-files-found: error
+
+  windows-ntfs-process-semantics:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      M1_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PYTHONOPTIMIZE: "1"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check exact candidate and runner tests
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne $env:M1_EXPECTED_SHA) { throw "candidate SHA mismatch" }
+          python -B -m unittest discover -s scripts -p test_m1_release_gate.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build exact Windows candidate
+        if: always()
+        run: cargo build --locked --all-features
+      - name: Probe runner NTFS process semantics
+        if: always()
+        shell: pwsh
+        run: |
+          $parent = Join-Path $env:RUNNER_TEMP "steve-m1-ntfs"
+          New-Item -ItemType Directory -Path $parent -ErrorAction Stop | Out-Null
+          $deployment = Join-Path $parent "unused-accounting-root"
+          $evidence = Join-Path $env:RUNNER_TEMP "m1-windows-ntfs-ci-process-semantics.json"
+          python -B scripts/m1_release_gate.py --qualify-target $parent --deployment-path $deployment --candidate-binary target/debug/steve.exe --expected-sha $env:M1_EXPECTED_SHA --evidence-scope ci-runner-process-semantics --output $evidence
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify runner evidence binding and release rejection
+        if: always()
+        shell: bash
+        run: |
+          python -B - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, "scripts")
+          import m1_release_gate as gate
+
+          artifact = Path(os.environ["RUNNER_TEMP"]) / "m1-windows-ntfs-ci-process-semantics.json"
+          evidence = json.loads(artifact.read_text(encoding="utf-8"))
+          gate.require(evidence.get("source_sha") == os.environ["M1_EXPECTED_SHA"], "CI evidence SHA mismatch")
+          gate.require(evidence.get("binary_sha256") == gate.sha256(Path("target/debug/steve.exe")), "CI binary hash mismatch")
+          gate.require(evidence.get("evidence_scope") == "ci-runner-process-semantics", "CI evidence scope mismatch")
+          gate.require(evidence.get("filesystem") == "ntfs", "CI runner filesystem is not NTFS")
+          volume = evidence.get("target_volume", {})
+          gate.require(volume.get("filesystem", "").upper() == "NTFS" and volume.get("guid") and volume.get("root"), "CI volume identity missing")
+          gate.require(volume.get("drive_type") in {2, 3, 6}, "CI volume is not local")
+          try:
+              gate.load_target_qualification(artifact, os.environ["M1_EXPECTED_SHA"], evidence["binary_sha256"], Path(evidence["deployment_path"]))
+          except RuntimeError as error:
+              gate.require("scope" in str(error), f"CI artifact rejection did not use scope: {error}")
+          else:
+              raise RuntimeError("CI artifact was accepted as deployment evidence")
+          gate.require(evidence.get("status") == "PASS", f"CI process probe failed: {evidence.get('error')}")
+          gate.require(evidence.get("checks") == {name: "PASS" for name in gate.TARGET_CHECKS}, "CI process checks incomplete")
+          gate.require(evidence.get("target_volume") == evidence.get("intended_volume") == evidence.get("probe_volume"), "CI volume identity mismatch")
+          PY
+      - name: Upload Windows runner process evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-windows-ntfs-ci-process-semantics
+          path: ${{ runner.temp }}/m1-windows-ntfs-ci-process-semantics.json
+          if-no-files-found: warn
 
   cross-platform:
     strategy:
@@ -58,8 +181,8 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets --all-features -- -D warnings
-          cargo check --all-targets --all-features
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo check --locked --all-targets --all-features
 
   integrations:
     runs-on: ubuntu-latest
@@ -87,12 +210,12 @@ jobs:
           STEVE_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/steve
           STEVE_OBJECT_STORE: fs
           STEVE_OBJECT_ROOT: /tmp/steve-objects
-        run: cargo run -- doctor
+        run: cargo run --locked -- doctor
 
       - name: PostgreSQL database serve parity
         env:
           STEVE_TEST_POSTGRES_URL: postgres://postgres:postgres@127.0.0.1:5432/steve
-        run: cargo test --test e2e --all-features database_backend_contract
+        run: cargo test --locked --test e2e --all-features database_backend_contract
 
       - name: Start S3-compatible test server
         run: |
@@ -135,7 +258,7 @@ jobs:
       - name: Object store backend parity
         env:
           STEVE_TEST_S3_ENDPOINT: http://127.0.0.1:5000
-        run: cargo test --bin steve --all-features object_store_backend_contract -- --nocapture
+        run: cargo test --locked --bin steve --all-features object_store_backend_contract -- --nocapture
 
       - name: S3-compatible doctor
         env:
@@ -147,7 +270,7 @@ jobs:
           STEVE_S3_REGION: us-east-1
           STEVE_S3_ACCESS_KEY_ID: test
           STEVE_S3_SECRET_ACCESS_KEY: test
-        run: cargo run -- doctor
+        run: cargo run --locked -- doctor
 
   container:
     if: github.event_name == 'push'
@@ -155,6 +278,37 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: docker build -t steve:test .
+
+  m1-mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      M1_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare locked dependencies
+        run: cargo fetch --locked
+      - name: Check M1 mutation runner
+        run: |
+          python3 -B scripts/test_qualify_m1_mutations.py
+          PYTHONOPTIMIZE=1 python3 -B scripts/test_qualify_m1_mutations.py
+      - name: Qualify all three M1 faults at the exact candidate
+        run: |
+          python3 -B scripts/qualify_m1_mutations.py --output "$RUNNER_TEMP/steve-m1-mutations" --expected-sha "$M1_EXPECTED_SHA"
+          python3 -B scripts/qualify_m1_mutations.py --verify "$RUNNER_TEMP/steve-m1-mutations/result.json" --expected-sha "$M1_EXPECTED_SHA"
+      - name: Retain exact-candidate M1 mutation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m1-mutation-${{ env.M1_EXPECTED_SHA }}
+          path: |
+            ${{ runner.temp }}/steve-m1-mutations/result.json
+            ${{ runner.temp }}/steve-m1-mutations/**/*.log
+          if-no-files-found: error
 
   mutation:
     if: github.event_name == 'pull_request'
@@ -262,13 +416,7 @@ jobs:
         timeout-minutes: 45
         shell: bash
         run: |
-          exclude_file="$RUNNER_TEMP/steve-git-exclude"
-          # make check generates this untracked lock; keep it in the copied source but out of dirty-source detection.
-          printf '/Cargo.lock\n' > "$exclude_file"
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0=core.excludesFile \
-          GIT_CONFIG_VALUE_0="$exclude_file" \
-            python3 -B scripts/qualify_buffering.py --output "$RUNNER_TEMP/steve-buffering"
+          python3 -B scripts/qualify_buffering.py --output "$RUNNER_TEMP/steve-buffering"
           python3 - "$RUNNER_TEMP/steve-buffering/result.json" <<'PY'
           import json
           import os
