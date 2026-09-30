@@ -61,6 +61,38 @@ steve usage
 steve migrate
 ```
 
+## Local container
+
+Build the image, create persistent volumes, and run the explicit provisioning
+command once before starting the server:
+
+```sh
+docker build -t steve:dev .
+docker volume create steve-accounting
+docker volume create steve-data
+docker run --rm \
+  --env STEVE_OPERATOR=local-container-operator \
+  --mount source=steve-accounting,target=/var/lib/steve/accounting \
+  --mount source=steve-data,target=/data \
+  steve:dev accounting provision --root /var/lib/steve/accounting
+```
+
+Set `STEVE_OPERATOR` to the identity responsible for this installation; Steve
+records it in the provisioning manifest.
+
+Start the server with the same volumes after provisioning succeeds:
+
+```sh
+docker run --rm \
+  --mount source=steve-accounting,target=/var/lib/steve/accounting \
+  --mount source=steve-data,target=/data \
+  -p 11435:11435 -p 8790:8790 \
+  steve:dev
+```
+
+The image never provisions during `serve`; a missing, incomplete, or corrupt
+accounting root still fails closed.
+
 ## Status
 
 **M0 — clean foundation: done.** It landed on `main` in [PR #1](https://github.com/djh00t/steve/pull/1) (`cbc2c44`). `steve serve` boots with SQLite or PostgreSQL, health and management endpoints respond, and local and S3-compatible object storage share one contract.
