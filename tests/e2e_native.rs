@@ -264,6 +264,9 @@ async fn native_process_routes_credentials_catalogue_and_restart() {
                     "up-claude",
                 ),
             ] {
+                if path == "chat/completions" && stream {
+                    body["model"] = "a-tie".into();
+                }
                 body["stream"] = stream.into();
                 let response = client
                     .post(format!("{base}/v1/{path}"))
@@ -466,12 +469,18 @@ async fn native_process_routes_credentials_catalogue_and_restart() {
                 .unwrap();
             let payloads: Vec<String> = sqlx::query_scalar("SELECT payload FROM steve_background_events WHERE kind = 'chat.attempt.terminal.v1'").fetch_all(&pool).await.unwrap();
             assert!(!payloads.is_empty());
+            let mut requested_models = std::collections::BTreeSet::new();
             for payload in payloads {
-                assert_eq!(
-                    serde_json::from_str::<Value>(&payload).unwrap()["provider"],
-                    "open"
-                );
+                let payload: Value = serde_json::from_str(&payload).unwrap();
+                let model = payload["model"].as_str().unwrap();
+                assert!(matches!(model, "auto" | "a-tie"), "{payload}");
+                requested_models.insert(model.to_owned());
+                assert_eq!(payload["provider"], "open");
             }
+            assert_eq!(
+                requested_models,
+                ["a-tie".to_owned(), "auto".to_owned()].into()
+            );
             pool.close().await;
         }
         drop(child);

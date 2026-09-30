@@ -1072,8 +1072,16 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
     let native_provider = native_request
         .as_ref()
         .map(|(route, _, _)| route.provider.clone());
-    let reply = if let Some(upstream) = upstream {
+    // Accounting records the ingress model, while only the forwarded body uses the upstream alias.
+    let native_requested_model = native_request.as_ref().map(|_| {
+        serde_json::from_slice::<Value>(&body).expect("validated native request")["model"]
+            .as_str()
+            .expect("validated native model")
+            .to_owned()
+    });
+    let mut reply = if let Some(upstream) = upstream {
         let callback_provider = native_provider.clone();
+        let callback_model = native_requested_model.clone();
         let deferred = state.deferred.clone();
         openai_chat::handle_chat_completions_with_upstream_and_terminal(
             request_body,
@@ -1083,13 +1091,21 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
                 if let Some(provider) = &callback_provider {
                     attempt.provider.clone_from(provider);
                 }
-                offer_chat_terminal_event(&deferred, request, model, &attempt);
+                offer_chat_terminal_event(
+                    &deferred,
+                    request,
+                    callback_model.as_deref().unwrap_or(model),
+                    &attempt,
+                );
             }),
         )
         .await
     } else {
         openai_chat::handle_chat_completions(&body)
     };
+    if native_requested_model.is_some() {
+        reply.model = native_requested_model;
+    }
     let attempt_count = reply
         .request
         .as_ref()
