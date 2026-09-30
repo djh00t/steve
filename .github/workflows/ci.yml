@@ -19,6 +19,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make check
         if: github.event_name == 'pull_request'
+      - name: Run Linux accounting end-to-end tests
+        run: cargo test --locked --test e2e_accounting
+        if: github.event_name == 'pull_request'
       - run: make quality-gates
         if: github.event_name == 'push'
       - name: Verify Cargo.lock is unchanged

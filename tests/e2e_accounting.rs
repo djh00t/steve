@@ -1531,7 +1531,8 @@ async fn chat_accounting_does_not_delay_response() {
             .await
             .expect("release SQLite writer");
         drop(database_lock);
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let mut last_snapshot = None;
+        let settlement = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let durable = journal_events(&root);
                 let journaled = durable
@@ -1542,17 +1543,27 @@ async fn chat_accounting_does_not_delay_response() {
                     ["unrecoverable_lost"]
                     .as_u64()
                     .expect("known incident loss count");
-                if journaled == 1
-                    && sqlite_events(&database_url).await.len() as u64 + durable.len() as u64 + lost
-                        == admitted
-                {
+                let rows = sqlite_events(&database_url).await.len() as u64;
+                last_snapshot = Some((rows, durable.len() as u64, journaled, lost));
+                if journaled == 1 && rows + durable.len() as u64 + lost == admitted {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
-        .await
-        .expect("journal acknowledgement and accounting outcomes did not settle");
+        .await;
+        if let Err(elapsed) = settlement {
+            match last_snapshot {
+                Some((sqlite_rows, journal_frames, terminal_chat_frames, unrecoverable_lost)) => {
+                    panic!(
+                        "journal acknowledgement and accounting outcomes did not settle within {elapsed}: admitted={admitted}, sqlite_rows={sqlite_rows}, journal_frames={journal_frames}, terminal_chat_frames={terminal_chat_frames}, unrecoverable_lost={unrecoverable_lost}"
+                    );
+                }
+                None => panic!(
+                    "journal acknowledgement and accounting outcomes did not settle within {elapsed}: admitted={admitted}, no completed settlement snapshot"
+                ),
+            }
+        }
 
         process.send_sigterm().expect("stop Chat accounting fixture");
         assert!(
