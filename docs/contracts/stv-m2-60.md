@@ -1,6 +1,6 @@
-# STV-M2-60 proposal: principal IDs and relationships
+# STV-M2-60 engineering working baseline: principal IDs and relationships
 
-**Status: proposal only.** David/Cos must accept this exact artifact revision before consumers treat its choices as binding. It changes no runtime behavior and authorizes no implementation. [#500 principal proposal](https://github.com/djh00t/steve/issues/500) is a child of the [#99 identity contract](https://github.com/djh00t/steve/issues/99); [#501](https://github.com/djh00t/steve/issues/501) owns initial principal/bootstrap credentials and [#502](https://github.com/djh00t/steve/issues/502) owns inference authentication and identity handoff.
+**Status: ENGINEERING WORKING BASELINE.** The reviewed proposal at `504dabec31f8fa086c43667b3da173e02f3f5617` and executable fixture at `b8f13f7d49c80833a0ba3708ee2be5f2de2e27e2` settle these interfaces for implementation planning. Final operator release acceptance remains pending at the combined M2 release gate. This artifact changes no runtime behavior. [#500 principal contract](https://github.com/djh00t/steve/issues/500) is a child of the [#99 identity contract](https://github.com/djh00t/steve/issues/99); [#501](https://github.com/djh00t/steve/issues/501) owns initial principal/bootstrap credentials and [#502](https://github.com/djh00t/steve/issues/502) owns inference authentication and identity handoff.
 
 ## Record contract
 
@@ -14,15 +14,15 @@ Use `Organisation`, `User`, and `Client` records in `organisations`, `users`, an
 
 | Field | Contract and write owner |
 |---|---|
-| `id` | Rust `Uuid`, immutable UUIDv7 primary key; #124 store generates it with `Uuid::now_v7()`. PostgreSQL column `UUID`; SQLite column canonical lowercase hyphenated UUID `TEXT`. |
+| `id` | Rust `Uuid`, immutable UUIDv7 primary key; #580/#582/#584 generate their owned record ID with `Uuid::now_v7()`. PostgreSQL column `UUID`; SQLite column canonical lowercase hyphenated UUID `TEXT`. |
 | `organisation_id`, `user_id` | Required immutable principal foreign keys; PostgreSQL `UUID`, SQLite canonical UUID `TEXT`; `ON DELETE RESTRICT`. #105/#107 declare and verify the constraints. |
-| `name` | Required `TEXT` / Rust `String`; #124 trims surrounding whitespace and rejects an empty result. No uniqueness or length rule is proposed. |
-| `created_at` | Required immutable UTC RFC3339 `TEXT` on both backends; #124 sets it at creation and callers cannot supply it. |
-| `inactive_at` | Nullable UTC RFC3339 `TEXT`; `NULL` means not inactivated. #124 sets it once on disable; callers cannot set or clear it. |
+| `name` | Required `TEXT` / Rust `String`; #580/#582/#584 trim surrounding whitespace and reject an empty result for their owned record. No uniqueness or length rule is defined. |
+| `created_at` | Required immutable UTC RFC3339 `TEXT` on both backends; the owning CRUD child sets it at creation and callers cannot supply it. |
+| `inactive_at` | Nullable UTC RFC3339 `TEXT`; `NULL` means not inactivated. The owning CRUD child sets it once on disable; callers cannot set or clear it. |
 
 Required columns are `NOT NULL`; `id` is the primary key; parent columns are `NOT NULL` foreign keys with `ON DELETE RESTRICT`. Do not add cascade deletion.
-At the write boundary #124 rejects `name.trim().is_empty()` and stores the trimmed value; #105/#107 add `CHECK (name <> '')` as a storage guard.
-The #124 store generates both timestamps with `Utc::now().to_rfc3339()`; persisted values remain UTC RFC3339 strings, never local time.
+At the write boundary #580/#582/#584 reject `name.trim().is_empty()` and store the trimmed value for their owned record; #105/#107 add `CHECK (name <> '')` as a storage guard.
+Each CRUD child generates its timestamps with `Utc::now().to_rfc3339()`; persisted values remain UTC RFC3339 strings, never local time.
 
 UUIDv7 uses the existing `uuid` dependency and current `Uuid` request/attempt ID types. It sorts by approximate creation time, so IDs are references only, never secrets or proof of authority. [Cargo.toml](../../Cargo.toml) [src/proxy/types.rs](../../src/proxy/types.rs) [RFC 9562 §5.7](https://www.rfc-editor.org/rfc/rfc9562.html#name-uuid-version-7)
 
@@ -38,7 +38,7 @@ UUIDv7 uses the existing `uuid` dependency and current `Uuid` request/attempt ID
 
 ### Attribution wire rules
 
-For both `Request` and `RequestAttempt`, newly serialized values must contain the `attribution` member. Its value is either JSON `null` or an object with exactly the three required, non-null members `organisation_id`, `user_id`, and `client_id`, each a canonical UUID string. This all-or-null choice has no representation for partial ancestry. On legacy deserialization only, an absent member and explicit `null` both mean unknown attribution and map to `None`; a present object with a missing, null, or malformed ID is rejected. Unknown members inside the attribution object are rejected; this proposal does not alter outer `Request`/`RequestAttempt` unknown-member handling. The implementation consumer must encode the legacy absent-member rule explicitly rather than infer it from current Serde defaults.
+For both `Request` and `RequestAttempt`, newly serialized values must contain the `attribution` member. Its value is either JSON `null` or an object with exactly the three required, non-null members `organisation_id`, `user_id`, and `client_id`, each a canonical UUID string. This all-or-null choice has no representation for partial ancestry. On legacy deserialization only, an absent member and explicit `null` both mean unknown attribution and map to `None`; a present object with a missing, null, or malformed ID is rejected. Unknown members inside the attribution object are rejected; this baseline does not alter outer `Request`/`RequestAttempt` unknown-member handling. The implementation consumer must encode the legacy absent-member rule explicitly rather than infer it from current Serde defaults.
 
 ### Contract examples and executable reference fixture
 
@@ -103,23 +103,24 @@ All IDs and timestamps below are synthetic contract examples, not observed runti
 }
 ```
 
-Run `python3 -B scripts/check_stv_m2_60.py` from the repository root. The standard-library [reference fixture](../../scripts/check_stv_m2_60.py) executes the JSON cases above and checks canonical UUIDv7 attribution, legacy absence/null, rejection of partial/unknown/malformed tuples, SQLite parent-link enforcement, inactive-ancestor resolution, and restricted deletion. It prints `STV-M2-60 contract fixture: passed (reference semantics only)` on success. This checks the proposed contract examples; it does not qualify Steve's future principal runtime, PostgreSQL migrations, or acceptance by David/Cos.
+Run `python3 -B scripts/check_stv_m2_60.py` from the repository root. The standard-library [reference fixture](../../scripts/check_stv_m2_60.py) executes the JSON cases above and checks canonical UUIDv7 attribution, legacy absence/null, rejection of partial/unknown/malformed tuples, SQLite parent-link enforcement, inactive-ancestor resolution, and restricted deletion. It prints `STV-M2-60 contract fixture: passed (engineering baseline semantics only)` on success. This checks the engineering baseline examples; it does not qualify Steve's future principal runtime, PostgreSQL migrations, or final operator release acceptance.
 
 ## Compatibility and migration scope
 
-- At source `4472ca59896465fcf27b0d1df1d5218552d80efd`, storage supports SQLite and PostgreSQL; the v1 migrations define the migration ledger and `steve_background_events`. `Request` and `RequestAttempt` are logical Serde types, not persisted request tables. Leave v1 rows and event payloads unchanged. [src/storage/db.rs](../../src/storage/db.rs) [src/proxy/types.rs](../../src/proxy/types.rs)
-- Add the three principal tables and required FKs as additive migrations for each backend. Follow migration contract #102 and the SQLite/PostgreSQL runners #103/#104; this proposal does not claim those contracts/runners are accepted or specify their transaction mechanics. [#102](https://github.com/djh00t/steve/issues/102) [#103](https://github.com/djh00t/steve/issues/103) [#104](https://github.com/djh00t/steve/issues/104)
+- At source `d6516aa45a6ddad4a66a637fad8f3ccee5761661`, storage supports SQLite and PostgreSQL; the v1 migrations define the migration ledger and `steve_background_events`. `Request` and `RequestAttempt` are logical Serde types, not persisted request tables. Leave v1 rows and event payloads unchanged. [src/storage/db.rs](../../src/storage/db.rs) [src/proxy/types.rs](../../src/proxy/types.rs)
+- Add the three principal tables and required FKs as additive migrations for each backend. Follow migration contract #102 and the SQLite/PostgreSQL runners #103/#104; this baseline does not claim those runners are implemented or specify their transaction mechanics. [#102](https://github.com/djh00t/steve/issues/102) [#103](https://github.com/djh00t/steve/issues/103) [#104](https://github.com/djh00t/steve/issues/104)
 - The inspected v1 migration definitions provide no attribution-bearing persisted request rows to backfill. For legacy serialized Request/RequestAttempt values, missing or null `attribution` means unknown. If future persisted data has a proven mapping, backfill only the complete verified tuple; otherwise preserve unknown as null.
 - Rollback does not drop identity tables or captured references. Stop applying later migrations. An older binary may run only after its migration and runtime compatibility with the newer schema has been verified; the migration contract rejects unknown schema versions. Otherwise require operator recovery; permanent downgrade/purge waits until the approved retention rule allows it.
 - SQLite must enforce the declared foreign keys; the implementation consumer must include a missing-parent rejection case. Existing SQLx 0.8.6 SQLite options enable foreign keys by default, so do not add a connection workaround unless a focused check fails. [#105](https://github.com/djh00t/steve/issues/105) [SQLx 0.8.6 SQLite options](https://github.com/launchbadge/sqlx/blob/v0.8.6/sqlx-sqlite/src/options/mod.rs#L185)
 
-## Consumer handoff and review decisions
+## Consumer handoff and release boundary
 
-David/Cos acceptance and merge of this exact proposal revision accepts only the principal ID, relationship, and attribution choices above. It does not implement or accept database migrations, authentication, management, or inference behavior, and does not waive any downstream consumer gates.
+The interfaces above are the engineering input to vertical slices. They do not implement or release database migrations, authentication, management, or inference behavior, and they do not waive downstream consumer gates. Final operator acceptance occurs only against the combined M2 release candidate.
 
-- #105 owns SQLite principal tables/FKs; #107 owns PostgreSQL principal tables/FKs; #118 owns Request/RequestAttempt attribution and serialization; #124 owns principal metadata create/read/update/disable. These consumers stay blocked until #99’s identity/auth contract composes with #106 and each consumer is resized against this proposal’s accepted revision. See the [M2 backlog index](../backlog-index.md) and [contract index](README.md).
-- Re-size #124 before dispatch: its current acceptance mixes client-key issue/rotation with principal CRUD despite the out-of-scope text. Keep key issue/rotation/revocation in #129/#130; retain #124’s existing admin/audit prerequisites while changing only its principal acceptance case.
-- Review decision: the spec shows one Organisation → User → Client chain but does not state whether a User may belong to multiple Organisations. This proposal chooses exactly one; if MVP requires multi-organisation membership, revise this contract before acceptance and consumer dispatch. [Spec §5](../specs/2026-09-26-steve-gateway.md#5-identity-and-attribution)
+- #105 consumes the record and relationship contract and produces the SQLite identity migration in `src/storage/db.rs::migrate_sqlite`; #107 consumes the same contract and the reviewed SQLite slice and produces the PostgreSQL identity migration in `src/storage/db.rs::migrate_postgres`. Both write the current shared migration file, so their edits are serialized. #118 consumes the attribution wire rules and produces `PrincipalAttribution` plus optional Request/RequestAttempt attribution in `src/proxy/types.rs`.
+- #124 is the coordination parent for sequential CRUD children: #580 owns Organisation create/read/update/disable, #582 owns User create/read/update/disable after #580, and #584 owns Client create/read/update/disable after #582. They serialize changes to `src/identity/api.rs`, `src/identity/store.rs`, `src/server.rs::management_router`, and `tests/e2e.rs`. Client-key issue, rotation, and revocation remain in #129/#130.
+- Do not run another principal proposal round. The commit independently reviewed for this artifact is the canonical working-baseline revision. It does not grant blanket acceptance: #105 also requires #99/#103/#104/#72; #107 requires #105/#104/#102/#72; #118 requires #99/#105/#108/#107/#72; and #580 requires #99/#105/#107/#109/#110/#123/#72. #582 additionally requires #580, and #584 additionally requires #582. The baseline gate is satisfied when this independently reviewed immutable revision is available on the consumer base under approved integration authority; it does not itself require fresh `main`. Each consumer remains blocked until its listed runtime predecessors and its own evidence gate are satisfied, including any package-specific fresh-main requirement. Historical indexes are status surfaces to synchronize after publication, not authority for this handoff.
+- Review decision: the spec shows one Organisation → User → Client chain but does not state whether a User may belong to multiple Organisations. This baseline chooses exactly one; if MVP requires multi-organisation membership, revise this contract before the affected consumer or release gate. [Spec §5](../specs/2026-09-26-steve-gateway.md#5-identity-and-attribution)
 - Purge timing after the no-reference condition remains an explicit M3 retention decision. Shared-account access stays with #100; bootstrap and request authentication stay with #501/#502.
 
 ## Negative cases

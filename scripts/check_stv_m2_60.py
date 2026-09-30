@@ -1,4 +1,4 @@
-"""Execute the proposed STV-M2-60 principal contract examples.
+"""Execute the STV-M2-60 engineering baseline examples.
 
 This is a reference fixture, not a test of Steve's future principal runtime.
 """
@@ -31,7 +31,7 @@ def examples() -> dict[str, object]:
 
 
 def attribution(record: dict[str, object]) -> tuple[str, str, str] | None:
-    """Apply the proposal's all-or-null attribution wire rule."""
+    """Apply the baseline's all-or-null attribution wire rule."""
     value = record.get("attribution")
     if value is None:
         return None
@@ -64,7 +64,7 @@ def must_reject_sql(
     values: tuple[object, ...],
     expected_error: str,
 ) -> None:
-    """Fail if a proposed SQLite constraint does not reject the write."""
+    """Fail if a baseline SQLite constraint does not reject the write."""
     try:
         db.execute(sql, values)
     except sqlite3.IntegrityError as exc:
@@ -96,7 +96,7 @@ def check_wire(data: dict[str, object]) -> tuple[str, str, str]:
 def check_relationships(
     data: dict[str, object], captured: tuple[str, str, str]
 ) -> None:
-    """Exercise proposed parent links, inactive ancestry and delete protection."""
+    """Exercise baseline parent links, inactive ancestry and delete protection."""
     with closing(sqlite3.connect(":memory:")) as db:
         db.execute("PRAGMA foreign_keys = ON")
         db.executescript(
@@ -206,7 +206,7 @@ def main() -> None:
     data = examples()
     captured = check_wire(data)
     check_relationships(data, captured)
-    print("STV-M2-60 contract fixture: passed (reference semantics only)")
+    print("STV-M2-60 contract fixture: passed (engineering baseline semantics only)")
 
 
 if __name__ == "__main__":
