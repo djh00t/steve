@@ -3,6 +3,8 @@ use crate::{
     deferred::DeferredQueues,
     lifecycle::{InflightGuard, Lifecycle, Phase},
     models::{self, ModelList},
+    native_release::{NativeProtocol, NativeRuntime, SelectedRoute},
+    native_telemetry::{observe, TelemetryContext},
     net::{bind_listener, is_dual_stack_address},
     proxy::{anthropic_messages, openai_chat, openai_responses, AnthropicUpstream, OpenAiUpstream},
     storage::{Database, ObjectStorage},
@@ -100,6 +102,7 @@ struct AppState {
     management_admission: Arc<AdmissionBudget>,
     openai_upstream: Option<OpenAiUpstream>,
     anthropic_upstream: Option<AnthropicUpstream>,
+    native: Option<NativeRuntime>,
     provider_probe: ProviderProbeState,
     shutdown: mpsc::Sender<ShutdownRequest>,
     drain_timeout: Duration,
@@ -247,18 +250,6 @@ pub async fn run(
     let inference_local = inference_listener.local_addr()?;
     let management_local = management_listener.local_addr()?;
 
-    let catalogue: Arc<[ModelConfig]> = models::resolve_catalogue(&cfg.models).into();
-    tracing::info!(
-        event = "model_catalogue_loaded",
-        count = catalogue.len(),
-        source = if cfg.models.is_empty() {
-            "static"
-        } else {
-            "config"
-        },
-        "model catalogue loaded"
-    );
-
     let counters = Arc::new(RequestCounters::default());
     let certificates = if let Some(path) = &cfg.server.upstream_ca_bundle {
         let pem = std::fs::read(path)
@@ -309,6 +300,42 @@ pub async fn run(
     let mut anthropic_builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(0);
+    let native = cfg
+        .native
+        .as_ref()
+        .map(|config| NativeRuntime::new(config, &certificates))
+        .transpose()?;
+    let catalogue: Arc<[ModelConfig]> = native
+        .as_ref()
+        .map_or_else(
+            || models::resolve_catalogue(&cfg.models),
+            NativeRuntime::catalogue,
+        )
+        .into();
+    if native.is_some() && catalogue.is_empty() {
+        anyhow::bail!("native mode requires at least one eligible configured model");
+    }
+    tracing::info!(
+        event = "model_catalogue_loaded",
+        count = catalogue.len(),
+        source = if native.is_some() {
+            "native"
+        } else if cfg.models.is_empty() {
+            "static"
+        } else {
+            "config"
+        },
+        "model catalogue loaded"
+    );
+    if let Some(config) = &cfg.native {
+        tracing::info!(
+            event = "native_access_policy",
+            policy = "local_os_users_only",
+            reference_input_tokens = config.reference_input_tokens,
+            reference_output_tokens = config.reference_output_tokens,
+            "native loopback access and fixed reference cost policy"
+        );
+    }
     for certificate in certificates {
         normal_builder = normal_builder.add_root_certificate(certificate.clone());
         anthropic_builder = anthropic_builder.add_root_certificate(certificate);
@@ -361,6 +388,7 @@ pub async fn run(
         management_admission: Arc::new(AdmissionBudget::new(4)),
         openai_upstream,
         anthropic_upstream,
+        native,
         provider_probe,
         shutdown: shutdown.clone(),
         drain_timeout: timeout,
@@ -781,7 +809,63 @@ async fn drain(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"phase": "draining"}))
 }
 
+fn native_request(
+    native: &NativeRuntime,
+    body: &[u8],
+    protocol: NativeProtocol,
+) -> std::result::Result<(SelectedRoute, Vec<u8>, TelemetryContext), String> {
+    let started = Instant::now();
+    let mut request: Value =
+        serde_json::from_slice(body).map_err(|_| "invalid JSON request".to_owned())?;
+    let route = native.select(&request, protocol)?;
+    request["model"] = Value::String(route.upstream_model.clone());
+    tracing::info!(event = "native_route_selected", public_model = %route.public_model, provider = %route.provider, input_micro_usd_per_million = route.input_micro_usd_per_million, output_micro_usd_per_million = route.output_micro_usd_per_million, "native route selected");
+    let context = TelemetryContext {
+        request_id: Uuid::now_v7().to_string(),
+        public_model: route.public_model.clone(),
+        provider: route.provider.clone(),
+        protocol: match protocol {
+            NativeProtocol::Chat => "chat",
+            NativeProtocol::Responses => "responses",
+            NativeProtocol::Messages => "messages",
+        },
+        started,
+    };
+    let body = serde_json::to_vec(&request).expect("JSON value serializes");
+    Ok((route, body, context))
+}
+
 async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
+    if let Some(native) = &state.native {
+        let (route, body, mut context) =
+            match native_request(native, &body, NativeProtocol::Messages) {
+                Ok(request) => request,
+                Err(message) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!({"error": {"type": "invalid_request_error", "message": message}}),
+                        ),
+                    )
+                        .into_response()
+                }
+            };
+        let reply = anthropic_messages::handle_messages_with_upstream(
+            &body,
+            route.anthropic.as_ref().expect("validated protocol"),
+        )
+        .await;
+        if let Some(attempt) = &reply.attempt {
+            context.request_id = attempt
+                .lock()
+                .expect("attempt lock")
+                .request_id
+                .0
+                .to_string();
+        }
+        return observe(reply.into_response(), context);
+    }
+
     let reply = if let Some(upstream) = &state.anthropic_upstream {
         anthropic_messages::handle_messages_with_upstream(&body, upstream).await
     } else {
@@ -791,6 +875,36 @@ async fn messages(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Res
 }
 
 async fn responses(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
+    if let Some(native) = &state.native {
+        let (route, body, mut context) =
+            match native_request(native, &body, NativeProtocol::Responses) {
+                Ok(request) => request,
+                Err(message) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(
+                            json!({"error": {"type": "invalid_request_error", "message": message}}),
+                        ),
+                    )
+                        .into_response()
+                }
+            };
+        let reply = openai_responses::handle_responses_with_upstream(
+            &body,
+            route.openai.as_ref().expect("validated protocol"),
+        )
+        .await;
+        if let Some(attempt) = &reply.attempt {
+            context.request_id = attempt
+                .lock()
+                .expect("attempt lock")
+                .request_id
+                .0
+                .to_string();
+        }
+        return observe(reply.into_response(), context);
+    }
+
     let reply = if let Some(upstream) = &state.openai_upstream {
         openai_responses::handle_responses_with_upstream(&body, upstream).await
     } else {
@@ -934,19 +1048,64 @@ impl<G: Unpin> HttpBody for GuardedBody<G> {
 }
 
 async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes) -> Response {
-    let reply = if let Some(upstream) = &state.openai_upstream {
+    let mut native_request = if let Some(native) = &state.native {
+        match native_request(native, &body, NativeProtocol::Chat) {
+            Ok(request) => Some(request),
+            Err(message) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": {"type": "invalid_request_error", "message": message}})),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        None
+    };
+    let request_body = native_request
+        .as_ref()
+        .map_or(body.as_ref(), |(_, body, _)| body.as_slice());
+    let upstream = native_request
+        .as_ref()
+        .and_then(|(route, _, _)| route.openai.as_ref())
+        .or(state.openai_upstream.as_ref());
+    let native_provider = native_request
+        .as_ref()
+        .map(|(route, _, _)| route.provider.clone());
+    // Accounting records the ingress model, while only the forwarded body uses the upstream alias.
+    let native_requested_model = native_request.as_ref().map(|_| {
+        serde_json::from_slice::<Value>(&body).expect("validated native request")["model"]
+            .as_str()
+            .expect("validated native model")
+            .to_owned()
+    });
+    let mut reply = if let Some(upstream) = upstream {
+        let callback_provider = native_provider.clone();
+        let callback_model = native_requested_model.clone();
         let deferred = state.deferred.clone();
         openai_chat::handle_chat_completions_with_upstream_and_terminal(
-            &body,
+            request_body,
             upstream,
             Arc::new(move |request, model, attempt| {
-                offer_chat_terminal_event(&deferred, request, model, attempt);
+                let mut attempt = attempt.clone();
+                if let Some(provider) = &callback_provider {
+                    attempt.provider.clone_from(provider);
+                }
+                offer_chat_terminal_event(
+                    &deferred,
+                    request,
+                    callback_model.as_deref().unwrap_or(model),
+                    &attempt,
+                );
             }),
         )
         .await
     } else {
         openai_chat::handle_chat_completions(&body)
     };
+    if native_requested_model.is_some() {
+        reply.model = native_requested_model;
+    }
     let attempt_count = reply
         .request
         .as_ref()
@@ -966,11 +1125,22 @@ async fn chat_completions(State(state): State<Arc<AppState>>, body: bytes::Bytes
                 "chat completions upstream attempt finished"
             );
             if !reply.requested_stream {
-                offer_chat_terminal_event(&state.deferred, request, model, attempt);
+                let mut attempt = attempt.clone();
+                if let Some(provider) = &native_provider {
+                    attempt.provider.clone_from(provider);
+                }
+                offer_chat_terminal_event(&state.deferred, request, model, &attempt);
             }
         }
     }
-    reply.into_response()
+    if let (Some((_, _, context)), Some(request)) = (&mut native_request, &reply.request) {
+        context.request_id = request.id.0.to_string();
+    }
+    let response = reply.into_response();
+    match native_request {
+        Some((_, _, context)) => observe(response, context),
+        None => response,
+    }
 }
 
 fn offer_chat_terminal_event(
@@ -1404,6 +1574,7 @@ mod tests {
             models: models::resolve_catalogue(&[]).into(),
             inference_admission: Arc::new(AdmissionBudget::new(32)),
             management_admission: Arc::new(AdmissionBudget::new(4)),
+            native: None,
             openai_upstream: None,
             anthropic_upstream: Some(
                 AnthropicUpstream::new(upstream_url, Duration::from_secs(2)).unwrap(),

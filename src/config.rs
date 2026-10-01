@@ -18,6 +18,7 @@ pub struct Config {
     pub queues: QueueConfig,
     pub logging: LoggingConfig,
     pub models: Vec<ModelConfig>,
+    pub native: Option<crate::native_release::NativeConfig>,
     #[serde(skip)]
     source: Option<PathBuf>,
 }
@@ -209,7 +210,18 @@ impl Config {
         Ok(cfg)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(native) = &self.native {
+            native.validate()?;
+            for address in [&self.server.inference_bind, &self.server.management_bind] {
+                let address: std::net::SocketAddr = address
+                    .parse()
+                    .context("native listeners require numeric loopback addresses")?;
+                if !address.ip().is_loopback() {
+                    anyhow::bail!("native mode permits local OS users only; both listeners must bind to loopback");
+                }
+            }
+        }
         let queues = &self.queues;
         if queues.accounting_operation_timeout_ms == 0
             || queues.accounting_retry_deadline_ms == 0
@@ -255,6 +267,33 @@ impl DatabaseConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_mode_accepts_only_loopback_listeners() {
+        let mut cfg = Config {
+            native: Some(crate::native_release::NativeConfig::default()),
+            server: ServerConfig {
+                inference_bind: "127.0.0.1:0".into(),
+                management_bind: "[::1]:0".into(),
+                ..ServerConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(cfg.validate().is_ok());
+        for address in [
+            "0.0.0.0:11435",
+            "[::]:11435",
+            "192.0.2.1:11435",
+            "localhost:11435",
+        ] {
+            cfg.server.inference_bind = address.into();
+            assert!(cfg.validate().is_err(), "accepted {address}");
+        }
+        cfg.server.inference_bind = "127.0.0.1:0".into();
+        cfg.server.management_bind = "0.0.0.0:8790".into();
+        assert!(cfg.validate().is_err());
+        assert!(Config::default().native.is_none());
+    }
 
     #[test]
     fn defaults_are_dual_stack() {

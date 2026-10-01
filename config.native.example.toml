@@ -1,0 +1,48 @@
+# Native single-user candidate. Replace model names, prices and private paths.
+# Prices below are illustrative USD micro-units per million tokens, NOT live prices.
+[server]
+inference_bind = "127.0.0.1:11435"
+management_bind = "127.0.0.1:8790"
+drain_timeout_seconds = 60
+
+[database]
+url = "sqlite://data/steve.db?mode=rwc"
+
+[object_storage]
+kind = "fs"
+root = "data/objects"
+
+[queues]
+accounting_journal = "/absolute/private/steve/accounting"
+
+[logging]
+level = "info"
+json = true
+
+[native]
+reference_input_tokens = 1000
+reference_output_tokens = 1000
+
+[[native.providers]]
+id = "openai"
+protocol = "openai"
+base_url = "https://api.openai.com/v1"
+credential_env = "STEVE_NATIVE_OPENAI_KEY"
+
+[[native.models]]
+id = "economy"
+provider = "openai"
+upstream_model = "replace-with-supported-model"
+protocols = ["chat", "responses"]
+streaming = true
+input_micro_usd_per_million = 1000000
+output_micro_usd_per_million = 2000000
+
+[[native.models]]
+id = "premium"
+provider = "openai"
+upstream_model = "replace-with-another-supported-model"
+protocols = ["chat", "responses"]
+streaming = true
+input_micro_usd_per_million = 2000000
+output_micro_usd_per_million = 4000000
