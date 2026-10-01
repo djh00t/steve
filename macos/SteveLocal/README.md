@@ -14,9 +14,14 @@ bash macos/SteveLocal/build.sh /absolute/verified/steve /absolute/private/native
 
 The configuration must use inference `127.0.0.1:11435` and management
 `127.0.0.1:8790`. Provision its accounting root using the daemon instructions
-first. The bundle contains the daemon and the configuration **path**, never a
-credential value or copy of the configuration. This controller is an unsigned
-local development app; it is not a notarized distributable installer.
+first. Use a normal native location such as `~/Library/Application Support/Steve`
+for private configuration/data and `~/Applications/Steve.app` for the app.
+Managed document folders can block a standalone app's file access or alter
+bundle metadata. Build seals the app on temporary native storage and verifies
+a fresh sibling copy before replacing its own previous bundle, without clearing quarantine or provenance attributes.
+The bundle contains the daemon and the configuration **path**, never a
+credential value or copy of the configuration. The bundle gets a local ad-hoc
+development signature; it is not a notarized distributable installer.
 
 Launch with the operator-approved configured credential variable inherited in the
 environment; never place its value in command arguments or an app launcher file:
@@ -46,9 +51,11 @@ back the window. **Quit Steve** waits for its owned daemon to drain gracefully.
 It does not stop an externally managed daemon. Logs append to the private
 configuration directory's `app-daemon.log`.
 
-After quitting, a fresh Finder launch cannot inherit a terminal's API key.
-Launch again from your approved secret-supplying environment, or reconnect to an
-already managed daemon. OS keychain storage and login auto-start need separate
+Double-click the installed app or use `open ~/Applications/Steve.app` to reopen it.
+A fresh ordinary launch was verified on the acceptance Mac using its existing
+approved environment. Availability of that credential after reboot was not
+verified: Finder requires an existing credential-supplying environment or an
+already managed daemon; the app itself stores no key. OS keychain storage and login auto-start need separate
 authorization and are not installed by this app.
 
 Build runs the executable's `--self-test` checks for client settings, accounting
