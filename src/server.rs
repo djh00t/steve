@@ -74,6 +74,8 @@ impl AdmissionBudget {
         match self.semaphore.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
+                // try_update requires Rust 1.95; retain earlier compiler compatibility.
+                #[allow(deprecated)]
                 let _ = self.rejected_total.fetch_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
