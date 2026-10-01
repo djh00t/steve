@@ -18,14 +18,18 @@ first. The bundle contains the daemon and the configuration **path**, never a
 credential value or copy of the configuration. This controller is an unsigned
 local development app; it is not a notarized distributable installer.
 
-Launch with the operator-approved existing `OPENAI_API_KEY` inherited in the
+Launch with the operator-approved configured credential variable inherited in the
 environment; never place its value in command arguments or an app launcher file:
 
 ```bash
 /absolute/output/Steve.app/Contents/MacOS/Steve
 ```
 
-The app starts the bundled daemon if no Steve instance is present. It owns only
+The daemon validates the configured credential names, including custom names
+and Anthropic credentials; the app does not assume `OPENAI_API_KEY` is universal.
+The app starts the bundled daemon only after connection refusal establishes
+absence. Timeouts, malformed responses and HTTP errors remain inconclusive and
+cannot trigger startup. It owns only
 the daemon it starts. An existing starting, draining or accounting-blocked daemon
 is displayed without launching a competitor. The app polls only local status,
 readiness and models; it makes no inference or provider-health requests.

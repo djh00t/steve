@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Darwin
 
 func clientSettings(model: String) -> String {
     "Base URL: http://127.0.0.1:11435/v1\nModel: \(model)\nClient API key: local (nonsecret placeholder)"
@@ -19,6 +20,18 @@ func daemonIsReady(_ status: [String: Any]?, _ readiness: [String: Any]?) -> Boo
     daemonIsPresent(status) && readiness?["status"] as? String == "ready"
 }
 
+func connectionWasRefused(_ error: NSError?) -> Bool {
+    var current = error
+    for _ in 0..<8 {
+        guard let error = current else { return false }
+        if error.domain == NSPOSIXErrorDomain && error.code == Int(ECONNREFUSED) { return true }
+        if error.userInfo["_kCFStreamErrorDomainKey"] as? Int == 1 &&
+            error.userInfo["_kCFStreamErrorCodeKey"] as? Int == Int(ECONNREFUSED) { return true }
+        current = error.userInfo[NSUnderlyingErrorKey] as? NSError
+    }
+    return false
+}
+
 if CommandLine.arguments.contains("--self-test") {
     assert(clientSettings(model: "luna").contains("Model: luna"))
     assert(clientSettings(model: "auto").contains("Model: auto"))
@@ -30,6 +43,12 @@ if CommandLine.arguments.contains("--self-test") {
     assert(!daemonIsPresent(nil))
     assert(!daemonIsReady(["name": "steve", "phase": "ready"], nil))
     assert(daemonIsReady(["name": "steve"], ["status": "ready"]))
+    let refused = NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNREFUSED))
+    assert(connectionWasRefused(refused))
+    assert(connectionWasRefused(NSError(domain: NSURLErrorDomain, code: -1004, userInfo: [NSUnderlyingErrorKey: refused])))
+    assert(connectionWasRefused(NSError(domain: NSURLErrorDomain, code: -1004, userInfo: ["_kCFStreamErrorDomainKey": 1, "_kCFStreamErrorCodeKey": Int(ECONNREFUSED)])))
+    assert(!connectionWasRefused(NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)))
+    assert(!connectionWasRefused(nil)) // HTTP errors/malformed responses are not absence.
     print("native controller self-checks passed")
     exit(0)
 }
@@ -46,6 +65,7 @@ final class Controller: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var refreshing = false
     private var daemonPresent = false
+    private var confirmedAbsent = false
     private var quitting = false
     private var connected = false
     private var appStarted = false
@@ -116,36 +136,38 @@ final class Controller: NSObject, NSApplicationDelegate {
         refresh()
     }
 
-    private func get(_ url: String, completion: @escaping ([String: Any]?) -> Void) {
-        session.dataTask(with: URL(string: url)!) { data, response, _ in
+    private func get(_ url: String, completion: @escaping ([String: Any]?, Bool) -> Void) {
+        session.dataTask(with: URL(string: url)!) { data, response, error in
             let value: [String: Any]?
             if (response as? HTTPURLResponse)?.statusCode == 200, let data {
                 value = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             } else { value = nil }
-            DispatchQueue.main.async { completion(value) }
+            let absent = response == nil && connectionWasRefused(error as NSError?)
+            DispatchQueue.main.async { completion(value, absent) }
         }.resume()
     }
     @objc private func refresh() {
         guard !refreshing else { return }
         refreshing = true
-        get("http://127.0.0.1:8790/api/v1/system/status") { [weak self] status in
+        get("http://127.0.0.1:8790/api/v1/system/status") { [weak self] status, absent in
             guard let self else { return }
             self.daemonPresent = daemonIsPresent(status)
+            self.confirmedAbsent = absent
             self.accounting.stringValue = status.map(accountingSummary) ?? "Accounting: unavailable while disconnected"
-            self.startButton.isEnabled = !self.daemonPresent && self.child == nil
+            self.startButton.isEnabled = self.confirmedAbsent && self.child == nil
             self.stopButton.isEnabled = self.child?.isRunning == true
             if !self.appStarted {
                 self.appStarted = true
-                if !self.daemonPresent { self.start() }
-                else { self.message.stringValue = "Connected to an existing daemon. Start/stop ownership stays with its original launcher." }
+                if self.confirmedAbsent { self.start() }
+                else if self.daemonPresent { self.message.stringValue = "Connected to an existing daemon. Start/stop ownership stays with its original launcher." }
             }
             guard self.daemonPresent else {
                 self.connected = false
-                self.connection.stringValue = "Disconnected — start Steve to use the proxy"
+                self.connection.stringValue = absent ? "Disconnected — start Steve to use the proxy" : "Connection inconclusive — existing ownership preserved"
                 self.refreshing = false
                 return
             }
-            self.get("http://127.0.0.1:11435/health/ready") { [weak self] readiness in
+            self.get("http://127.0.0.1:11435/health/ready") { [weak self] readiness, _ in
                 guard let self else { return }
                 self.connected = daemonIsReady(status, readiness)
                 let phase = status?["phase"] as? String ?? "unknown"
@@ -153,7 +175,7 @@ final class Controller: NSObject, NSApplicationDelegate {
                 if self.connected && self.message.stringValue.hasPrefix("Starting app-managed") {
                     self.message.stringValue = "App-managed Steve is running. Closing this window keeps it running; Quit Steve stops it."
                 }
-                self.get("http://127.0.0.1:11435/v1/models") { [weak self] catalogue in
+                self.get("http://127.0.0.1:11435/v1/models") { [weak self] catalogue, _ in
                     guard let self else { return }
                     let selected = self.models.titleOfSelectedItem ?? "auto"
                     let ids = ((catalogue?["data"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String }
@@ -167,11 +189,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         }
     }
     @objc private func start() {
-        guard child == nil, !daemonPresent else { return }
-        guard !(ProcessInfo.processInfo.environment["OPENAI_API_KEY"] ?? "").isEmpty else {
-            message.stringValue = "No credential is available to this app process. Use the approved environment launcher; Steve never saves the key."
-            return
-        }
+        guard child == nil, confirmedAbsent else { return }
         guard let binary = Bundle.main.url(forResource: "steve", withExtension: nil), FileManager.default.fileExists(atPath: configPath) else {
             message.stringValue = "Missing bundled daemon or private configuration. Rebuild the app with the prepared configuration path."
             return
