@@ -185,6 +185,13 @@ jobs:
       - name: Check macOS
         if: runner.os == 'macOS'
         run: make check
+      - name: Check native local controller
+        if: runner.os == 'macOS'
+        run: |
+          printf '#!/bin/sh\nexit 0\n' > "$RUNNER_TEMP/steve-fixture"
+          chmod +x "$RUNNER_TEMP/steve-fixture"
+          touch "$RUNNER_TEMP/native-fixture.toml"
+          bash macos/SteveLocal/build.sh "$RUNNER_TEMP/steve-fixture" "$RUNNER_TEMP/native-fixture.toml" "$RUNNER_TEMP/Steve.app"
       - name: Check Windows
         if: runner.os == 'Windows'
         run: |
