@@ -15,6 +15,49 @@ MARKER = 'SYNTHETIC_CONTENT_CANARY'
 def require(value, message):
     if not value: raise RuntimeError(message)
 
+def fixture_auth_ok(path, headers):
+    """Check the intended provider header and reject client-secret residue."""
+    name, expected = ('x-api-key', KEY) if path == '/v1/messages' else ('Authorization', 'Bearer '+KEY)
+    return (headers.get_all(name, []) == [expected]
+            and all('fake-client-key' not in value
+                    for key in ('Authorization', 'x-api-key', 'Proxy-Authorization')
+                    for value in headers.get_all(key, [])))
+
+
+def validate_results(results):
+    """Reject functional regressions while retaining known compatibility limits."""
+    for path in ('direct', 'gateway'):
+        measurement = results['paths'][path]
+        cases = measurement['cases']
+        for protocol in ('chat', 'responses', 'messages'):
+            for mode in ('json', 'sse'):
+                case = cases[protocol+'_'+mode]
+                require(case['status'] == 200 and case['contains_expected_text'], path+' '+protocol+' '+mode)
+                if mode == 'sse':
+                    require(case['total_ms']-case['first_byte_ms'] >= 200, path+' '+protocol+' EOF buffering')
+            missing = cases[protocol+'_missing']
+            expected = 502 if path == 'gateway' and protocol == 'messages' else 200
+            require(missing['status'] == expected and missing['wire_usage'] is None, path+' '+protocol+' missing usage')
+            cancelled = cases[protocol+'_cancel']
+            require(cancelled['status'] == 200 and cancelled['upstream_attempts'] == 1
+                    and cancelled['upstream_cancelled'], path+' '+protocol+' cancellation/replay')
+        for mode in ('json', 'sse'):
+            bridge = cases['bridge_'+mode]
+            expected = '/v1/responses' if path == 'gateway' else '/v1/messages'
+            require(bridge['status'] == 200 and bridge['contains_expected_text']
+                    and bridge['actual_upstream_path'] == expected, path+' bridge '+mode)
+        for scenario, status, attempts in [('error', 502, 2), ('malformed', 502, 1), ('timeout', 504, 1)]:
+            case = cases[scenario]
+            require(case['status'] == status and case['upstream_attempts'] == attempts
+                    and case['total_ms'] < 35000, path+' '+scenario+' status/attempt/bound')
+        require(measurement['admission'] == {'overload_status':503,'health_status':200,'inference_active':32}, path+' admission qualification')
+        require(measurement['drain_exit_code'] == 0, path+' idle shutdown')
+        require(tuple(measurement['terminal_id_count']) == (70, 70, 70), path+' terminal identity/count')
+        require(measurement['durable_native_requests_by_protocol'] == {'chat':69,'responses':0,'messages':0}, path+' durable accounting boundary')
+    require(not results['log_canary_leak'], 'content or key canary leak')
+    require(results['all_fixture_credentials_correct']
+            and all(record['auth_ok'] for record in results['fixture_records']), 'fixture auth substitution')
+
 def port():
     with socket.socket() as s:
         s.bind(('127.0.0.1', 0)); return s.getsockname()[1]
@@ -48,7 +91,7 @@ class Fixture(BaseHTTPRequestHandler):
     def do_POST(self):
         data=json.loads(self.rfile.read(int(self.headers['Content-Length'])))
         text=json.dumps(data); scenario=next((s for s in ['cancel','missing','error','malformed','timeout'] if s in text),'normal')
-        self.records.append({'path':self.path,'scenario':scenario,'auth_ok':self.headers.get('Authorization')=='Bearer '+KEY or self.headers.get('x-api-key')==KEY,'unknown_preserved':'spike_unknown' in data})
+        self.records.append({'path':self.path,'scenario':scenario,'auth_ok':fixture_auth_ok(self.path, self.headers),'unknown_preserved':'spike_unknown' in data})
         if scenario=='timeout': time.sleep(31)
         code=503 if scenario=='error' else 200
         stream=data.get('stream',False)
@@ -174,11 +217,7 @@ def main():
             results['log_canary_leak']=any(MARKER in p.read_text(errors='replace') or KEY in p.read_text(errors='replace') or 'fake-client-key' in p.read_text(errors='replace') for p in root.rglob('*.log'))
             server.shutdown();server.server_close()
             args.output.write_text(json.dumps(results,indent=2))
-            for path,measurement in results['paths'].items():
-                require(measurement['admission']=={'overload_status':503,'health_status':200,'inference_active':32},path+' admission qualification')
-                require(measurement['drain_exit_code']==0,path+' idle shutdown')
-            require(not results['log_canary_leak'],'content or key canary leak')
-            require(results['all_fixture_credentials_correct'],'fixture auth substitution')
+            validate_results(results)
             print(json.dumps({'output':str(args.output),'privacy_leak':results['log_canary_leak'],'credentials_ok':results['all_fixture_credentials_correct']}))
         finally:
             for c in reversed(children):stop(c)

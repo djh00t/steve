@@ -145,16 +145,16 @@ scheduling, protocol order and allocator history can affect this small sample.
 
 | Measurement | Steve direct | Steve plus gateway |
 |---|---:|---:|
-| Steve listener-ready startup | 58.11 ms | 57.09 ms |
-| Extra gateway TCP-listener startup | none | 22.84 ms |
-| Warm Chat JSON first-body-byte median | 1.513 ms | 1.690 ms |
-| Sequential fixture JSON throughput | 512.1 requests/s | 458.8 requests/s |
-| Post-probe stack RSS | 30416 KiB | 62656 KiB |
-| Idle shutdown | 287.55 ms | 341.01 ms (Steve only) |
+| Steve listener-ready startup | 57.15 ms | 108.43 ms |
+| Extra gateway TCP-listener startup | none | 28.29 ms |
+| Warm Chat JSON first-body-byte median | 1.146 ms | 1.771 ms |
+| Sequential fixture JSON throughput | 545.8 requests/s | 456.9 requests/s |
+| Post-probe stack RSS | 30576 KiB | 62592 KiB |
+| Idle shutdown | 290.63 ms | 290.29 ms (Steve only) |
 
 All six normal protocol/mode cases returned200. SSE first-byte delays were
-2.33 ms or less direct and
-4.59 ms or less through the gateway,
+3.77 ms or less direct and
+4.28 ms or less through the gateway,
 with a300ms delayed tail: neither buffered the complete stream.
 
 Messages-to-Responses conversion succeeded in JSON and SSE with expected text;
@@ -171,3 +171,26 @@ Steve limitation, unaffected by adding a gateway.
 Raw measurements and sanitized attempt metadata are in [results.json](results.json).
 Its script SHA256 and both binary hashes bind the observations to the executed
 probe. No stack adoption or final release merge is approved by these results.
+
+## Review regression gates
+
+The reproduction command now rejects incorrect statuses/text, EOF buffering,
+wrong conversion destinations, replay or failed cancellation, changed missing-usage
+semantics, retry/timeout deviations and accounting identity/count regressions.
+The fixture requires its protocol-specific provider header and independently
+rejects leftover client-key canaries in either auth header or Proxy-Authorization,
+including duplicate headers. Sanitized results are saved before validation, so
+a failed run still leaves diagnostic metadata.
+
+Run the fast network-free checks (also wired into hosted quality CI):
+
+```sh
+PYTHONOPTIMIZE=1 python3 -B -m unittest discover -s experiments/agentgateway -p 'test_*.py'
+```
+
+Eight regression tests pass. Counterfactual checks detected all28 functional
+false-positive cases under the original validation block and five credential
+false positives under the original OR predicate. The full probe was rerun with
+the stricter gates and fake-only credentials; all gates passed. The known
+Messages-missing-usage502 and Chat-only durable accounting remain explicitly
+expected experiment limits, not complete product acceptance.
