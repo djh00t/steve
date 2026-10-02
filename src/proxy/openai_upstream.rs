@@ -99,6 +99,17 @@ impl OpenAiUpstream {
     ///
     /// `request` is encoded as the JSON body. `stream: true` is rejected.
     pub async fn chat_completion(&self, request: &impl Serialize) -> Result<Value, SteveError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        self.chat_completion_with_headers(request, &mut headers)
+            .await
+    }
+
+    pub(crate) async fn chat_completion_with_headers(
+        &self,
+        request: &impl Serialize,
+        headers: &mut reqwest::header::HeaderMap,
+    ) -> Result<Value, SteveError> {
+        headers.clear();
         let body = serde_json::to_value(request).map_err(|err| SteveError::Config {
             message: format!("chat completion request is not valid JSON: {err}"),
         })?;
@@ -117,6 +128,7 @@ impl OpenAiUpstream {
             .await
             .map_err(|err| map_http_error(err, self.timeout))?;
 
+        *headers = super::safe_cache_headers(response.headers());
         let status = response.status();
         if !status.is_success() {
             return Err(SteveError::UpstreamStatus {
@@ -137,6 +149,18 @@ impl OpenAiUpstream {
         request: &impl Serialize,
         cancel: CancelToken,
     ) -> Result<OpenAiEventStream, SteveError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        self.chat_completion_stream_with_headers(request, cancel, &mut headers)
+            .await
+    }
+
+    pub(crate) async fn chat_completion_stream_with_headers(
+        &self,
+        request: &impl Serialize,
+        cancel: CancelToken,
+        headers: &mut reqwest::header::HeaderMap,
+    ) -> Result<OpenAiEventStream, SteveError> {
+        headers.clear();
         if cancel.is_cancelled() {
             return Err(SteveError::Cancelled);
         }
@@ -160,6 +184,7 @@ impl OpenAiUpstream {
             }
         };
 
+        *headers = super::safe_cache_headers(response.headers());
         let status = response.status();
         if !status.is_success() {
             return Err(SteveError::UpstreamStatus {
@@ -188,6 +213,17 @@ impl OpenAiUpstream {
     ///
     /// `stream: true` is rejected before opening a connection.
     pub async fn create_response(&self, request: &impl Serialize) -> Result<Value, SteveError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        self.create_response_with_headers(request, &mut headers)
+            .await
+    }
+
+    pub(crate) async fn create_response_with_headers(
+        &self,
+        request: &impl Serialize,
+        headers: &mut reqwest::header::HeaderMap,
+    ) -> Result<Value, SteveError> {
+        headers.clear();
         let body = prepare_responses_body(request, false)?;
         let response = self
             .post_responses(&body, "application/json")
@@ -196,6 +232,7 @@ impl OpenAiUpstream {
             .await
             .map_err(|err| map_http_error(err, self.timeout))?;
 
+        *headers = super::safe_cache_headers(response.headers());
         let status = response.status();
         if !status.is_success() {
             return Err(SteveError::UpstreamStatus {
@@ -218,6 +255,18 @@ impl OpenAiUpstream {
         request: &impl Serialize,
         cancel: CancelToken,
     ) -> Result<impl Stream<Item = Result<Bytes, SteveError>> + Send + 'static, SteveError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        self.create_response_stream_with_headers(request, cancel, &mut headers)
+            .await
+    }
+
+    pub(crate) async fn create_response_stream_with_headers(
+        &self,
+        request: &impl Serialize,
+        cancel: CancelToken,
+        headers: &mut reqwest::header::HeaderMap,
+    ) -> Result<impl Stream<Item = Result<Bytes, SteveError>> + Send + 'static, SteveError> {
+        headers.clear();
         if cancel.is_cancelled() {
             return Err(SteveError::Cancelled);
         }
@@ -237,6 +286,7 @@ impl OpenAiUpstream {
             }
         };
 
+        *headers = super::safe_cache_headers(response.headers());
         let status = response.status();
         if !status.is_success() {
             return Err(SteveError::UpstreamStatus {

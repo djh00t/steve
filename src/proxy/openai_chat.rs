@@ -100,6 +100,7 @@ pub(crate) enum ChatCompletionReplyBody {
 }
 
 pub(crate) struct ChatCompletionReply {
+    cache_headers: axum::http::HeaderMap,
     pub(crate) status: StatusCode,
     pub(crate) body: ChatCompletionReplyBody,
     pub(crate) request: Option<Request>,
@@ -113,12 +114,14 @@ pub(crate) type TerminalAttemptCallback =
 
 impl IntoResponse for ChatCompletionReply {
     fn into_response(self) -> Response {
-        match self.body {
+        let mut response = match self.body {
             ChatCompletionReplyBody::Stream(body) => {
                 (self.status, [("content-type", SSE_CONTENT_TYPE)], body).into_response()
             }
             body => (self.status, Json(body)).into_response(),
-        }
+        };
+        response.headers_mut().extend(self.cache_headers);
+        response
     }
 }
 
@@ -127,6 +130,7 @@ pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
         Ok(handoff) => {
             record_handoff(&handoff);
             ChatCompletionReply {
+                cache_headers: axum::http::HeaderMap::new(),
                 status: StatusCode::NOT_IMPLEMENTED,
                 body: ChatCompletionReplyBody::Stub(ChatCompletionStub::from(&handoff)),
                 request: Some(handoff.request),
@@ -136,6 +140,7 @@ pub(crate) fn handle_chat_completions(body: &[u8]) -> ChatCompletionReply {
             }
         }
         Err(error) => ChatCompletionReply {
+            cache_headers: axum::http::HeaderMap::new(),
             status: StatusCode::BAD_REQUEST,
             body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
             request: None,
@@ -163,6 +168,7 @@ pub(crate) async fn handle_chat_completions_with_upstream_and_terminal(
         Ok(handoff) => handoff,
         Err(error) => {
             return ChatCompletionReply {
+                cache_headers: axum::http::HeaderMap::new(),
                 status: StatusCode::BAD_REQUEST,
                 body: ChatCompletionReplyBody::Error(SteveErrorResponse { error }),
                 request: None,
@@ -172,6 +178,7 @@ pub(crate) async fn handle_chat_completions_with_upstream_and_terminal(
             }
         }
     };
+    let mut cache_headers = axum::http::HeaderMap::new();
     record_handoff(&handoff);
     handoff.attempt.provider = "openai".into();
     let request: Value = serde_json::from_slice(body).expect("validated JSON");
@@ -191,13 +198,14 @@ pub(crate) async fn handle_chat_completions_with_upstream_and_terminal(
             armed: true,
         };
         return match upstream
-            .chat_completion_stream(&request, cancel.clone())
+            .chat_completion_stream_with_headers(&request, cancel.clone(), &mut cache_headers)
             .await
         {
             Ok(stream) => {
                 let body = pump_upstream(&gate, cancel, stream).expect("fresh replay gate");
                 pending.armed = false;
                 ChatCompletionReply {
+                    cache_headers,
                     status: StatusCode::OK,
                     body: ChatCompletionReplyBody::Stream(Body::from_stream(AttemptBody {
                         inner: body.into_data_stream(),
@@ -217,6 +225,7 @@ pub(crate) async fn handle_chat_completions_with_upstream_and_terminal(
                     StatusCode::BAD_GATEWAY
                 };
                 ChatCompletionReply {
+                    cache_headers,
                     status,
                     body: ChatCompletionReplyBody::Error(SteveErrorResponse {
                         error: SteveError {
@@ -237,7 +246,9 @@ pub(crate) async fn handle_chat_completions_with_upstream_and_terminal(
 
     let mut attempts = Vec::new();
     let result = loop {
-        let result = upstream.chat_completion(&request).await;
+        let result = upstream
+            .chat_completion_with_headers(&request, &mut cache_headers)
+            .await;
         handoff.attempt.finished_at = Some(Utc::now());
         let retry = result.as_ref().err().is_some_and(is_retryable) && attempts.is_empty();
         if retry {
@@ -285,6 +296,7 @@ pub(crate) async fn handle_chat_completions_with_upstream_and_terminal(
     };
     attempts.push(handoff.attempt.clone());
     ChatCompletionReply {
+        cache_headers,
         status,
         body: response,
         request: Some(handoff.request),
