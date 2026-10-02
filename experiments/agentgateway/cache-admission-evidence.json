@@ -1,0 +1,63 @@
+{
+  "fixture_only": true,
+  "historical_before_steve_fix": true,
+  "topology": "client -> AgentGateway RC1 -> official vSR ext_proc -> synthetic provider (Steve absent)",
+  "image": "ghcr.io/vllm-project/semantic-router/extproc@sha256:d4e6e2f2077bbd4557faa416415fe48d00f49af7f1a58fa23414200be57323f5",
+  "source_pin": "6573123715e214a9eaa3ad23372ee5157411e519",
+  "script_sha256": "540e927a65ba0a66e990dfb712db9ae60286a711a99d1e7eb09e1bd102abd335",
+  "config_sha256": "f7ce90cae21de4fbd6320308b90ce09d31d871069ad8d6bdfb97c19784c9ede7",
+  "checks": {
+    "actual_vsr_exact_hit": true,
+    "changed_user_text_miss": true,
+    "changed_system_miss": true,
+    "changed_tenant_miss": true,
+    "provider_no_store_respected": false
+  },
+  "repeat": {
+    "statuses": [
+      200,
+      200
+    ],
+    "upstream_attempts": 1,
+    "latency_ms": [
+      51.281832973472774,
+      2.345166984014213
+    ]
+  },
+  "no_store": {
+    "upstream_attempts": 1,
+    "headers": [
+      "no-store",
+      null
+    ]
+  },
+  "separate_header_boundaries": {
+    "provider_alone": {
+      "status": 200,
+      "cache_control": "no-store",
+      "upstream_attempts": 1
+    },
+    "gateway_alone": {
+      "status": 200,
+      "cache_control": "no-store",
+      "upstream_attempts": 1
+    },
+    "steve_alone": {
+      "status": 200,
+      "cache_control": null,
+      "upstream_attempts": 1
+    }
+  },
+  "real_provider_calls": 0,
+  "cleanup": {
+    "container_removed": true,
+    "network_removed": true
+  },
+  "image_removed_after_run": true,
+  "limitations": [
+    "source-to-binary correspondence unattested",
+    "fake identity partition only",
+    "JSON cache hit, not SSE cache qualification",
+    "no patched vSR acceptance"
+  ]
+}
