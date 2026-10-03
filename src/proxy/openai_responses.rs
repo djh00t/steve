@@ -107,6 +107,7 @@ pub(crate) enum ResponsesReplyBody {
 }
 
 pub(crate) struct ResponsesReply {
+    cache_headers: axum::http::HeaderMap,
     pub(crate) status: StatusCode,
     pub(crate) body: ResponsesReplyBody,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -115,14 +116,16 @@ pub(crate) struct ResponsesReply {
 
 impl IntoResponse for ResponsesReply {
     fn into_response(self) -> Response {
-        match self.body {
+        let mut response = match self.body {
             ResponsesReplyBody::Error(body) => (self.status, Json(body)).into_response(),
             ResponsesReplyBody::Stub(body) => (self.status, Json(body)).into_response(),
             ResponsesReplyBody::Success(body) => (self.status, Json(body)).into_response(),
             ResponsesReplyBody::Stream(body) => {
                 (self.status, [("content-type", SSE_CONTENT_TYPE)], body).into_response()
             }
-        }
+        };
+        response.headers_mut().extend(self.cache_headers);
+        response
     }
 }
 
@@ -131,12 +134,14 @@ pub(crate) fn handle_responses(body: &[u8]) -> ResponsesReply {
         Ok(handoff) => {
             record_handoff(&handoff);
             ResponsesReply {
+                cache_headers: axum::http::HeaderMap::new(),
                 status: StatusCode::NOT_IMPLEMENTED,
                 body: ResponsesReplyBody::Stub(ResponsesStub::from(&handoff)),
                 attempt: Some(Arc::new(Mutex::new(handoff.attempt))),
             }
         }
         Err(error) => ResponsesReply {
+            cache_headers: axum::http::HeaderMap::new(),
             status: StatusCode::BAD_REQUEST,
             body: ResponsesReplyBody::Error(SteveErrorResponse { error }),
             attempt: None,
@@ -152,12 +157,14 @@ pub(crate) async fn handle_responses_with_upstream(
         Ok(handoff) => handoff,
         Err(error) => {
             return ResponsesReply {
+                cache_headers: axum::http::HeaderMap::new(),
                 status: StatusCode::BAD_REQUEST,
                 body: ResponsesReplyBody::Error(SteveErrorResponse { error }),
                 attempt: None,
             }
         }
     };
+    let mut cache_headers = axum::http::HeaderMap::new();
     record_handoff(&handoff);
     handoff.attempt.provider = "openai".into();
     let attempt = Arc::new(Mutex::new(handoff.attempt));
@@ -172,13 +179,14 @@ pub(crate) async fn handle_responses_with_upstream(
             armed: true,
         };
         match upstream
-            .create_response_stream(&request, cancel.clone())
+            .create_response_stream_with_headers(&request, cancel.clone(), &mut cache_headers)
             .await
         {
             Ok(stream) => {
                 let body = pump_upstream(&gate, cancel, stream).expect("fresh replay gate");
                 pending.armed = false;
                 return ResponsesReply {
+                    cache_headers,
                     status: StatusCode::OK,
                     body: ResponsesReplyBody::Stream(Body::from_stream(AttemptBody {
                         inner: body.into_data_stream(),
@@ -188,7 +196,7 @@ pub(crate) async fn handle_responses_with_upstream(
                 };
             }
             Err(error) => {
-                let reply = upstream_failure(attempt, error);
+                let reply = upstream_failure(attempt, error, cache_headers);
                 pending.armed = false;
                 return reply;
             }
@@ -200,22 +208,30 @@ pub(crate) async fn handle_responses_with_upstream(
         cancel: None,
         armed: true,
     };
-    let reply = match upstream.create_response(&request).await {
+    let reply = match upstream
+        .create_response_with_headers(&request, &mut cache_headers)
+        .await
+    {
         Ok(value) => {
             finish_attempt(&attempt, AttemptStatus::Success);
             ResponsesReply {
+                cache_headers,
                 status: StatusCode::OK,
                 body: ResponsesReplyBody::Success(value),
                 attempt: Some(attempt),
             }
         }
-        Err(error) => upstream_failure(attempt, error),
+        Err(error) => upstream_failure(attempt, error, cache_headers),
     };
     pending.armed = false;
     reply
 }
 
-fn upstream_failure(attempt: Arc<Mutex<RequestAttempt>>, error: UpstreamError) -> ResponsesReply {
+fn upstream_failure(
+    attempt: Arc<Mutex<RequestAttempt>>,
+    error: UpstreamError,
+    cache_headers: axum::http::HeaderMap,
+) -> ResponsesReply {
     finish_attempt(&attempt, AttemptStatus::UpstreamError);
     let status = if matches!(error, UpstreamError::Timeout { .. }) {
         StatusCode::GATEWAY_TIMEOUT
@@ -223,6 +239,7 @@ fn upstream_failure(attempt: Arc<Mutex<RequestAttempt>>, error: UpstreamError) -
         StatusCode::BAD_GATEWAY
     };
     ResponsesReply {
+        cache_headers,
         status,
         body: ResponsesReplyBody::Error(SteveErrorResponse {
             error: SteveError {

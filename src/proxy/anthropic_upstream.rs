@@ -104,6 +104,17 @@ impl AnthropicUpstream {
     ///
     /// `stream: true` is rejected before a connection is opened.
     pub async fn create_message(&self, request: &impl Serialize) -> Result<Value, AnthropicError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        self.create_message_with_headers(request, &mut headers)
+            .await
+    }
+
+    pub(crate) async fn create_message_with_headers(
+        &self,
+        request: &impl Serialize,
+        headers: &mut reqwest::header::HeaderMap,
+    ) -> Result<Value, AnthropicError> {
+        headers.clear();
         let body = prepare_body(request, false)?;
         let response = self
             .post_json(&body, "application/json")
@@ -112,6 +123,7 @@ impl AnthropicUpstream {
             .await
             .map_err(|err| map_http_error(err, self.timeout))?;
 
+        *headers = super::safe_cache_headers(response.headers());
         let status = response.status();
         if !status.is_success() {
             return Err(AnthropicError::UpstreamStatus {
@@ -137,6 +149,18 @@ impl AnthropicUpstream {
         request: &impl Serialize,
         cancel: CancelToken,
     ) -> Result<AnthropicEventStream, AnthropicError> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        self.create_message_stream_with_headers(request, cancel, &mut headers)
+            .await
+    }
+
+    pub(crate) async fn create_message_stream_with_headers(
+        &self,
+        request: &impl Serialize,
+        cancel: CancelToken,
+        headers: &mut reqwest::header::HeaderMap,
+    ) -> Result<AnthropicEventStream, AnthropicError> {
+        headers.clear();
         if cancel.is_cancelled() {
             return Err(AnthropicError::Cancelled);
         }
@@ -159,6 +183,7 @@ impl AnthropicUpstream {
             }
         };
 
+        *headers = super::safe_cache_headers(response.headers());
         let status = response.status();
         if !status.is_success() {
             return Err(AnthropicError::UpstreamStatus {
